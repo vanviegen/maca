@@ -62,15 +62,11 @@ def find_next_session_id(repo_root):
     aai_dir = Path(repo_root) / '.aai'
     aai_dir.mkdir(exist_ok=True)
 
-    # Find all existing session directories and logs
+    # Find all existing session directories
     existing = []
     for item in aai_dir.iterdir():
         if item.is_dir() and item.name.isdigit():
             existing.append(int(item.name))
-        elif item.name.endswith('.log'):
-            match = re.match(r'(\d+)\.log$', item.name)
-            if match:
-                existing.append(int(match.group(1)))
 
     return max(existing, default=0) + 1
 
@@ -78,7 +74,11 @@ def find_next_session_id(repo_root):
 def create_session_worktree(repo_root, session_id):
     """Create a new branch and worktree for the session."""
     branch_name = f'aai-{session_id}'
-    worktree_path = Path(repo_root) / '.aai' / str(session_id)
+    session_dir = Path(repo_root) / '.aai' / str(session_id)
+    worktree_path = session_dir / '<tree>'
+
+    # Ensure session directory exists
+    session_dir.mkdir(parents=True, exist_ok=True)
 
     # Get current branch to branch from
     current_branch = get_current_branch(cwd=repo_root)
@@ -89,13 +89,17 @@ def create_session_worktree(repo_root, session_id):
     # Create worktree
     run_git('worktree', 'add', str(worktree_path), branch_name, cwd=repo_root)
 
+    # Create .scratch directory for temporary analysis files
+    scratch_dir = worktree_path / '.scratch'
+    scratch_dir.mkdir(exist_ok=True)
+
     return worktree_path, branch_name
 
 
 def commit_changes(worktree_path, message):
-    """Commit all changes in the worktree with the given message."""
-    # Add all changes (including untracked files)
-    run_git('add', '-A', cwd=worktree_path)
+    """Commit all changes in the worktree with the given message, excluding .scratch and .aai."""
+    # Add all changes (including untracked files), but exclude .scratch and .aai
+    run_git('add', '-A', ':!.scratch', ':!.aai', cwd=worktree_path)
 
     # Check if there are changes to commit
     result = run_git('diff', '--cached', '--quiet', cwd=worktree_path, check=False)

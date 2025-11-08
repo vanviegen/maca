@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional
 
 
 class SessionLogger:
-    """Logs session events to a JSONL file."""
+    """Logs session events to per-context JSONL files."""
 
     def __init__(self, repo_root: Path, session_id: int):
         """
@@ -20,34 +20,32 @@ class SessionLogger:
         """
         self.repo_root = repo_root
         self.session_id = session_id
-        self.log_path = repo_root / '.aai' / f'{session_id}.log'
+        self.session_dir = repo_root / '.aai' / str(session_id)
         self.total_cost = 0.0
         self.total_tokens = 0
 
-        # Ensure .aai directory exists
-        self.log_path.parent.mkdir(exist_ok=True)
-
-        # Create/open log file
-        if not self.log_path.exists():
-            self.log_path.touch()
+        # Ensure session directory exists
+        self.session_dir.mkdir(parents=True, exist_ok=True)
 
     def log(self, entry_type: str, data: Dict[str, Any], context_id: Optional[str] = None):
         """
-        Log an entry to the session log.
+        Log an entry to the appropriate context log file.
 
         Args:
             entry_type: Type of entry (message, tool_call, tool_result, commit, summary, etc.)
             data: The data to log
             context_id: Optional context identifier (main or subcontext name)
         """
+        context_id = context_id or 'main'
+        log_path = self.session_dir / f'{context_id}.log'
+
         entry = {
             'type': entry_type,
             'timestamp': time.time(),
-            'context_id': context_id or 'main',
             'data': data
         }
 
-        with open(self.log_path, 'a') as f:
+        with open(log_path, 'a') as f:
             f.write(json.dumps(entry) + '\n')
 
     def log_message(self, role: str, content: str, context_id: Optional[str] = None):
@@ -56,6 +54,16 @@ class SessionLogger:
             'role': role,
             'content': content
         }, context_id)
+
+    def log_full_prompt(self, messages: list, context_id: Optional[str] = None):
+        """Log the full prompt sent to the LLM."""
+        self.log('full_prompt', {
+            'messages': messages
+        }, context_id)
+
+    def log_full_response(self, response: dict, context_id: Optional[str] = None):
+        """Log the full response from the LLM."""
+        self.log('full_response', response, context_id)
 
     def log_tool_call(self, tool_name: str, arguments: Dict[str, Any], context_id: Optional[str] = None):
         """Log a tool call."""
@@ -109,11 +117,20 @@ class SessionLogger:
             'total_cost_millis': self.total_cost * 1000
         }
 
-    def read_log(self) -> list:
-        """Read all entries from the log file."""
+    def read_log(self, context_id: str = 'main') -> list:
+        """
+        Read all entries from a context log file.
+
+        Args:
+            context_id: The context whose log to read
+
+        Returns:
+            List of log entries
+        """
+        log_path = self.session_dir / f'{context_id}.log'
         entries = []
-        if self.log_path.exists():
-            with open(self.log_path, 'r') as f:
+        if log_path.exists():
+            with open(log_path, 'r') as f:
                 for line in f:
                     if line.strip():
                         entries.append(json.loads(line))

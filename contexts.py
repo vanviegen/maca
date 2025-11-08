@@ -4,6 +4,7 @@
 import json
 import os
 import urllib.request
+import difflib
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 
@@ -24,7 +25,8 @@ class BaseContext:
         context_type: str,
         model: str,
         max_response_chars: int = 10000,
-        api_key: Optional[str] = None
+        api_key: Optional[str] = None,
+        worktree_path: Optional[Path] = None
     ):
         """
         Initialize a context.
@@ -35,14 +37,17 @@ class BaseContext:
             model: Model to use for this context
             max_response_chars: Maximum characters in response
             api_key: OpenRouter API key (defaults to env var)
+            worktree_path: Path to the worktree (for loading AGENTS.md)
         """
         self.context_id = context_id
         self.context_type = context_type
         self.model = model
         self.max_response_chars = max_response_chars
         self.api_key = api_key or os.environ.get('OPENROUTER_API_KEY')
+        self.worktree_path = worktree_path
         self.messages = []
         self.last_usage = {}
+        self.agents_md_content = None
 
         if not self.api_key:
             raise ContextError("OPENROUTER_API_KEY not set")
@@ -50,12 +55,27 @@ class BaseContext:
         # Load system prompt
         self._load_system_prompt()
 
+        # Load AGENTS.md if it exists
+        self._load_agents_md()
+
     def _load_system_prompt(self):
-        """Load the system prompt from a markdown file."""
+        """Load the system prompt from markdown files."""
         # Find the prompts directory (next to the script)
         script_dir = Path(__file__).parent
         prompts_dir = script_dir / 'prompts'
 
+        # First load common.md (shared across all contexts)
+        common_path = prompts_dir / 'common.md'
+        if not common_path.exists():
+            raise ContextError(f"Common prompt not found: {common_path}")
+
+        common_prompt = common_path.read_text()
+        self.messages.append({
+            'role': 'system',
+            'content': common_prompt
+        })
+
+        # Then load context-specific prompt
         prompt_file = f'{self.context_type}.md'
         prompt_path = prompts_dir / prompt_file
 
@@ -63,11 +83,68 @@ class BaseContext:
             raise ContextError(f"System prompt not found: {prompt_path}")
 
         system_prompt = prompt_path.read_text()
-
         self.messages.append({
             'role': 'system',
             'content': system_prompt
         })
+
+    def _load_agents_md(self):
+        """Load AGENTS.md from the worktree if it exists."""
+        if not self.worktree_path:
+            return
+
+        agents_path = self.worktree_path / 'AGENTS.md'
+        if agents_path.exists():
+            content = agents_path.read_text()
+            self.agents_md_content = content
+            self.messages.append({
+                'role': 'system',
+                'content': f"# Project Context (AGENTS.md)\n\n{content}"
+            })
+
+    def update_agents_md(self):
+        """
+        Check if AGENTS.md has been updated and append diff to context.
+
+        This appends only the diff rather than full content to keep context small.
+
+        TODO: Implement mechanism to remove older versions of AGENTS.md from context
+        in a batch operation to prevent context from growing too large.
+        """
+        if not self.worktree_path:
+            return False
+
+        agents_path = self.worktree_path / 'AGENTS.md'
+        if not agents_path.exists():
+            return False
+
+        new_content = agents_path.read_text()
+
+        # Check if content has changed
+        if new_content != self.agents_md_content:
+            old_lines = self.agents_md_content.splitlines(keepends=True) if self.agents_md_content else []
+            new_lines = new_content.splitlines(keepends=True)
+
+            # Generate unified diff
+            diff = difflib.unified_diff(
+                old_lines,
+                new_lines,
+                fromfile='AGENTS.md (previous)',
+                tofile='AGENTS.md (current)',
+                lineterm=''
+            )
+            diff_text = '\n'.join(diff)
+
+            self.agents_md_content = new_content
+
+            # Append diff to keep caches active
+            self.messages.append({
+                'role': 'system',
+                'content': f"# AGENTS.md Updated\n\nThe following changes were made to AGENTS.md:\n\n```diff\n{diff_text}\n```"
+            })
+            return True
+
+        return False
 
     def add_message(self, role: str, content: str):
         """Add a message to the context."""
@@ -83,9 +160,13 @@ class BaseContext:
         else:
             return tools.get_tool_schemas('subcontext')
 
-    def call_llm(self) -> Dict[str, Any]:
+    def call_llm(self, logger=None, verbose=False) -> Dict[str, Any]:
         """
         Call the LLM and return the response.
+
+        Args:
+            logger: Optional session logger
+            verbose: If True, print full prompts and responses
 
         Returns:
             Dict with 'message' and 'tool_calls' keys
@@ -107,6 +188,23 @@ class BaseContext:
             'tool_choice': 'required',  # Force tool use
         }
 
+        # Log full prompt
+        if logger:
+            logger.log_full_prompt(self.messages, self.context_id)
+
+        # Display full prompt if verbose
+        if verbose:
+            from prompt_toolkit import print_formatted_text, HTML
+            print_formatted_text(HTML("\n<ansiyellow>=== FULL PROMPT ===</ansiyellow>"))
+            for i, msg in enumerate(self.messages):
+                role = msg.get('role', 'unknown')
+                content = msg.get('content', '')
+                if content:
+                    print_formatted_text(HTML(f"<ansicyan>[{i}] {role}:</ansicyan>"))
+                    print_formatted_text(content)
+                    print()
+            print_formatted_text(HTML("<ansiyellow>===================</ansiyellow>\n"))
+
         try:
             req = urllib.request.Request(
                 "https://openrouter.ai/api/v1/chat/completions",
@@ -120,6 +218,18 @@ class BaseContext:
                 error_body = e.read().decode('utf-8')
                 raise ContextError(f"LLM API error: {error_body}")
             raise ContextError(f"LLM API error: {str(e)}")
+
+        # Log full response
+        if logger:
+            logger.log_full_response(result, self.context_id)
+
+        # Display full response if verbose
+        if verbose:
+            from prompt_toolkit import print_formatted_text, HTML
+            print_formatted_text(HTML("\n<ansiyellow>=== FULL RESPONSE ===</ansiyellow>"))
+            response_str = json.dumps(result, indent=2)
+            print_formatted_text(response_str)
+            print_formatted_text(HTML("<ansiyellow>=====================</ansiyellow>\n"))
 
         # Extract response
         choice = result['choices'][0]
@@ -165,78 +275,84 @@ class BaseContext:
 class MainContext(BaseContext):
     """Main orchestrator context."""
 
-    def __init__(self, model: str = "anthropic/claude-sonnet-4.5", api_key: Optional[str] = None):
+    def __init__(self, model: str = "anthropic/claude-sonnet-4.5", api_key: Optional[str] = None, worktree_path: Optional[Path] = None):
         super().__init__(
             context_id='main',
             context_type='main',
             model=model,
             max_response_chars=100000,  # Main context can have large responses
-            api_key=api_key
+            api_key=api_key,
+            worktree_path=worktree_path
         )
 
 
 class CodeAnalysisContext(BaseContext):
-    """Context for analyzing code and maintaining AI-ARCHITECTURE.md."""
+    """Context for analyzing code and creating/maintaining AGENTS.md."""
 
-    def __init__(self, unique_name: str, model: str = "anthropic/claude-sonnet-4.5", max_response_chars: int = 2000, api_key: Optional[str] = None):
+    def __init__(self, unique_name: str, model: str = "anthropic/claude-sonnet-4.5", max_response_chars: int = 2000, api_key: Optional[str] = None, worktree_path: Optional[Path] = None):
         super().__init__(
             context_id=unique_name,
             context_type='code_analysis',
             model=model,
             max_response_chars=max_response_chars,
-            api_key=api_key
+            api_key=api_key,
+            worktree_path=worktree_path
         )
 
 
 class ResearchContext(BaseContext):
     """Context for web research and information gathering."""
 
-    def __init__(self, unique_name: str, model: str = "anthropic/claude-sonnet-4.5", max_response_chars: int = 2000, api_key: Optional[str] = None):
+    def __init__(self, unique_name: str, model: str = "anthropic/claude-sonnet-4.5", max_response_chars: int = 2000, api_key: Optional[str] = None, worktree_path: Optional[Path] = None):
         super().__init__(
             context_id=unique_name,
             context_type='research',
             model=model,
             max_response_chars=max_response_chars,
-            api_key=api_key
+            api_key=api_key,
+            worktree_path=worktree_path
         )
 
 
 class ImplementationContext(BaseContext):
     """Context for implementing code based on specifications."""
 
-    def __init__(self, unique_name: str, model: str = "anthropic/claude-sonnet-4.5", max_response_chars: int = 2000, api_key: Optional[str] = None):
+    def __init__(self, unique_name: str, model: str = "anthropic/claude-sonnet-4.5", max_response_chars: int = 2000, api_key: Optional[str] = None, worktree_path: Optional[Path] = None):
         super().__init__(
             context_id=unique_name,
             context_type='implementation',
             model=model,
             max_response_chars=max_response_chars,
-            api_key=api_key
+            api_key=api_key,
+            worktree_path=worktree_path
         )
 
 
 class ReviewContext(BaseContext):
     """Context for reviewing code quality and correctness."""
 
-    def __init__(self, unique_name: str, model: str = "anthropic/claude-sonnet-4.5", max_response_chars: int = 2000, api_key: Optional[str] = None):
+    def __init__(self, unique_name: str, model: str = "anthropic/claude-sonnet-4.5", max_response_chars: int = 2000, api_key: Optional[str] = None, worktree_path: Optional[Path] = None):
         super().__init__(
             context_id=unique_name,
             context_type='review',
             model=model,
             max_response_chars=max_response_chars,
-            api_key=api_key
+            api_key=api_key,
+            worktree_path=worktree_path
         )
 
 
 class MergeContext(BaseContext):
     """Context for resolving merge conflicts."""
 
-    def __init__(self, unique_name: str, model: str = "anthropic/claude-sonnet-4.5", max_response_chars: int = 2000, api_key: Optional[str] = None):
+    def __init__(self, unique_name: str, model: str = "anthropic/claude-sonnet-4.5", max_response_chars: int = 2000, api_key: Optional[str] = None, worktree_path: Optional[Path] = None):
         super().__init__(
             context_id=unique_name,
             context_type='merge',
             model=model,
             max_response_chars=max_response_chars,
-            api_key=api_key
+            api_key=api_key,
+            worktree_path=worktree_path
         )
 
 
@@ -250,7 +366,7 @@ CONTEXT_TYPES = {
 }
 
 
-def create_context(unique_name: str, context_type: str, model: str = "auto", max_response_chars: int = 2000) -> BaseContext:
+def create_context(unique_name: str, context_type: str, model: str = "auto", max_response_chars: int = 2000, worktree_path: Optional[Path] = None) -> BaseContext:
     """
     Create a new context of the specified type.
 
@@ -259,6 +375,7 @@ def create_context(unique_name: str, context_type: str, model: str = "auto", max
         context_type: Type of context to create
         model: Model to use (or "auto" for default)
         max_response_chars: Maximum response characters
+        worktree_path: Path to the worktree
 
     Returns:
         New context instance
@@ -271,4 +388,4 @@ def create_context(unique_name: str, context_type: str, model: str = "auto", max
         model = "anthropic/claude-sonnet-4.5"
 
     context_class = CONTEXT_TYPES[context_type]
-    return context_class(unique_name, model, max_response_chars)
+    return context_class(unique_name, model, max_response_chars, worktree_path=worktree_path)

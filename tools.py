@@ -3,14 +3,20 @@
 
 import inspect
 import re
-import glob as glob_module
+import os
 from pathlib import Path
 from typing import get_type_hints, get_origin, get_args, Any, Dict, List, Union
 import typing
+from prompt_toolkit.history import FileHistory
 
 # Global variables set by the orchestrator
 WORKTREE_PATH = None
 REPO_ROOT = None
+
+# Setup shared input history
+HISTORY_FILE = Path.home() / '.aai' / 'history'
+HISTORY_FILE.parent.mkdir(exist_ok=True)
+HISTORY = FileHistory(str(HISTORY_FILE))
 
 
 # Tool registry
@@ -193,14 +199,16 @@ def execute_tool(tool_name: str, arguments: Dict, context_type='subcontext') -> 
 # ==============================================================================
 
 @tool('subcontext')
-def read_files(file_paths: List[str], start_line: int = 1, max_lines: int = 100) -> List[Dict[str, Any]]:
+def read_files(file_paths: List[str], start_line: int = 1, max_lines: int = 250) -> List[Dict[str, Any]]:
     """
     Read one or more files, optionally with line range limits.
+
+    IMPORTANT: Read ALL relevant files in a SINGLE call for efficiency. Avoid multiple tool calls.
 
     Args:
         file_paths: List of file paths to read
         start_line: Line number to start reading from (1-indexed)
-        max_lines: Maximum number of lines to read per file
+        max_lines: Maximum number of lines to read per file (default: 250)
 
     Returns:
         List of dicts with file_path, data, and remaining_lines for each file
@@ -247,27 +255,43 @@ def read_files(file_paths: List[str], start_line: int = 1, max_lines: int = 100)
 
 
 @tool('subcontext')
-def list_files(glob_pattern: str = "**/*", max_files: int = 200) -> List[str]:
+def list_files(path_regex: str = r".*", max_files: int = 200) -> List[str]:
     """
-    List files in the worktree matching a glob pattern.
+    List files in the worktree matching a regular expression pattern.
+
+    Use | to match multiple file types efficiently in one call.
+    Examples:
+    - r"\.py$" - All Python files
+    - r"\.(py|js|ts)$" - Python, JavaScript, and TypeScript files
+    - r"^src/.*\.(py|md)$" - Python and Markdown files in src/
+    - r"(test_.*\.py|.*_test\.py)$" - Python test files
 
     Args:
-        glob_pattern: Glob pattern to match files (e.g., "**/*.py", "src/**/*.js")
+        path_regex: Regular expression to match file paths (applied to full relative path)
         max_files: Maximum number of files to return
 
     Returns:
-        List of file paths relative to worktree root
+        List of file paths relative to worktree root, sorted
     """
     worktree = Path(WORKTREE_PATH)
     matches = []
+    pattern = re.compile(path_regex)
 
-    for path in worktree.glob(glob_pattern):
-        if path.is_file():
-            rel_path = path.relative_to(worktree)
-            matches.append(str(rel_path))
+    # Walk the entire tree
+    for root, dirs, files in os.walk(worktree):
+        # Skip .git, .scratch, and other hidden directories
+        dirs[:] = [d for d in dirs if not d.startswith('.')]
 
-            if len(matches) >= max_files:
-                break
+        for file in files:
+            full_path = Path(root) / file
+            rel_path = full_path.relative_to(worktree)
+            rel_path_str = str(rel_path)
+
+            if pattern.search(rel_path_str):
+                matches.append(rel_path_str)
+
+                if len(matches) >= max_files:
+                    return sorted(matches)
 
     return sorted(matches)
 
@@ -406,8 +430,19 @@ def complete(result: str) -> None:
     """
     Signal that the task is complete and return the result to the main context.
 
+    For tasks involving analysis or generating extensive output:
+    - Place detailed results in files within .scratch/ directory (e.g., .scratch/analysis.md, .scratch/test-results.txt)
+    - The .scratch/ directory is temporary and git-ignored - files there are never committed
+    - Return a SUMMARY of findings in the result parameter
+    - Mention which .scratch/ files contain detailed data if the main context asked for analysis
+    - ONLY create .scratch/ files if the main context specifically requested analysis/detailed output
+
+    For regular implementation tasks:
+    - Just return a brief summary of what was done
+    - Do NOT create .scratch/ files unless specifically requested
+
     Args:
-        result: Summary of what was accomplished
+        result: Summary of what was accomplished (and optionally mention .scratch/ files with details)
     """
     # This is handled specially by the context runner
     pass
@@ -431,13 +466,6 @@ def get_user_input(prompt: str, preset_answers: List[str] = None) -> str:
     """
     from prompt_toolkit import prompt as pt_prompt
     from prompt_toolkit.shortcuts import radiolist_dialog
-    from prompt_toolkit.history import FileHistory
-    from pathlib import Path
-
-    # Use shared history file
-    history_file = Path.home() / '.aai' / 'history'
-    history_file.parent.mkdir(exist_ok=True)
-    history = FileHistory(str(history_file))
 
     if preset_answers:
         # Show radio list dialog
@@ -451,11 +479,11 @@ def get_user_input(prompt: str, preset_answers: List[str] = None) -> str:
         ).run()
 
         if result == '__custom__':
-            return pt_prompt(f"{prompt}\n> ", history=history)
+            return pt_prompt(f"{prompt}\n> ", history=HISTORY)
         return result
     else:
         # Simple text input
-        return pt_prompt(f"{prompt}\n> ", history=history)
+        return pt_prompt(f"{prompt}\n> ", history=HISTORY)
 
 
 @tool('main')

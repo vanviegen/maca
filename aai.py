@@ -48,6 +48,7 @@ class AAI:
         self.logger = None
         self.main_context = None
         self.subcontexts: Dict[str, contexts.BaseContext] = {}
+        self.verbose = False
 
     def ensure_git_repo(self):
         """Ensure we're in a git repository, or offer to initialize one."""
@@ -100,15 +101,35 @@ class AAI:
         if prompt_arg:
             return prompt_arg
 
-        print_formatted_text(HTML("<ansiyellow>Enter your task (press Alt+Enter or Esc+Enter to submit):</ansiyellow>"))
-        return pt_prompt("> ", multiline=True, history=HISTORY).strip()
+        while True:
+            print_formatted_text(HTML("<ansiyellow>Enter your task (press Alt+Enter or Esc+Enter to submit):</ansiyellow>"))
+            if self.verbose:
+                print_formatted_text(HTML("<ansicyan>[Verbose mode: ON]</ansicyan>"))
+
+            prompt = pt_prompt("> ", multiline=True, history=HISTORY).strip()
+
+            # Check for special commands
+            if prompt == '/verbose on':
+                self.verbose = True
+                print_formatted_text(HTML("<ansigreen>Verbose mode enabled</ansigreen>"))
+                continue
+            elif prompt == '/verbose off':
+                self.verbose = False
+                print_formatted_text(HTML("<ansigreen>Verbose mode disabled</ansigreen>"))
+                continue
+            elif prompt.startswith('/'):
+                print_formatted_text(HTML(f"<ansired>Unknown command: {prompt}</ansired>"))
+                print_formatted_text(HTML("Available commands: /verbose on, /verbose off"))
+                continue
+
+            return prompt
 
     def run_main_context(self):
         """Run one iteration of the main context."""
         try:
             print_formatted_text(HTML("<ansicyan>Main context thinking...</ansicyan>"))
 
-            response = self.main_context.call_llm()
+            response = self.main_context.call_llm(logger=self.logger, verbose=self.verbose)
             tool_call = response['tool_call']
             usage = response['usage']
 
@@ -158,7 +179,10 @@ class AAI:
             max_chars = arguments.get('max_response_chars', 2000)
 
             # Create the subcontext
-            subcontext = contexts.create_context(unique_name, context_type, model, max_chars)
+            subcontext = contexts.create_context(
+                unique_name, context_type, model, max_chars,
+                worktree_path=self.worktree_path
+            )
             self.subcontexts[unique_name] = subcontext
 
             # Add the task to the subcontext
@@ -209,7 +233,7 @@ class AAI:
             ))
 
             start_time = time.time()
-            response = subcontext.call_llm()
+            response = subcontext.call_llm(logger=self.logger, verbose=self.verbose)
             tool_call = response['tool_call']
             usage = response['usage']
 
@@ -248,6 +272,7 @@ class AAI:
             # Check for git changes and commit if needed
             diff_stats = git_ops.get_diff_stats(self.worktree_path)
 
+            agents_md_updated = False
             if diff_stats:
                 # Commit changes
                 commit_msg = arguments.get('rationale', f'{tool_name} executed')
@@ -258,11 +283,27 @@ class AAI:
                     f"    <ansigreen>✓ Committed changes</ansigreen>"
                 ))
 
+                # Check if AGENTS.md was updated and refresh all contexts
+                if self.main_context.update_agents_md():
+                    agents_md_updated = True
+                    print_formatted_text(HTML(
+                        f"    <ansicyan>AGENTS.md updated - refreshed all contexts</ansicyan>"
+                    ))
+                    # Update all subcontexts too
+                    for ctx in self.subcontexts.values():
+                        ctx.update_agents_md()
+
             # Build summary for main context
             summary = self._build_subcontext_summary(
                 unique_name, tool_name, arguments.get('rationale', ''),
                 tokens, cost, tool_duration, diff_stats, result
             )
+
+            # If this was an implementation context and AGENTS.md was updated, ask main to verify
+            if subcontext.context_type == 'implementation' and agents_md_updated:
+                summary += ("\n\nNote: AGENTS.md was updated by this implementation. Please verify from "
+                           "a high-level perspective whether this update was appropriate and necessary. "
+                           "You may query the subcontext for the rationale behind the updates if needed.")
 
             # Add summary to main context
             self.main_context.add_message('user', summary)
@@ -271,7 +312,8 @@ class AAI:
                 'tokens': tokens,
                 'cost': cost,
                 'duration': tool_duration,
-                'diff_stats': diff_stats
+                'diff_stats': diff_stats,
+                'agents_md_updated': agents_md_updated
             }, unique_name)
 
         except Exception as e:
@@ -387,7 +429,10 @@ class AAI:
         self.create_session()
 
         # Initialize main context
-        self.main_context = contexts.MainContext()
+        self.main_context = contexts.MainContext(worktree_path=self.worktree_path)
+
+        # Check if AGENTS.md exists, if not suggest creating it
+        self.first_llm_call = True
 
         # Main loop
         while True:
@@ -399,9 +444,21 @@ class AAI:
                 print("No task provided. Exiting.")
                 break
 
-            # Add to main context
-            self.main_context.add_message('user', prompt)
+            # On first LLM call, if no AGENTS.md exists, prepend guidance to create it
+            agents_path = self.worktree_path / 'AGENTS.md'
+            if self.first_llm_call and not agents_path.exists():
+                guidance = ("Note: This project does not have an AGENTS.md file yet. Unless the user's "
+                           "request explicitly does not benefit from understanding the codebase, or they "
+                           "explicitly ask not to, your first step should usually be to create a code_analysis "
+                           "subcontext to analyze the project and create an initial AGENTS.md file. This file "
+                           "should be short and lean, documenting key project context, architecture, and dependencies.")
+                self.main_context.add_message('user', f"{guidance}\n\nUser request: {prompt}")
+            else:
+                # Add to main context
+                self.main_context.add_message('user', prompt)
+
             self.logger.log_message('user', prompt, 'main')
+            self.first_llm_call = False
 
             # Main context loop
             while True:
