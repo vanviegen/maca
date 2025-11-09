@@ -1,6 +1,6 @@
-# AAI Agent Configuration
+# MACA Agent Configuration
 
-This file contains the default configuration for the agentic coding assistant.
+This file contains the default configuration for the multi-agent coding assistant.
 
 ## Default Docker Configuration
 
@@ -52,11 +52,11 @@ shell(
 
 ## Image Caching
 
-AAI automatically caches built images based on the combination of `docker_image` and `docker_runs`. When using the same configuration repeatedly, builds will be fast as the cached image is reused.
+MACA automatically caches built images based on the combination of `docker_image` and `docker_runs`. When using the same configuration repeatedly, builds will be fast as the cached image is reused.
 
 ## Rootless Execution
 
-If `podman` is available on the system, AAI will prefer it over Docker for rootless container execution. This ensures file permissions in the worktree are preserved correctly.
+If `podman` is available on the system, MACA will prefer it over Docker for rootless container execution. This ensures file permissions in the worktree are preserved correctly.
 
 ## Volume Mounts
 

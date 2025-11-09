@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Agentic Coding Assistant - Main entry point."""
+"""Multi-Agent Coding Assistant - Main entry point."""
 
 import argparse
 import sys
@@ -25,13 +25,13 @@ tools.WORKTREE_PATH = None
 tools.REPO_ROOT = None
 
 # Setup history file
-HISTORY_FILE = Path.home() / '.aai' / 'history'
+HISTORY_FILE = Path.home() / '.maca' / 'history'
 HISTORY_FILE.parent.mkdir(exist_ok=True)
 HISTORY = FileHistory(str(HISTORY_FILE))
 
 
-class AAI:
-    """Main orchestration class for the agentic coding assistant."""
+class MACA:
+    """Main orchestration class for the multi-agent coding assistant."""
 
     def __init__(self, repo_path: str = '.'):
         """
@@ -57,7 +57,7 @@ class AAI:
 
             response = radiolist_dialog(
                 title='Git Repository Required',
-                text='AAI requires a git repository. Initialize one now?',
+                text='MACA requires a git repository. Initialize one now?',
                 values=[
                     ('yes', 'Yes, initialize git repository'),
                     ('no', 'No, exit')
@@ -176,26 +176,97 @@ class AAI:
             context_type = arguments['context_type']
             task = arguments['task']
             model = arguments.get('model', 'auto')
-            max_chars = arguments.get('max_response_chars', 2000)
+            path_regex = arguments.get('path_regex', r'.*')
+            file_limit = arguments.get('file_limit', 5)
 
-            # Create the subcontext
-            subcontext = contexts.create_context(
-                unique_name, context_type, model, max_chars,
-                worktree_path=self.worktree_path
-            )
-            self.subcontexts[unique_name] = subcontext
+            # Handle file_processor context type specially
+            if context_type == 'file_processor':
+                import re
+                from pathlib import Path as PathLib
 
-            # Add the task to the subcontext
-            subcontext.add_message('user', task)
+                # Find matching files
+                pattern = re.compile(path_regex)
+                matching_files = []
 
-            result = f"Created {context_type} subcontext '{unique_name}'"
-            self.logger.log_tool_result(tool_name, result, 0, 'main')
+                for root, dirs, files in os.walk(self.worktree_path):
+                    # Skip .git, .scratch, .maca
+                    dirs[:] = [d for d in dirs if not d.startswith('.')]
 
-            print_formatted_text(HTML(
-                f"  <ansigreen>Created subcontext:</ansigreen> {unique_name} ({context_type})"
-            ))
+                    for file in files:
+                        full_path = PathLib(root) / file
+                        rel_path = full_path.relative_to(self.worktree_path)
+                        rel_path_str = str(rel_path)
 
-            return (result, True, unique_name)
+                        if pattern.search(rel_path_str):
+                            matching_files.append(rel_path_str)
+
+                # Check file limit
+                if len(matching_files) > file_limit:
+                    error_msg = f"Matched {len(matching_files)} files, exceeds limit of {file_limit}. Use list_files(r'{path_regex}') first to see what matches, then adjust regex or increase file_limit."
+                    self.logger.log_tool_result(tool_name, error_msg, 0, 'main')
+                    print_formatted_text(HTML(f"  <ansired>Error:</ansired> {error_msg}"))
+                    return (error_msg, False, None)
+
+                # Create one subcontext per file
+                results = []
+                for file_path in matching_files:
+                    file_unique_name = f"{unique_name}-{file_path.replace('/', '-').replace('\\', '-')}"
+
+                    # Read file contents
+                    full_file_path = self.worktree_path / file_path
+                    try:
+                        file_contents = full_file_path.read_text()
+                    except Exception as e:
+                        results.append(f"{file_path}: Error reading - {e}")
+                        continue
+
+                    # Create subcontext
+                    subcontext = contexts.create_context(
+                        file_unique_name, context_type, model,
+                        worktree_path=self.worktree_path
+                    )
+                    self.subcontexts[file_unique_name] = subcontext
+
+                    # Add file contents and task to context
+                    file_message = f"File: {file_path}\n\n```\n{file_contents}\n```\n\n{task}"
+                    subcontext.add_message('user', file_message)
+
+                    results.append(f"{file_path} -> {file_unique_name}")
+
+                result = f"Created {len(matching_files)} file_processor subcontexts:\n" + "\n".join(results)
+                self.logger.log_tool_result(tool_name, result, 0, 'main')
+
+                print_formatted_text(HTML(
+                    f"  <ansigreen>Created {len(matching_files)} file_processor subcontexts</ansigreen>"
+                ))
+
+                # Return first subcontext name to run
+                if matching_files:
+                    first_name = f"{unique_name}-{matching_files[0].replace('/', '-').replace('\\', '-')}"
+                    return (result, True, first_name)
+                else:
+                    return (result, False, None)
+
+            else:
+                # Regular subcontext creation
+                # Create the subcontext
+                subcontext = contexts.create_context(
+                    unique_name, context_type, model,
+                    worktree_path=self.worktree_path
+                )
+                self.subcontexts[unique_name] = subcontext
+
+                # Add the task to the subcontext
+                subcontext.add_message('user', task)
+
+                result = f"Created {context_type} subcontext '{unique_name}'"
+                self.logger.log_tool_result(tool_name, result, 0, 'main')
+
+                print_formatted_text(HTML(
+                    f"  <ansigreen>Created subcontext:</ansigreen> {unique_name} ({context_type})"
+                ))
+
+                return (result, True, unique_name)
 
         elif tool_name == 'continue_subcontext':
             unique_name = arguments['unique_name']
@@ -431,6 +502,18 @@ class AAI:
         # Initialize main context
         self.main_context = contexts.MainContext(worktree_path=self.worktree_path)
 
+        # Auto-call list_files for top-level directory to give context about project structure
+        try:
+            top_files_result = tools.execute_tool('list_files', {'path_regex': r'^[^/\\]*$'}, context_type='main')
+            # Add as a system message so main context knows what files are in the top directory
+            top_files_msg = f"Top-level directory contains {top_files_result['total_count']} files"
+            if top_files_result['files']:
+                top_files_msg += f":\n" + "\n".join(f"- {f}" for f in top_files_result['files'])
+            self.main_context.add_message('system', top_files_msg)
+        except Exception as e:
+            # Don't fail if this doesn't work
+            pass
+
         # Check if AGENTS.md exists, if not suggest creating it
         self.first_llm_call = True
 
@@ -493,8 +576,8 @@ class AAI:
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        prog='aai',
-        description='Agentic Coding Assistant - A multi-context AI coding assistant',
+        prog='maca',
+        description='Multi-Agent Coding Assistant - A multi-context AI coding assistant',
     )
     parser.add_argument('task', nargs='*', help='Initial task description')
     parser.add_argument('-m', '--model', default='anthropic/claude-sonnet-4.5',
@@ -508,7 +591,7 @@ def main():
     task = ' '.join(args.task) if args.task else None
 
     # Create and run assistant
-    assistant = AAI(args.directory)
+    assistant = MACA(args.directory)
     assistant.run(task)
 
 

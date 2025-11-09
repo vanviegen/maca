@@ -25,7 +25,6 @@ class BaseContext:
         context_id: str,
         context_type: str,
         model: str,
-        max_response_chars: int = 10000,
         api_key: Optional[str] = None,
         worktree_path: Optional[Path] = None
     ):
@@ -36,14 +35,12 @@ class BaseContext:
             context_id: Unique identifier for this context
             context_type: Type of context (main, code_analysis, research, etc.)
             model: Model to use for this context
-            max_response_chars: Maximum characters in response
             api_key: OpenRouter API key (defaults to env var)
             worktree_path: Path to the worktree (for loading AGENTS.md)
         """
         self.context_id = context_id
         self.context_type = context_type
         self.model = model
-        self.max_response_chars = max_response_chars
         self.api_key = api_key or os.environ.get('OPENROUTER_API_KEY')
         self.worktree_path = worktree_path
         self.messages = []
@@ -59,6 +56,13 @@ class BaseContext:
 
         # Load AGENTS.md if it exists
         self._load_agents_md()
+
+        # Add unique name info for subcontexts (main context doesn't need this)
+        if self.context_type != 'main':
+            self.messages.append({
+                'role': 'system',
+                'content': f"# Your Context Info\n\nYour unique name: **{self.context_id}**\n\nYou can use this name to create guaranteed unique files in .scratch/ directory (e.g., `.scratch/{self.context_id}-output.txt`)."
+            })
 
         # Initialize HEAD tracking if we have a worktree
         if self.worktree_path:
@@ -221,8 +225,8 @@ class BaseContext:
         headers = {
             'Content-Type': 'application/json',
             'Authorization': f'Bearer {self.api_key}',
-            'HTTP-Referer': 'https://github.com/vanviegen/aai',
-            'X-Title': 'AAI - Agentic Coding Assistant'
+            'HTTP-Referer': 'https://github.com/vanviegen/maca',
+            'X-Title': 'MACA - Multi-Agent Coding Assistant'
         }
 
         # Get tool schemas
@@ -315,7 +319,7 @@ class BaseContext:
         self.messages.append({
             'role': 'tool',
             'tool_call_id': tool_call['id'],
-            'content': str(result)[:self.max_response_chars]
+            'content': str(result)
         })
 
 
@@ -327,7 +331,6 @@ class MainContext(BaseContext):
             context_id='main',
             context_type='main',
             model=model,
-            max_response_chars=100000,  # Main context can have large responses
             api_key=api_key,
             worktree_path=worktree_path
         )
@@ -336,12 +339,11 @@ class MainContext(BaseContext):
 class CodeAnalysisContext(BaseContext):
     """Context for analyzing code and creating/maintaining AGENTS.md."""
 
-    def __init__(self, unique_name: str, model: str = "anthropic/claude-sonnet-4.5", max_response_chars: int = 2000, api_key: Optional[str] = None, worktree_path: Optional[Path] = None):
+    def __init__(self, unique_name: str, model: str = "anthropic/claude-sonnet-4.5", api_key: Optional[str] = None, worktree_path: Optional[Path] = None):
         super().__init__(
             context_id=unique_name,
             context_type='code_analysis',
             model=model,
-            max_response_chars=max_response_chars,
             api_key=api_key,
             worktree_path=worktree_path
         )
@@ -350,12 +352,11 @@ class CodeAnalysisContext(BaseContext):
 class ResearchContext(BaseContext):
     """Context for web research and information gathering."""
 
-    def __init__(self, unique_name: str, model: str = "anthropic/claude-sonnet-4.5", max_response_chars: int = 2000, api_key: Optional[str] = None, worktree_path: Optional[Path] = None):
+    def __init__(self, unique_name: str, model: str = "anthropic/claude-sonnet-4.5", api_key: Optional[str] = None, worktree_path: Optional[Path] = None):
         super().__init__(
             context_id=unique_name,
             context_type='research',
             model=model,
-            max_response_chars=max_response_chars,
             api_key=api_key,
             worktree_path=worktree_path
         )
@@ -364,12 +365,11 @@ class ResearchContext(BaseContext):
 class ImplementationContext(BaseContext):
     """Context for implementing code based on specifications."""
 
-    def __init__(self, unique_name: str, model: str = "anthropic/claude-sonnet-4.5", max_response_chars: int = 2000, api_key: Optional[str] = None, worktree_path: Optional[Path] = None):
+    def __init__(self, unique_name: str, model: str = "anthropic/claude-sonnet-4.5", api_key: Optional[str] = None, worktree_path: Optional[Path] = None):
         super().__init__(
             context_id=unique_name,
             context_type='implementation',
             model=model,
-            max_response_chars=max_response_chars,
             api_key=api_key,
             worktree_path=worktree_path
         )
@@ -378,12 +378,11 @@ class ImplementationContext(BaseContext):
 class ReviewContext(BaseContext):
     """Context for reviewing code quality and correctness."""
 
-    def __init__(self, unique_name: str, model: str = "anthropic/claude-sonnet-4.5", max_response_chars: int = 2000, api_key: Optional[str] = None, worktree_path: Optional[Path] = None):
+    def __init__(self, unique_name: str, model: str = "anthropic/claude-sonnet-4.5", api_key: Optional[str] = None, worktree_path: Optional[Path] = None):
         super().__init__(
             context_id=unique_name,
             context_type='review',
             model=model,
-            max_response_chars=max_response_chars,
             api_key=api_key,
             worktree_path=worktree_path
         )
@@ -392,12 +391,24 @@ class ReviewContext(BaseContext):
 class MergeContext(BaseContext):
     """Context for resolving merge conflicts."""
 
-    def __init__(self, unique_name: str, model: str = "anthropic/claude-sonnet-4.5", max_response_chars: int = 2000, api_key: Optional[str] = None, worktree_path: Optional[Path] = None):
+    def __init__(self, unique_name: str, model: str = "anthropic/claude-sonnet-4.5", api_key: Optional[str] = None, worktree_path: Optional[Path] = None):
         super().__init__(
             context_id=unique_name,
             context_type='merge',
             model=model,
-            max_response_chars=max_response_chars,
+            api_key=api_key,
+            worktree_path=worktree_path
+        )
+
+
+class FileProcessorContext(BaseContext):
+    """Context for processing individual files in batch operations."""
+
+    def __init__(self, unique_name: str, model: str = "qwen/qwen3-coder-30b-a3b-instruct", api_key: Optional[str] = None, worktree_path: Optional[Path] = None):
+        super().__init__(
+            context_id=unique_name,
+            context_type='file_processor',
+            model=model,
             api_key=api_key,
             worktree_path=worktree_path
         )
@@ -409,11 +420,12 @@ CONTEXT_TYPES = {
     'research': ResearchContext,
     'implementation': ImplementationContext,
     'review': ReviewContext,
-    'merge': MergeContext
+    'merge': MergeContext,
+    'file_processor': FileProcessorContext
 }
 
 
-def create_context(unique_name: str, context_type: str, model: str = "auto", max_response_chars: int = 2000, worktree_path: Optional[Path] = None) -> BaseContext:
+def create_context(unique_name: str, context_type: str, model: str = "auto", worktree_path: Optional[Path] = None) -> BaseContext:
     """
     Create a new context of the specified type.
 
@@ -421,7 +433,6 @@ def create_context(unique_name: str, context_type: str, model: str = "auto", max
         unique_name: Unique identifier for the context
         context_type: Type of context to create
         model: Model to use (or "auto" for default)
-        max_response_chars: Maximum response characters
         worktree_path: Path to the worktree
 
     Returns:
@@ -435,4 +446,4 @@ def create_context(unique_name: str, context_type: str, model: str = "auto", max
         model = "anthropic/claude-sonnet-4.5"
 
     context_class = CONTEXT_TYPES[context_type]
-    return context_class(unique_name, model, max_response_chars, worktree_path=worktree_path)
+    return context_class(unique_name, model, worktree_path=worktree_path)

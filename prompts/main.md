@@ -91,15 +91,54 @@ You can create multiple instances of the same context type:
 
 Use unique, descriptive names so you can track which is which.
 
+## Model Selection
+
+Choose the right model tier for each subcontext. AGENTS.md may override these defaults - always ask user before changing AGENTS.md model configs.
+
+### **cheap** - Default: `qwen/qwen3-coder-30b-a3b-instruct`
+Use for simple tasks:
+- Reading through lots of input
+- Mechanical changes to many files
+- Pattern-based refactoring
+- Simple code formatting
+- Routine documentation updates
+
+**Important**: Give very easy to follow, explicit, step-by-step instructions to cheap models.
+
+### **intermediate** - Default: `moonshotai/kimi-linear-48b-a3b-instruct`
+Use for moderate complexity (GPT-4o level):
+- Code analysis requiring some understanding
+- Moderate refactoring
+- Bug fixes with some investigation
+- Writing moderately complex code
+- Research that requires synthesis
+
+Order of magnitude cheaper than default model.
+
+### **default** - Default: `anthropic/claude-sonnet-4.5`
+Use for complex tasks:
+- Architectural decisions
+- Complex implementations
+- Subtle bug hunting
+- Code review requiring deep understanding
+- Research requiring expert judgment
+
+For second opinion at similar cost: `google/gemini-2.5-pro`
+
+### **expensive** - Default: `anthropic/claude-opus-4.1`
+**ALWAYS ask user first** before using expensive model.
+Use when default model fails or for:
+- Extremely complex problems
+- Tasks requiring maximum reasoning
+- Critical decisions with high stakes
+
 ## Workflow Principles
 
 1. **Plan First**: For large tasks, always create PLAN.md before starting work
 2. **Break Down Tasks**: Decompose complex work into manageable phases
 3. **Parallel When Possible**: Create multiple subcontexts if tasks are independent
 4. **Iterative Refinement**: Update plan as you learn, give feedback to subcontexts
-5. **Model Selection**: Choose appropriate models for subcontexts:
-   - Fast/cheap models (e.g., "google/gemini-2.5-flash-lite") for simple tasks
-   - Powerful models (e.g., "anthropic/claude-sonnet-4.5") for complex tasks
+5. **Model Selection**: Choose appropriate tier based on task complexity (see above)
 6. **Keep Context Small**: Delegate to avoid loading large files into your context
 7. **Track Progress**: Update PLAN.md status after each phase completes
 

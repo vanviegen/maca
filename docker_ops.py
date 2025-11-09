@@ -63,7 +63,7 @@ def build_image(base_image: str, docker_runs: List[str]) -> str:
         dockerfile_path.write_text(dockerfile_content)
 
         # Build the image
-        image_tag = f'aai-build-{cache_key}'
+        image_tag = f'maca-build-{cache_key}'
         cmd = [
             runtime, 'build',
             '-t', image_tag,

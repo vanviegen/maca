@@ -40,7 +40,7 @@ def init_git_repo(path='.'):
     # Create an initial commit to have a main branch
     readme_path = Path(path) / 'README.md'
     if not readme_path.exists():
-        readme_path.write_text('# Project\n\nInitialized by aai.\n')
+        readme_path.write_text('# Project\n\nInitialized by maca.\n')
     run_git('add', 'README.md', cwd=path)
     run_git('commit', '-m', 'Initial commit', cwd=path)
 
@@ -103,13 +103,13 @@ def get_changed_files_between(old_commit, new_commit, cwd='.'):
 
 
 def find_next_session_id(repo_root):
-    """Find the next available session ID by checking .aai directory."""
-    aai_dir = Path(repo_root) / '.aai'
-    aai_dir.mkdir(exist_ok=True)
+    """Find the next available session ID by checking .maca directory."""
+    maca_dir = Path(repo_root) / '.maca'
+    maca_dir.mkdir(exist_ok=True)
 
     # Find all existing session directories
     existing = []
-    for item in aai_dir.iterdir():
+    for item in maca_dir.iterdir():
         if item.is_dir() and item.name.isdigit():
             existing.append(int(item.name))
 
@@ -118,8 +118,8 @@ def find_next_session_id(repo_root):
 
 def create_session_worktree(repo_root, session_id):
     """Create a new branch and worktree for the session."""
-    branch_name = f'aai-{session_id}'
-    session_dir = Path(repo_root) / '.aai' / str(session_id)
+    branch_name = f'maca-{session_id}'
+    session_dir = Path(repo_root) / '.maca' / str(session_id)
     worktree_path = session_dir / '<tree>'
 
     # Ensure session directory exists
@@ -142,9 +142,9 @@ def create_session_worktree(repo_root, session_id):
 
 
 def commit_changes(worktree_path, message):
-    """Commit all changes in the worktree with the given message, excluding .scratch and .aai."""
-    # Add all changes (including untracked files), but exclude .scratch and .aai
-    run_git('add', '-A', ':!.scratch', ':!.aai', cwd=worktree_path)
+    """Commit all changes in the worktree with the given message, excluding .scratch and .maca."""
+    # Add all changes (including untracked files), but exclude .scratch and .maca
+    run_git('add', '-A', ':!.scratch', ':!.maca', cwd=worktree_path)
 
     # Check if there are changes to commit
     result = run_git('diff', '--cached', '--quiet', cwd=worktree_path, check=False)
@@ -186,7 +186,7 @@ def generate_descriptive_branch_name(commit_message, repo_root):
     """
     Generate a descriptive branch name from commit message.
 
-    Returns a branch name that doesn't conflict with existing aai/* branches.
+    Returns a branch name that doesn't conflict with existing maca/* branches.
     """
     # Extract first line of commit message
     first_line = commit_message.split('\n')[0].strip()
@@ -210,11 +210,11 @@ def generate_descriptive_branch_name(commit_message, repo_root):
     if not name:
         name = 'changes'
 
-    # Check if aai/<name> exists, if so add suffix
+    # Check if maca/<name> exists, if so add suffix
     base_name = name
     counter = 2
     while True:
-        full_branch = f'aai/{name}'
+        full_branch = f'maca/{name}'
         result = run_git('rev-parse', '--verify', full_branch, cwd=repo_root, check=False)
         if result.returncode != 0:
             # Branch doesn't exist, we can use it
@@ -252,7 +252,7 @@ def merge_to_main(repo_root, worktree_path, branch_name, commit_message):
     enhanced_message = commit_message
     if not enhanced_message.endswith('\n'):
         enhanced_message += '\n'
-    enhanced_message += f'\nThe original chain of AAI commits is kept in the aai/{descriptive_name} branch.'
+    enhanced_message += f'\nThe original chain of MACA commits is kept in the maca/{descriptive_name} branch.'
 
     # Soft reset to base
     run_git('reset', '--soft', base_commit, cwd=repo_root)
@@ -276,7 +276,7 @@ def merge_to_main(repo_root, worktree_path, branch_name, commit_message):
     run_git('merge', '--ff-only', branch_name, cwd=repo_root)
 
     # Create the descriptive branch pointing at original HEAD
-    run_git('branch', f'aai/{descriptive_name}', original_head, cwd=repo_root)
+    run_git('branch', f'maca/{descriptive_name}', original_head, cwd=repo_root)
 
     return True, "Merged successfully"
 

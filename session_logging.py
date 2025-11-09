@@ -20,9 +20,10 @@ class SessionLogger:
         """
         self.repo_root = repo_root
         self.session_id = session_id
-        self.session_dir = repo_root / '.aai' / str(session_id)
+        self.session_dir = repo_root / '.maca' / str(session_id)
         self.total_cost = 0.0
         self.total_tokens = 0
+        self.seq = 0  # Global sequence number across all log entries
 
         # Ensure session directory exists
         self.session_dir.mkdir(parents=True, exist_ok=True)
@@ -39,7 +40,11 @@ class SessionLogger:
         context_id = context_id or 'main'
         log_path = self.session_dir / f'{context_id}.log'
 
+        # Increment global sequence number
+        self.seq += 1
+
         entry = {
+            'seq': self.seq,
             'type': entry_type,
             'timestamp': time.time(),
             'data': data

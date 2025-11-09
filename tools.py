@@ -14,7 +14,7 @@ WORKTREE_PATH = None
 REPO_ROOT = None
 
 # Setup shared input history
-HISTORY_FILE = Path.home() / '.aai' / 'history'
+HISTORY_FILE = Path.home() / '.maca' / 'history'
 HISTORY_FILE.parent.mkdir(exist_ok=True)
 HISTORY = FileHistory(str(HISTORY_FILE))
 
@@ -22,6 +22,7 @@ HISTORY = FileHistory(str(HISTORY_FILE))
 # Tool registry
 _MAIN_TOOLS = {}
 _SUBCONTEXT_TOOLS = {}
+_FILE_PROCESSOR_TOOLS = {}
 
 
 def tool(context_type='subcontext'):
@@ -29,7 +30,7 @@ def tool(context_type='subcontext'):
     Decorator to register a function as an LLM tool.
 
     Args:
-        context_type: 'main' or 'subcontext' to determine which context can use this tool
+        context_type: 'main', 'subcontext', or 'file_processor' to determine which context can use this tool
     """
     def decorator(func):
         # Generate schema from function
@@ -38,6 +39,11 @@ def tool(context_type='subcontext'):
         # Register tool
         if context_type == 'main':
             _MAIN_TOOLS[func.__name__] = {
+                'function': func,
+                'schema': schema
+            }
+        elif context_type == 'file_processor':
+            _FILE_PROCESSOR_TOOLS[func.__name__] = {
                 'function': func,
                 'schema': schema
             }
@@ -179,6 +185,9 @@ def get_tool_schemas(context_type='subcontext') -> List[Dict]:
         # Main context gets ALL tools (both main-only and subcontext tools)
         all_tools = {**_SUBCONTEXT_TOOLS, **_MAIN_TOOLS}
         return [tool_info['schema'] for tool_info in all_tools.values()]
+    elif context_type == 'file_processor':
+        # File processor contexts only get file_processor tools
+        return [tool_info['schema'] for tool_info in _FILE_PROCESSOR_TOOLS.values()]
     else:
         # Subcontexts only get subcontext tools
         return [tool_info['schema'] for tool_info in _SUBCONTEXT_TOOLS.values()]
@@ -195,6 +204,11 @@ def execute_tool(tool_name: str, arguments: Dict, context_type='subcontext') -> 
             tool_info = _SUBCONTEXT_TOOLS[tool_name]
         else:
             raise ValueError(f"Unknown tool: {tool_name}")
+    elif context_type == 'file_processor':
+        # File processor contexts can only use file_processor tools
+        if tool_name not in _FILE_PROCESSOR_TOOLS:
+            raise ValueError(f"Unknown tool: {tool_name}")
+        tool_info = _FILE_PROCESSOR_TOOLS[tool_name]
     else:
         # Subcontexts can only use subcontext tools
         if tool_name not in _SUBCONTEXT_TOOLS:
@@ -270,9 +284,12 @@ def read_files(file_paths: List[str], start_line: int = 1, max_lines: int = 250)
 
 
 @tool('subcontext')
-def list_files(path_regex: str = r".*", max_files: int = 200) -> List[str]:
+def list_files(path_regex: str = r".*", max_files: int = 50) -> Dict[str, Any]:
     """
     List files in the worktree matching a regular expression pattern.
+
+    Returns a random sampling if more files match than max_files.
+    Use this to get an impression of what files exist matching a pattern.
 
     Use | to match multiple file types efficiently in one call.
     Examples:
@@ -280,19 +297,23 @@ def list_files(path_regex: str = r".*", max_files: int = 200) -> List[str]:
     - r"\.(py|js|ts)$" - Python, JavaScript, and TypeScript files
     - r"^src/.*\.(py|md)$" - Python and Markdown files in src/
     - r"(test_.*\.py|.*_test\.py)$" - Python test files
+    - r"^[^/\\]*$" - Files in top directory only (no subdirectories)
 
     Args:
         path_regex: Regular expression to match file paths (applied to full relative path)
-        max_files: Maximum number of files to return
+        max_files: Maximum number of files to return (default: 50)
 
     Returns:
-        List of file paths relative to worktree root, sorted
+        Dict with 'total_count' (int) and 'files' (list of paths). If total_count > max_files,
+        'files' contains random sampling.
     """
+    import random
+
     worktree = Path(WORKTREE_PATH)
     matches = []
     pattern = re.compile(path_regex)
 
-    # Walk the entire tree
+    # Walk the entire tree and collect ALL matches
     for root, dirs, files in os.walk(worktree):
         # Skip .git, .scratch, and other hidden directories
         dirs[:] = [d for d in dirs if not d.startswith('.')]
@@ -305,10 +326,20 @@ def list_files(path_regex: str = r".*", max_files: int = 200) -> List[str]:
             if pattern.search(rel_path_str):
                 matches.append(rel_path_str)
 
-                if len(matches) >= max_files:
-                    return sorted(matches)
+    total_count = len(matches)
 
-    return sorted(matches)
+    # If we have more matches than max_files, return random sampling
+    if total_count > max_files:
+        sampled = random.sample(matches, max_files)
+        return {
+            'total_count': total_count,
+            'files': sorted(sampled)
+        }
+    else:
+        return {
+            'total_count': total_count,
+            'files': sorted(matches)
+        }
 
 
 @tool('subcontext')
@@ -505,16 +536,27 @@ def get_user_input(prompt: str, preset_answers: List[str] = None) -> str:
 
 
 @tool('main')
-def create_subcontext(unique_name: str, context_type: str, task: str, model: str = "auto", max_response_chars: int = 2000) -> str:
+def create_subcontext(unique_name: str, context_type: str, task: str, model: str = "auto", path_regex: str = r".*", file_limit: int = 5) -> str:
     """
     Create a new subcontext to work on a specific task.
 
+    For regular context types (code_analysis, research, implementation, review, merge):
+    - Creates a single subcontext
+    - path_regex and file_limit parameters are ignored
+
+    For file_processor context type:
+    - Spawns one file_processor instance per file matching path_regex
+    - Each instance processes a single file autonomously
+    - If more than file_limit files match, returns error suggesting to use list_files first
+    - unique_name gets file name appended to make it actually unique
+
     Args:
-        unique_name: Unique identifier for this subcontext
-        context_type: Type of context (code_analysis, research, implementation, review, merge)
+        unique_name: Unique identifier for this subcontext (file_processor: base name, file appended)
+        context_type: Type of context (code_analysis, research, implementation, review, merge, file_processor)
         task: Description of the task for this subcontext
-        model: Model to use ("auto" to let system choose, or specific model name)
-        max_response_chars: Maximum characters the subcontext can return
+        model: Model to use ("auto" for default, or specific model name like "qwen/qwen3-coder-30b-a3b-instruct")
+        path_regex: Regex pattern to match files (only for file_processor context type)
+        file_limit: Maximum files to process (only for file_processor context type)
 
     Returns:
         Confirmation message
@@ -557,4 +599,61 @@ def complete(result: str) -> None:
         result: Summary of everything that was accomplished in the entire session
     """
     # Handled by the orchestrator
+    pass
+
+
+# ==============================================================================
+# FILE_PROCESSOR TOOLS
+# ==============================================================================
+
+@tool('file_processor')
+def update_files_and_complete(updates: List[Dict[str, str]], result: str) -> None:
+    """
+    Update files and signal completion. This is the ONLY tool available to file_processor contexts.
+
+    This is a one-shot tool - the context terminates immediately after calling it.
+
+    Args:
+        updates: List of file update specifications (same format as update_files tool)
+        result: Brief summary of what was done with this file (goes to Main context)
+    """
+    # First perform the updates
+    if updates:
+        from . import WORKTREE_PATH
+        for update in updates:
+            file_path = update['file_path']
+            full_path = Path(WORKTREE_PATH) / file_path
+
+            # Ensure parent directory exists
+            full_path.parent.mkdir(parents=True, exist_ok=True)
+
+            if 'data' in update:
+                # Full file write
+                full_path.write_text(update['data'])
+            elif 'old_data' in update and 'new_data' in update:
+                # Search and replace
+                if not full_path.exists():
+                    raise ValueError(f"Cannot search/replace in non-existent file: {file_path}")
+
+                content = full_path.read_text()
+                old_data = update['old_data']
+                new_data = update['new_data']
+                allow_multiple = update.get('allow_multiple', False)
+
+                count = content.count(old_data)
+                if count == 0:
+                    raise ValueError(f"Search string not found in {file_path}")
+                elif count > 1 and not allow_multiple:
+                    raise ValueError(f"Search string appears {count} times in {file_path}, but allow_multiple=false")
+
+                if allow_multiple:
+                    content = content.replace(old_data, new_data)
+                else:
+                    content = content.replace(old_data, new_data, 1)
+
+                full_path.write_text(content)
+            else:
+                raise ValueError(f"Invalid update specification: {update}")
+
+    # Result is handled by the orchestrator
     pass
