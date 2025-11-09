@@ -175,18 +175,33 @@ def generate_tool_schema(func, context_type='subcontext') -> Dict:
 
 def get_tool_schemas(context_type='subcontext') -> List[Dict]:
     """Get all tool schemas for a given context type."""
-    tools = _MAIN_TOOLS if context_type == 'main' else _SUBCONTEXT_TOOLS
-    return [tool_info['schema'] for tool_info in tools.values()]
+    if context_type == 'main':
+        # Main context gets ALL tools (both main-only and subcontext tools)
+        all_tools = {**_SUBCONTEXT_TOOLS, **_MAIN_TOOLS}
+        return [tool_info['schema'] for tool_info in all_tools.values()]
+    else:
+        # Subcontexts only get subcontext tools
+        return [tool_info['schema'] for tool_info in _SUBCONTEXT_TOOLS.values()]
 
 
 def execute_tool(tool_name: str, arguments: Dict, context_type='subcontext') -> Any:
     """Execute a tool with the given arguments."""
-    tools = _MAIN_TOOLS if context_type == 'main' else _SUBCONTEXT_TOOLS
+    # Try to find the tool in the appropriate registry
+    if context_type == 'main':
+        # Main context can use both main-only and subcontext tools
+        if tool_name in _MAIN_TOOLS:
+            tool_info = _MAIN_TOOLS[tool_name]
+        elif tool_name in _SUBCONTEXT_TOOLS:
+            tool_info = _SUBCONTEXT_TOOLS[tool_name]
+        else:
+            raise ValueError(f"Unknown tool: {tool_name}")
+    else:
+        # Subcontexts can only use subcontext tools
+        if tool_name not in _SUBCONTEXT_TOOLS:
+            raise ValueError(f"Unknown tool: {tool_name}")
+        tool_info = _SUBCONTEXT_TOOLS[tool_name]
 
-    if tool_name not in tools:
-        raise ValueError(f"Unknown tool: {tool_name}")
-
-    func = tools[tool_name]['function']
+    func = tool_info['function']
 
     # Remove rationale from arguments before calling (it's just for logging)
     exec_args = {k: v for k, v in arguments.items() if k != 'rationale'}
@@ -428,7 +443,10 @@ def shell(command: str, docker_image: str = "debian:stable", docker_runs: List[s
 @tool('subcontext')
 def complete(result: str) -> None:
     """
-    Signal that the task is complete and return the result to the main context.
+    Signal that your subtask is complete and return the result to the main context.
+
+    This signals that YOU (the subcontext) are done with your specific task. The main context
+    may continue orchestrating other work after you complete.
 
     For tasks involving analysis or generating extensive output:
     - Place detailed results in files within .scratch/ directory (e.g., .scratch/analysis.md, .scratch/test-results.txt)
@@ -524,10 +542,19 @@ def continue_subcontext(unique_name: str, guidance: str = "") -> str:
 @tool('main')
 def complete(result: str) -> None:
     """
-    Signal that the entire task is complete.
+    Signal that the ENTIRE user task is complete and you're ready to end the session.
+
+    This is different from subcontext complete() - this signals that ALL work is done,
+    including any multi-phase plans, and you're ready to return control to the user.
+
+    Only call this when:
+    - All planned phases are complete
+    - All subtasks have been implemented and verified
+    - The user's original request has been fully satisfied
+    - No further work is needed
 
     Args:
-        result: Summary of what was accomplished
+        result: Summary of everything that was accomplished in the entire session
     """
     # Handled by the orchestrator
     pass

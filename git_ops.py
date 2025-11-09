@@ -57,6 +57,51 @@ def get_current_branch(cwd='.'):
     return result.stdout.strip()
 
 
+def get_head_commit(cwd='.'):
+    """Get the current HEAD commit hash."""
+    result = run_git('rev-parse', 'HEAD', cwd=cwd)
+    return result.stdout.strip()
+
+
+def get_commits_between(old_commit, new_commit, cwd='.'):
+    """
+    Get list of commits between old_commit and new_commit.
+
+    Returns list of dicts with 'hash' and 'message' (first line only).
+    """
+    # Format: <hash> <first line of message>
+    result = run_git('log', '--format=%H %s', f'{old_commit}..{new_commit}', cwd=cwd, check=False)
+
+    if result.returncode != 0 or not result.stdout.strip():
+        return []
+
+    commits = []
+    for line in result.stdout.strip().split('\n'):
+        if line:
+            parts = line.split(' ', 1)
+            if len(parts) == 2:
+                commits.append({
+                    'hash': parts[0][:8],  # Short hash
+                    'message': parts[1]
+                })
+
+    return commits
+
+
+def get_changed_files_between(old_commit, new_commit, cwd='.'):
+    """
+    Get list of files changed between old_commit and new_commit.
+
+    Returns list of file paths.
+    """
+    result = run_git('diff', '--name-only', old_commit, new_commit, cwd=cwd, check=False)
+
+    if result.returncode != 0 or not result.stdout.strip():
+        return []
+
+    return [line.strip() for line in result.stdout.strip().split('\n') if line.strip()]
+
+
 def find_next_session_id(repo_root):
     """Find the next available session ID by checking .aai directory."""
     aai_dir = Path(repo_root) / '.aai'
@@ -137,6 +182,50 @@ def squash_commits(repo_root, branch_name):
     return all_messages
 
 
+def generate_descriptive_branch_name(commit_message, repo_root):
+    """
+    Generate a descriptive branch name from commit message.
+
+    Returns a branch name that doesn't conflict with existing aai/* branches.
+    """
+    # Extract first line of commit message
+    first_line = commit_message.split('\n')[0].strip()
+
+    # Remove common prefixes
+    for prefix in ['Add', 'Update', 'Fix', 'Remove', 'Refactor', 'Implement']:
+        if first_line.startswith(prefix + ' '):
+            first_line = first_line[len(prefix) + 1:]
+            break
+
+    # Convert to branch name format (lowercase, hyphenated, max 40 chars)
+    name = first_line.lower()
+    name = re.sub(r'[^a-z0-9\s-]', '', name)  # Remove special chars
+    name = re.sub(r'\s+', '-', name)  # Replace spaces with hyphens
+    name = re.sub(r'-+', '-', name)  # Collapse multiple hyphens
+    name = name.strip('-')  # Remove leading/trailing hyphens
+    name = name[:40]  # Limit length
+    name = name.rstrip('-')  # Remove trailing hyphen if truncated
+
+    # Ensure we have something
+    if not name:
+        name = 'changes'
+
+    # Check if aai/<name> exists, if so add suffix
+    base_name = name
+    counter = 2
+    while True:
+        full_branch = f'aai/{name}'
+        result = run_git('rev-parse', '--verify', full_branch, cwd=repo_root, check=False)
+        if result.returncode != 0:
+            # Branch doesn't exist, we can use it
+            break
+        # Branch exists, try next variant
+        name = f'{base_name}-{counter}'
+        counter += 1
+
+    return name
+
+
 def merge_to_main(repo_root, worktree_path, branch_name, commit_message):
     """Merge the session branch into main using squash + rebase + ff strategy."""
     main_branch = get_current_branch(cwd=repo_root)
@@ -148,15 +237,28 @@ def merge_to_main(repo_root, worktree_path, branch_name, commit_message):
     # Switch to the session branch in the main repo
     run_git('checkout', branch_name, cwd=repo_root)
 
+    # Save the current HEAD commit hash (before squashing)
+    result = run_git('rev-parse', 'HEAD', cwd=repo_root)
+    original_head = result.stdout.strip()
+
     # Get the merge base
     result = run_git('merge-base', main_branch, branch_name, cwd=repo_root)
     base_commit = result.stdout.strip()
 
+    # Generate descriptive branch name for preserving history
+    descriptive_name = generate_descriptive_branch_name(commit_message, repo_root)
+
+    # Append preservation note to commit message
+    enhanced_message = commit_message
+    if not enhanced_message.endswith('\n'):
+        enhanced_message += '\n'
+    enhanced_message += f'\nThe original chain of AAI commits is kept in the aai/{descriptive_name} branch.'
+
     # Soft reset to base
     run_git('reset', '--soft', base_commit, cwd=repo_root)
 
-    # Commit everything as one commit
-    run_git('commit', '-m', commit_message, cwd=repo_root, check=False)
+    # Commit everything as one commit with enhanced message
+    run_git('commit', '-m', enhanced_message, cwd=repo_root, check=False)
 
     # Go back to main branch
     run_git('checkout', main_branch, cwd=repo_root)
@@ -172,6 +274,9 @@ def merge_to_main(repo_root, worktree_path, branch_name, commit_message):
 
     # Fast-forward merge
     run_git('merge', '--ff-only', branch_name, cwd=repo_root)
+
+    # Create the descriptive branch pointing at original HEAD
+    run_git('branch', f'aai/{descriptive_name}', original_head, cwd=repo_root)
 
     return True, "Merged successfully"
 

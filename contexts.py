@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Dict, List, Any, Optional
 
 import tools
+from git_ops import get_head_commit, get_commits_between, get_changed_files_between
 
 
 class ContextError(Exception):
@@ -48,6 +49,7 @@ class BaseContext:
         self.messages = []
         self.last_usage = {}
         self.agents_md_content = None
+        self.last_head_commit = None
 
         if not self.api_key:
             raise ContextError("OPENROUTER_API_KEY not set")
@@ -57,6 +59,10 @@ class BaseContext:
 
         # Load AGENTS.md if it exists
         self._load_agents_md()
+
+        # Initialize HEAD tracking if we have a worktree
+        if self.worktree_path:
+            self.last_head_commit = get_head_commit(cwd=self.worktree_path)
 
     def _load_system_prompt(self):
         """Load the system prompt from markdown files."""
@@ -146,6 +152,44 @@ class BaseContext:
 
         return False
 
+    def _check_head_changes(self):
+        """
+        Check if HEAD has changed since last invocation.
+
+        If changed, add a system message with commit info and changed files.
+        """
+        if not self.worktree_path or not self.last_head_commit:
+            return
+
+        current_head = get_head_commit(cwd=self.worktree_path)
+
+        if current_head != self.last_head_commit:
+            # HEAD has changed, gather info
+            commits = get_commits_between(self.last_head_commit, current_head, cwd=self.worktree_path)
+            changed_files = get_changed_files_between(self.last_head_commit, current_head, cwd=self.worktree_path)
+
+            if commits or changed_files:
+                # Build system message
+                message_parts = ["# Repository Updates\n\nThe following changes have been made since you were last invoked:\n"]
+
+                if commits:
+                    message_parts.append("\n## New Commits\n")
+                    for commit in commits:
+                        message_parts.append(f"- `{commit['hash']}` {commit['message']}")
+
+                if changed_files:
+                    message_parts.append("\n\n## Changed Files\n")
+                    for filepath in changed_files:
+                        message_parts.append(f"- {filepath}")
+
+                self.messages.append({
+                    'role': 'system',
+                    'content': '\n'.join(message_parts)
+                })
+
+            # Update tracking
+            self.last_head_commit = current_head
+
     def add_message(self, role: str, content: str):
         """Add a message to the context."""
         self.messages.append({
@@ -171,6 +215,9 @@ class BaseContext:
         Returns:
             Dict with 'message' and 'tool_calls' keys
         """
+        # Check for HEAD changes before calling LLM
+        self._check_head_changes()
+
         headers = {
             'Content-Type': 'application/json',
             'Authorization': f'Bearer {self.api_key}',
