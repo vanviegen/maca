@@ -536,33 +536,56 @@ def get_user_input(prompt: str, preset_answers: List[str] = None) -> str:
 
 
 @tool('main')
-def create_subcontext(unique_name: str, context_type: str, task: str, model: str = "auto", path_regex: str = r".*", file_limit: int = 5) -> str:
+def create_subcontext(context_type: str, task: str, model: str = "auto") -> str:
     """
     Create a new subcontext to work on a specific task.
+    The subcontext will be automatically named (e.g., research1, implementation2, etc.)
 
-    For regular context types (code_analysis, research, implementation, review, merge):
-    - Creates a single subcontext
-    - path_regex and file_limit parameters are ignored
+    Available context types:
+    - code_analysis: Analyze codebases, understand architecture
+    - research: Gather information, look up documentation, find solutions
+    - implementation: Write and modify code
+    - review: Review code for quality, correctness, security
+    - merge: Resolve git merge conflicts
 
-    For file_processor context type:
-    - Spawns one file_processor instance per file matching path_regex
-    - Each instance processes a single file autonomously
-    - If more than file_limit files match, returns error suggesting to use list_files first
-    - unique_name gets file name appended to make it actually unique
+    For processing multiple files with one-shot operations, use run_oneshot_per_file instead.
 
     Args:
-        unique_name: Unique identifier for this subcontext (file_processor: base name, file appended)
-        context_type: Type of context (code_analysis, research, implementation, review, merge, file_processor)
+        context_type: Type of context (code_analysis, research, implementation, review, merge)
         task: Description of the task for this subcontext
         model: Model to use ("auto" for default, or specific model name like "qwen/qwen3-coder-30b-a3b-instruct")
-        path_regex: Regex pattern to match files (only for file_processor context type)
-        file_limit: Maximum files to process (only for file_processor context type)
 
     Returns:
-        Confirmation message
+        Confirmation message with the auto-generated name
     """
     # Handled by the orchestrator
-    return f"Created subcontext '{unique_name}' of type '{context_type}'"
+    return f"Created subcontext of type '{context_type}'"
+
+
+@tool('main')
+def run_oneshot_per_file(path_regex: str, task: str, file_limit: int = 5, model: str = "auto") -> str:
+    """
+    Run a one-shot file_processor on each file matching path_regex.
+
+    Creates one file_processor instance per file. Each instance:
+    - Receives the file contents and task
+    - Has access to only update_files_and_complete tool
+    - Terminates after calling the tool (one-shot execution)
+
+    Useful for applying mechanical changes across multiple files, converting multiple files, or analyzing
+    multiple files individually, while keeping context sizes small.
+
+    Args:
+        path_regex: Regex pattern to match files (e.g., r"\\.py$" for Python files)
+        task: Task description for the file_processor (applied to each file)
+        file_limit: Maximum files to process (default: 5, prevents accidental bulk operations)
+        model: Model to use ("auto" for default, or specific model like "qwen/qwen3-coder-30b-a3b-instruct")
+
+    Returns:
+        Confirmation message with list of files being processed
+    """
+    # Handled by the orchestrator
+    return f"Running file_processor on files matching '{path_regex}'"
 
 
 @tool('main')

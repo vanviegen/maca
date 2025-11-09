@@ -48,6 +48,7 @@ class MACA:
         self.logger = None
         self.main_context = None
         self.subcontexts: Dict[str, contexts.BaseContext] = {}
+        self.context_counters: Dict[str, int] = {}  # Track counter per context type for auto-naming
         self.verbose = False
 
     def ensure_git_repo(self):
@@ -172,101 +173,113 @@ class MACA:
             return (result, False, None)
 
         elif tool_name == 'create_subcontext':
-            unique_name = arguments['unique_name']
             context_type = arguments['context_type']
             task = arguments['task']
             model = arguments.get('model', 'auto')
-            path_regex = arguments.get('path_regex', r'.*')
+
+            # Auto-generate unique name
+            if context_type not in self.context_counters:
+                self.context_counters[context_type] = 0
+            self.context_counters[context_type] += 1
+            unique_name = f"{context_type}{self.context_counters[context_type]}"
+
+            # Create the subcontext
+            subcontext = contexts.create_context(
+                unique_name, context_type, model,
+                worktree_path=self.worktree_path
+            )
+            self.subcontexts[unique_name] = subcontext
+
+            # Add the task to the subcontext
+            subcontext.add_message('user', task)
+
+            result = f"Created {context_type} subcontext '{unique_name}'"
+            self.logger.log_tool_result(tool_name, result, 0, 'main')
+
+            print_formatted_text(HTML(
+                f"  <ansigreen>Created subcontext:</ansigreen> {unique_name} ({context_type})"
+            ))
+
+            return (result, True, unique_name)
+
+        elif tool_name == 'run_oneshot_per_file':
+            path_regex = arguments['path_regex']
+            task = arguments['task']
             file_limit = arguments.get('file_limit', 5)
+            model = arguments.get('model', 'auto')
 
-            # Handle file_processor context type specially
-            if context_type == 'file_processor':
-                import re
-                from pathlib import Path as PathLib
+            # Auto-generate base name for file_processor contexts
+            context_type = 'file_processor'
+            if context_type not in self.context_counters:
+                self.context_counters[context_type] = 0
+            self.context_counters[context_type] += 1
+            base_name = f"file_processor{self.context_counters[context_type]}"
 
-                # Find matching files
-                pattern = re.compile(path_regex)
-                matching_files = []
+            # Find matching files
+            import re
+            from pathlib import Path as PathLib
 
-                for root, dirs, files in os.walk(self.worktree_path):
-                    # Skip .git, .scratch, .maca
-                    dirs[:] = [d for d in dirs if not d.startswith('.')]
+            pattern = re.compile(path_regex)
+            matching_files = []
 
-                    for file in files:
-                        full_path = PathLib(root) / file
-                        rel_path = full_path.relative_to(self.worktree_path)
-                        rel_path_str = str(rel_path)
+            for root, dirs, files in os.walk(self.worktree_path):
+                # Skip .git, .scratch, .maca
+                dirs[:] = [d for d in dirs if not d.startswith('.')]
 
-                        if pattern.search(rel_path_str):
-                            matching_files.append(rel_path_str)
+                for file in files:
+                    full_path = PathLib(root) / file
+                    rel_path = full_path.relative_to(self.worktree_path)
+                    rel_path_str = str(rel_path)
 
-                # Check file limit
-                if len(matching_files) > file_limit:
-                    error_msg = f"Matched {len(matching_files)} files, exceeds limit of {file_limit}. Use list_files(r'{path_regex}') first to see what matches, then adjust regex or increase file_limit."
-                    self.logger.log_tool_result(tool_name, error_msg, 0, 'main')
-                    print_formatted_text(HTML(f"  <ansired>Error:</ansired> {error_msg}"))
-                    return (error_msg, False, None)
+                    if pattern.search(rel_path_str):
+                        matching_files.append(rel_path_str)
 
-                # Create one subcontext per file
-                results = []
-                for file_path in matching_files:
-                    file_unique_name = f"{unique_name}-{file_path.replace('/', '-').replace('\\', '-')}"
+            # Check file limit
+            if len(matching_files) > file_limit:
+                error_msg = f"Matched {len(matching_files)} files, exceeds limit of {file_limit}. Use list_files(r'{path_regex}') first to see what matches, then adjust regex or increase file_limit."
+                self.logger.log_tool_result(tool_name, error_msg, 0, 'main')
+                print_formatted_text(HTML(f"  <ansired>Error:</ansired> {error_msg}"))
+                return (error_msg, False, None)
 
-                    # Read file contents
-                    full_file_path = self.worktree_path / file_path
-                    try:
-                        file_contents = full_file_path.read_text()
-                    except Exception as e:
-                        results.append(f"{file_path}: Error reading - {e}")
-                        continue
+            # Create one subcontext per file
+            results = []
+            for file_path in matching_files:
+                file_unique_name = f"{base_name}-{file_path.replace('/', '-').replace('\\', '-')}"
 
-                    # Create subcontext
-                    subcontext = contexts.create_context(
-                        file_unique_name, context_type, model,
-                        worktree_path=self.worktree_path
-                    )
-                    self.subcontexts[file_unique_name] = subcontext
+                # Read file contents
+                full_file_path = self.worktree_path / file_path
+                try:
+                    file_contents = full_file_path.read_text()
+                except Exception as e:
+                    results.append(f"{file_path}: Error reading - {e}")
+                    continue
 
-                    # Add file contents and task to context
-                    file_message = f"File: {file_path}\n\n```\n{file_contents}\n```\n\n{task}"
-                    subcontext.add_message('user', file_message)
-
-                    results.append(f"{file_path} -> {file_unique_name}")
-
-                result = f"Created {len(matching_files)} file_processor subcontexts:\n" + "\n".join(results)
-                self.logger.log_tool_result(tool_name, result, 0, 'main')
-
-                print_formatted_text(HTML(
-                    f"  <ansigreen>Created {len(matching_files)} file_processor subcontexts</ansigreen>"
-                ))
-
-                # Return first subcontext name to run
-                if matching_files:
-                    first_name = f"{unique_name}-{matching_files[0].replace('/', '-').replace('\\', '-')}"
-                    return (result, True, first_name)
-                else:
-                    return (result, False, None)
-
-            else:
-                # Regular subcontext creation
-                # Create the subcontext
+                # Create subcontext
                 subcontext = contexts.create_context(
-                    unique_name, context_type, model,
+                    file_unique_name, context_type, model,
                     worktree_path=self.worktree_path
                 )
-                self.subcontexts[unique_name] = subcontext
+                self.subcontexts[file_unique_name] = subcontext
 
-                # Add the task to the subcontext
-                subcontext.add_message('user', task)
+                # Add file contents and task to context
+                file_message = f"File: {file_path}\n\n```\n{file_contents}\n```\n\n{task}"
+                subcontext.add_message('user', file_message)
 
-                result = f"Created {context_type} subcontext '{unique_name}'"
-                self.logger.log_tool_result(tool_name, result, 0, 'main')
+                results.append(f"{file_path} -> {file_unique_name}")
 
-                print_formatted_text(HTML(
-                    f"  <ansigreen>Created subcontext:</ansigreen> {unique_name} ({context_type})"
-                ))
+            result = f"Created {len(matching_files)} file_processor subcontexts:\n" + "\n".join(results)
+            self.logger.log_tool_result(tool_name, result, 0, 'main')
 
-                return (result, True, unique_name)
+            print_formatted_text(HTML(
+                f"  <ansigreen>Created {len(matching_files)} file_processor subcontexts</ansigreen>"
+            ))
+
+            # Return first subcontext name to run
+            if matching_files:
+                first_name = f"{base_name}-{matching_files[0].replace('/', '-').replace('\\', '-')}"
+                return (result, True, first_name)
+            else:
+                return (result, False, None)
 
         elif tool_name == 'continue_subcontext':
             unique_name = arguments['unique_name']
