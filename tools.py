@@ -512,7 +512,7 @@ def shell(command: str, docker_image: str = "debian:stable", docker_runs: List[s
 
 
 @tool
-def subcontext_complete(result: str) -> None:
+def subcontext_complete(result: str) -> bool:
     """
     Signal that your subtask is complete and return the result to the main context.
 
@@ -533,8 +533,7 @@ def subcontext_complete(result: str) -> None:
     Args:
         result: Summary of what was accomplished (and optionally mention .scratch/ files with details)
     """
-    # This is handled specially by the context runner
-    pass
+    return True
 
 
 @tool
@@ -613,14 +612,7 @@ def create_subcontext(context_type: str, task: str, model: str = "auto", budget:
 
     # Auto-generate unique name and create subcontext
     unique_name = maca._generate_unique_context_name(context_type)
-    maca._create_and_register_subcontext(unique_name, context_type, model, task)
-
-    # Initialize budget tracking
-    maca.subcontext_budgets[unique_name] = budget
-    maca.subcontext_spent[unique_name] = 0
-
-    result = f"Created {context_type} subcontext '{unique_name}' with budget {budget}μ$"
-    maca.logger.log('main', type='tool_result', tool_name='create_subcontext', result=result, duration=0)
+    subcontext = maca._create_and_register_subcontext(unique_name, context_type, model, task)
 
     print_formatted_text(FormattedText([
         ('', '  '),
@@ -629,9 +621,18 @@ def create_subcontext(context_type: str, task: str, model: str = "auto", budget:
     ]))
 
     # Run the subcontext autonomously
-    maca.run_subcontext(unique_name)
+    run_result = subcontext.run(budget=budget, logger=maca.logger, maca=maca)
 
-    return result
+    # Build summary for main context
+    summary = f"Subcontext '{unique_name}' ({context_type}):\n"
+    summary += f"Status: {'Completed' if run_result['completed'] else 'Budget exceeded'}\n"
+    summary += f"Cost: {run_result['cost']}μ$\n\n"
+    summary += run_result['summary']
+
+    # Add summary to main context
+    maca.main_context.add_message('user', summary)
+
+    return summary
 
 
 @tool
@@ -654,10 +655,88 @@ def run_oneshot_per_file(path_regex: str, task: str, file_limit: int = 5, model:
         model: Model to use ("auto" for default, or specific model like "qwen/qwen3-coder-30b-a3b-instruct")
 
     Returns:
-        Confirmation message with list of files being processed
+        Summary of processing all files
     """
-    # Handled by the orchestrator
-    return f"Running file_processor on files matching '{path_regex}'"
+    import contexts
+    from prompt_toolkit import print_formatted_text
+    from prompt_toolkit.formatted_text import FormattedText
+    from pathlib import Path
+
+    maca = MACA_INSTANCE
+    if not maca:
+        raise ValueError("MACA instance not initialized")
+
+    # Get list of files matching the regex
+    file_list_result = list_files(path_regex=path_regex, max_files=file_limit)
+    files = file_list_result['files']
+
+    # Filter to only actual files (not directories)
+    files = [f for f in files if f.get('type') != 'directory']
+
+    if not files:
+        return f"No files found matching pattern '{path_regex}'"
+
+    if len(files) > file_limit:
+        files = files[:file_limit]
+
+    print_formatted_text(FormattedText([
+        ('', '  '),
+        ('ansigreen', f'Processing {len(files)} files with file_processor...'),
+    ]))
+
+    # Process each file
+    results = []
+    total_cost = 0
+
+    for i, file_info in enumerate(files, 1):
+        file_path = file_info['path']
+
+        print_formatted_text(FormattedText([
+            ('', '  '),
+            ('ansicyan', f'[{i}/{len(files)}] Processing: {file_path}'),
+        ]))
+
+        # Read file contents
+        file_result = read_files([file_path])
+        if file_result[0].get('error'):
+            error_msg = f"Error reading {file_path}: {file_result[0]['error']}"
+            results.append(error_msg)
+            continue
+
+        file_contents = file_result[0]['data']
+
+        # Create unique name for this file processor
+        unique_name = f"file_processor{i}"
+
+        # Create file_processor context
+        context = contexts.Context(
+            context_id=unique_name,
+            context_type='_file_processor',
+            model=model,
+            worktree_path=Path(WORKTREE_PATH)
+        )
+
+        # Add task and file contents
+        initial_message = f"{task}\n\nFile: {file_path}\n\nContents:\n{file_contents}"
+        context.add_message('user', initial_message)
+
+        # Run context (will execute once and complete)
+        run_result = context.run(budget=None, logger=maca.logger, maca=maca)
+
+        total_cost += run_result['cost']
+
+        # Collect result
+        if run_result['completed']:
+            results.append(f"{file_path}: {run_result['tool_result']}")
+        else:
+            results.append(f"{file_path}: ERROR - {run_result['summary']}")
+
+    # Build aggregate summary
+    summary = f"Processed {len(files)} files with file_processor.\n"
+    summary += f"Total cost: {total_cost}μ$\n\n"
+    summary += "Results:\n" + "\n".join(f"- {r}" for r in results)
+
+    return summary
 
 
 @tool
@@ -687,36 +766,35 @@ def continue_subcontext(unique_name: str, guidance: str = "", budget: int = 2000
     if unique_name not in maca.subcontexts:
         raise ValueError(f"Unknown subcontext: {unique_name}")
 
+    subcontext = maca.subcontexts[unique_name]
+
     # Add guidance if provided
     if guidance:
-        maca.subcontexts[unique_name].add_message('user', guidance)
+        subcontext.add_message('user', guidance)
 
-    # Update budget (add to existing budget)
-    if unique_name not in maca.subcontext_budgets:
-        maca.subcontext_budgets[unique_name] = budget
-        maca.subcontext_spent[unique_name] = 0
-    else:
-        maca.subcontext_budgets[unique_name] += budget
-
-    result = f"Continuing subcontext '{unique_name}' with additional budget {budget}μ$"
-    maca.logger.log('main', type='tool_result', tool_name='continue_subcontext', result=result, duration=0)
-
-    spent = maca.subcontext_spent.get(unique_name, 0)
-    remaining = maca.subcontext_budgets[unique_name] - spent
     print_formatted_text(FormattedText([
         ('', '  '),
         ('ansigreen', 'Continuing subcontext:'),
-        ('', f' {unique_name}, budget: {remaining}μ$ remaining'),
+        ('', f' {unique_name}, budget: {budget}μ$'),
     ]))
 
     # Run the subcontext autonomously
-    maca.run_subcontext(unique_name)
+    run_result = subcontext.run(budget=budget, logger=maca.logger, maca=maca)
 
-    return result
+    # Build summary for main context
+    summary = f"Subcontext '{unique_name}' continued:\n"
+    summary += f"Status: {'Completed' if run_result['completed'] else 'Budget exceeded'}\n"
+    summary += f"Cost: {run_result['cost']}μ$\n\n"
+    summary += run_result['summary']
+
+    # Add summary to main context
+    maca.main_context.add_message('user', summary)
+
+    return summary
 
 
 @tool
-def main_complete(result: str) -> None:
+def main_complete(result: str) -> bool:
     """
     Signal that the ENTIRE user task is complete and you're ready to end the session.
 
@@ -732,12 +810,11 @@ def main_complete(result: str) -> None:
     Args:
         result: Summary of everything that was accomplished in the entire session
     """
-    # Handled by the orchestrator
-    pass
+    return True
 
 
 @tool
-def update_files_and_complete(updates: List[Dict[str, str]], result: str) -> None:
+def update_files_and_complete(updates: List[Dict[str, str]], result: str) -> bool:
     """
     Update files and signal completion. This is the ONLY tool available to file_processor contexts.
 
@@ -784,5 +861,4 @@ def update_files_and_complete(updates: List[Dict[str, str]], result: str) -> Non
             else:
                 raise ValueError(f"Invalid update specification: {update}")
 
-    # Result is handled by the orchestrator
-    pass
+    return True

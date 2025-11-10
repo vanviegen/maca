@@ -291,7 +291,9 @@ class Context:
         choice = result['choices'][0]
         message = choice['message']
 
-        cost = int(result['usage']['cost' * 1_000_000]) # Convert dollars to microdollars
+        # Extract usage
+        usage = result.get('usage', {})
+        cost = int(usage.get('cost', 0) * 1_000_000)  # Convert dollars to microdollars
         self.cumulative_cost += cost
 
         # Add assistant message to history
@@ -304,12 +306,13 @@ class Context:
         if len(tool_calls) != 1:
             raise ContextError(f"Expected exactly 1 tool call, got {len(tool_calls)}")
 
-        logger.log(self.context_id, type='response', message=message, cost=cost, tool_call=tool_calls[0])
+        if logger:
+            logger.log(self.context_id, type='response', message=message, cost=cost, tool_call=tool_calls[0])
 
         return {
             'message': message,
             'tool_call': tool_calls[0],
-            'usage': self.last_usage
+            'usage': usage
         }
 
     def execute_tool(self, tool_call: Dict) -> Any:
@@ -328,3 +331,219 @@ class Context:
             'tool_call_id': tool_call['id'],
             'content': str(result)
         })
+
+    def run(self, budget=None, logger=None, single_iteration=False, maca=None):
+        """
+        Run this context until completion, budget exceeded, or single iteration complete.
+
+        Args:
+            budget: Maximum cost in microdollars before returning (None = unlimited)
+            logger: Session logger instance
+            single_iteration: If True, run only one LLM call + tool execution then return
+            maca: MACA instance (for refreshing AGENTS.md across all contexts)
+
+        Returns:
+            dict with:
+            - completed: bool (True if completed normally, False if budget exceeded)
+            - summary: str (summary of what happened)
+            - cost: int (total cost in microdollars for this run)
+            - tool_name: str (name of last tool executed)
+            - tool_result: Any (result of last tool execution)
+        """
+        import time
+        import json
+        from prompt_toolkit import print_formatted_text
+        from prompt_toolkit.formatted_text import FormattedText
+        import git_ops
+
+        total_cost = 0
+        spent = 0
+        summary_parts = []
+        last_tool_name = None
+        last_tool_result = None
+        is_subcontext = (self.context_type != '_main')
+        indent = is_subcontext
+
+        # Loop until completion or budget exceeded
+        while True:
+            # Print thinking message
+            prefix = '  ' if indent else ''
+            thinking_msg = f"{prefix}Subcontext '{self.context_id}' thinking..." if indent else 'Main context thinking ...'
+            print_formatted_text(FormattedText([('ansicyan', thinking_msg)]))
+
+            # Call LLM
+            try:
+                response = self.call_llm(logger=logger)
+            except Exception as e:
+                if logger:
+                    logger.log(self.context_id, type='error', error=str(e))
+                return {
+                    'completed': False,
+                    'summary': f"Error during LLM call: {str(e)}",
+                    'cost': total_cost,
+                    'tool_name': last_tool_name,
+                    'tool_result': last_tool_result
+                }
+
+            tool_call = response['tool_call']
+            usage = response['usage']
+
+            # Extract usage metrics
+            tokens = usage.get('prompt_tokens', 0) + usage.get('completion_tokens', 0)
+            cost = usage.get('cost', 0)
+            total_cost += cost
+            spent += cost
+
+            # Log LLM call
+            if logger:
+                logger.log(self.context_id, type='llm_call', model=self.model, tokens=tokens, cost=cost)
+
+            # Extract tool info
+            tool_name = tool_call['function']['name']
+            arguments = json.loads(tool_call['function']['arguments'])
+            last_tool_name = tool_name
+
+            # Log tool call
+            if logger:
+                logger.log(self.context_id, type='tool_call', tool_name=tool_name, arguments=str(arguments))
+
+            # Print tool info
+            arrow_prefix = '  ' if indent else ''
+            print_formatted_text(FormattedText([
+                ('', arrow_prefix),
+                ('ansigreen', '→'),
+                ('', ' Tool: '),
+                ('ansiyellow', tool_name),
+            ]))
+
+            # Print rationale if present (subcontexts only)
+            rationale = arguments.get('rationale', '')
+            if indent and rationale:
+                print_formatted_text(FormattedText([
+                    ('', f"    Rationale: {rationale}"),
+                ]))
+
+            # Execute tool
+            tool_start = time.time()
+            try:
+                result = self.execute_tool(tool_call)
+                last_tool_result = result
+                tool_duration = time.time() - tool_start
+            except Exception as e:
+                error_msg = f"Error executing tool {tool_name}: {str(e)}"
+                if logger:
+                    logger.log(self.context_id, type='error', error=error_msg)
+                # Add error as tool result to maintain conversation integrity
+                self.add_tool_result(tool_call, error_msg)
+                return {
+                    'completed': False,
+                    'summary': error_msg,
+                    'cost': total_cost,
+                    'tool_name': tool_name,
+                    'tool_result': None
+                }
+
+            # Log tool result
+            if logger:
+                logger.log(self.context_id, type='tool_result', tool_name=tool_name, result=str(result), duration=tool_duration)
+
+            # Check if tool returned True (completion signal)
+            completed = (result is True)
+
+            # For completion tools, extract the result from arguments
+            if completed:
+                result = arguments.get('result', 'Task completed')
+                last_tool_result = result
+
+            # Add tool result to context
+            self.add_tool_result(tool_call, str(result))
+
+            # Check for git changes and commit if needed
+            diff_stats = None
+            if hasattr(tools, 'WORKTREE_PATH') and tools.WORKTREE_PATH:
+                from pathlib import Path
+                worktree_path = Path(tools.WORKTREE_PATH)
+                diff_stats = git_ops.get_diff_stats(worktree_path)
+
+                if diff_stats:
+                    # Commit changes
+                    commit_msg = rationale or f'{tool_name} executed'
+                    git_ops.commit_changes(worktree_path, commit_msg)
+                    if logger:
+                        logger.log(self.context_id, type='commit', message=commit_msg, diff_stats=diff_stats)
+
+                    print_formatted_text(FormattedText([
+                        ('', '    ' if indent else ''),
+                        ('ansigreen', '✓ Committed changes'),
+                    ]))
+
+                    # Check if AGENTS.md was updated and refresh all contexts
+                    if self.update_agents_md():
+                        print_formatted_text(FormattedText([
+                            ('', '    ' if indent else ''),
+                            ('ansicyan', 'AGENTS.md updated - refreshed all contexts'),
+                        ]))
+                        # Update all contexts if maca instance available
+                        if maca:
+                            if hasattr(maca, 'main_context') and maca.main_context and maca.main_context != self:
+                                maca.main_context.update_agents_md()
+                            for ctx in getattr(maca, 'subcontexts', {}).values():
+                                if ctx != self:
+                                    ctx.update_agents_md()
+
+            # Build summary for this iteration
+            iteration_summary = f"Tool: {tool_name}\n"
+            if rationale:
+                iteration_summary += f"Rationale: {rationale}\n"
+            iteration_summary += f"Tokens: {tokens}, Cost: {cost}μ$, Duration: {tool_duration:.2f}s\n"
+            if diff_stats:
+                iteration_summary += f"Changes:\n{diff_stats}\n"
+            iteration_summary += f"Result: {str(result)[:500]}\n"
+            summary_parts.append(iteration_summary)
+
+            # Check if we should return
+            if completed:
+                print_formatted_text(FormattedText([
+                    ('', '    ' if indent else ''),
+                    ('ansigreen', f'✓ Context {self.context_id} completed. Cost: {total_cost}μ$'),
+                ]))
+                return {
+                    'completed': True,
+                    'summary': '\n'.join(summary_parts),
+                    'cost': total_cost,
+                    'tool_name': tool_name,
+                    'tool_result': result
+                }
+
+            # Check budget (only for subcontexts)
+            if budget is not None:
+                remaining = budget - spent
+                if remaining <= 0:
+                    budget_msg = f"Context '{self.context_id}' budget exceeded (spent {spent}μ$ of {budget}μ$)"
+                    print_formatted_text(FormattedText([
+                        ('', '    ' if indent else ''),
+                        ('ansiyellow', budget_msg),
+                    ]))
+                    return {
+                        'completed': False,
+                        'summary': '\n'.join(summary_parts) + f"\n\n{budget_msg}",
+                        'cost': total_cost,
+                        'tool_name': tool_name,
+                        'tool_result': result
+                    }
+
+                # Show remaining budget
+                print_formatted_text(FormattedText([
+                    ('', '    ' if indent else ''),
+                    ('ansiblue', f'Budget remaining: {remaining}μ$'),
+                ]))
+
+            # If single_iteration mode, return after one iteration
+            if single_iteration:
+                return {
+                    'completed': False,
+                    'summary': '\n'.join(summary_parts),
+                    'cost': total_cost,
+                    'tool_name': tool_name,
+                    'tool_result': result
+                }

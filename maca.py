@@ -4,10 +4,8 @@
 import argparse
 import sys
 import os
-import time
 from pathlib import Path
 from typing import Dict, Optional
-import json
 
 from prompt_toolkit import prompt as pt_prompt
 from prompt_toolkit.shortcuts import radiolist_dialog
@@ -48,10 +46,8 @@ class MACA:
         self.branch_name = None
         self.logger = None
         self.main_context = None
-        self.subcontexts: Dict[str, contexts.BaseContext] = {}
+        self.subcontexts: Dict[str, contexts.Context] = {}
         self.context_counters: Dict[str, int] = {}  # Track counter per context type for auto-naming
-        self.subcontext_budgets: Dict[str, int] = {}  # Budget in μ$ per subcontext
-        self.subcontext_spent: Dict[str, int] = {}  # Amount spent in μ$ per subcontext
 
     def ensure_git_repo(self):
         """Ensure we're in a git repository, or offer to initialize one."""
@@ -115,223 +111,6 @@ class MACA:
 
             return prompt
 
-    def _execute_llm_call_and_log(self, context, context_id: str, indent: bool = False) -> tuple:
-        """
-        Execute LLM call and log it. Common logic for both main and subcontexts.
-
-        Args:
-            context: The context object to call
-            context_id: The ID to use for logging (e.g., 'main' or unique_name)
-            indent: Whether to indent the output messages
-
-        Returns:
-            Tuple of (tool_call, arguments, tokens, cost)
-        """
-        # Print thinking message
-        prefix = '  ' if indent else ''
-        thinking_msg = f"{prefix}Subcontext '{context_id}' thinking..." if indent else 'Main context thinking ...'
-        print_formatted_text(FormattedText([('ansicyan', thinking_msg)]))
-
-        # Call LLM
-        response = context.call_llm(logger=self.logger)
-        tool_call = response['tool_call']
-        usage = response['usage']
-
-        # Extract usage metrics
-        tokens = usage.get('prompt_tokens', 0) + usage.get('completion_tokens', 0)
-        cost = usage.get('cost', 0)
-
-        # Log LLM call
-        self.logger.log(context_id, type='llm_call', model=context.model, tokens=tokens, cost=cost)
-
-        # Extract tool info
-        tool_name = tool_call['function']['name']
-        arguments = json.loads(tool_call['function']['arguments'])
-
-        # Log tool call
-        self.logger.log(context_id, type='tool_call', tool_name=tool_name, arguments=str(arguments))
-
-        # Print tool info
-        arrow_prefix = '  ' if indent else ''
-        print_formatted_text(FormattedText([
-            ('', arrow_prefix),
-            ('ansigreen', '→'),
-            ('', ' Tool: '),
-            ('ansiyellow', tool_name),
-        ]))
-
-        # Print rationale if present (subcontexts only)
-        if indent and 'rationale' in arguments:
-            print_formatted_text(FormattedText([
-                ('', f"    Rationale: {arguments['rationale']}"),
-            ]))
-
-        return tool_call, arguments, tokens, cost
-
-    def run_main_context(self):
-        """Run one iteration of the main context."""
-        try:
-            tool_call, _, _, _ = self._execute_llm_call_and_log(
-                self.main_context, 'main', indent=False
-            )
-            return tool_call
-
-        except Exception as e:
-            self.logger.log('main', type='error', error=str(e))
-            raise
-
-    def execute_main_tool(self, tool_call: Dict) -> tuple:
-        """
-        Execute a main context tool call.
-
-        Returns:
-            Tuple of (result_string, should_run_subcontext, subcontext_name)
-        """
-        tool_name = tool_call['function']['name']
-        arguments = json.loads(tool_call['function']['arguments'])
-
-        # Special case: complete() signals end of task
-        if tool_name == 'complete':
-            return ('COMPLETE', False, None)
-
-        # All other tools are executed normally via the tool system
-        result = tools.execute_tool(tool_name, arguments, context_type='main')
-        self.logger.log('main', type='tool_result', tool_name=tool_name, result=str(result), duration=0)
-
-        # For run_oneshot_per_file, we need to run the first file processor subcontext
-        # This is the only remaining special case
-        if tool_name == 'run_oneshot_per_file' and 'first_subcontext' in result:
-            # Extract first subcontext name from result dict
-            return (str(result['message']), True, result['first_subcontext'])
-
-        return (str(result), False, None)
-
-    def run_subcontext(self, unique_name: str):
-        """
-        Run a subcontext autonomously until budget is exceeded or it calls complete().
-
-        The subcontext will loop, executing tool calls until either:
-        1. It calls complete() - task is done
-        2. Budget is exceeded - control returns to main for verification
-        3. An error occurs
-
-        All tool calls and rationales are still logged to main context for monitoring.
-        """
-        subcontext = self.subcontexts[unique_name]
-        budget = self.subcontext_budgets.get(unique_name, 20000)
-        spent = self.subcontext_spent.get(unique_name, 0)
-
-        # Loop until budget exceeded or complete() called
-        while True:
-            tool_call = None
-
-            try:
-                # Execute LLM call and log it
-                tool_call, arguments, tokens, cost = self._execute_llm_call_and_log(
-                    subcontext, unique_name, indent=True
-                )
-                tool_name = tool_call['function']['name']
-
-                # Update spending
-                spent += cost
-                self.subcontext_spent[unique_name] = spent
-
-                # Execute tool
-                tool_start = time.time()
-
-                if tool_name == 'complete':
-                    result = arguments.get('result', 'Task completed')
-                    tool_duration = 0
-                else:
-                    result = subcontext.execute_tool(tool_call)
-                    tool_duration = time.time() - tool_start
-
-                self.logger.log(unique_name, type='tool_result', tool_name=tool_name, result=result, duration=tool_duration)
-
-                # Add tool result to subcontext
-                subcontext.add_tool_result(tool_call, result)
-
-                # Check for git changes and commit if needed
-                diff_stats = git_ops.get_diff_stats(self.worktree_path)
-
-                agents_md_updated = False
-                if diff_stats:
-                    # Commit changes
-                    commit_msg = arguments.get('rationale', f'{tool_name} executed')
-                    git_ops.commit_changes(self.worktree_path, commit_msg)
-                    self.logger.log(unique_name, type='commit', message=commit_msg, diff_stats=diff_stats)
-
-                    print_formatted_text(FormattedText([
-                        ('', '    '),
-                        ('ansigreen', '✓ Committed changes'),
-                    ]))
-
-                    # Check if AGENTS.md was updated and refresh all contexts
-                    if self.main_context.update_agents_md():
-                        agents_md_updated = True
-                        print_formatted_text(FormattedText([
-                            ('', '    '),
-                            ('ansicyan', 'AGENTS.md updated - refreshed all contexts'),
-                        ]))
-                        # Update all subcontexts too
-                        for ctx in self.subcontexts.values():
-                            ctx.update_agents_md()
-
-                # Build summary for main context (for monitoring)
-                summary = self._build_subcontext_summary(
-                    unique_name, tool_name, arguments.get('rationale', ''),
-                    tokens, cost, tool_duration, diff_stats, result
-                )
-
-                # If this was an implementation context and AGENTS.md was updated, ask main to verify
-                if subcontext.context_type == 'implementation' and agents_md_updated:
-                    summary += ("\n\nNote: AGENTS.md was updated by this implementation. Please verify from "
-                               "a high-level perspective whether this update was appropriate and necessary. "
-                               "You may query the subcontext for the rationale behind the updates if needed.")
-
-                # Add summary to main context (for monitoring)
-                self.main_context.add_message('user', summary)
-                self.logger.log(unique_name, type='subcontext_summary', tool=tool_name, tokens=tokens, cost=cost, duration=tool_duration, diff_stats=diff_stats, agents_md_updated=agents_md_updated)
-
-                # Check if we should return control to main
-                if tool_name == 'complete':
-                    print_formatted_text(FormattedText([
-                        ('', '    '),
-                        ('ansigreen', f'✓ Subcontext {unique_name} completed. Spent: {spent}μ$'),
-                    ]))
-                    break
-
-                remaining = budget - spent
-                if remaining <= 0:
-                    budget_msg = f"Subcontext '{unique_name}' budget exceeded (spent {spent}μ$ of {budget}μ$). Returning control to main."
-                    print_formatted_text(FormattedText([
-                        ('', '    '),
-                        ('ansiyellow', budget_msg),
-                    ]))
-                    self.main_context.add_message('user', budget_msg)
-                    break
-
-                # Show remaining budget
-                print_formatted_text(FormattedText([
-                    ('', '    '),
-                    ('ansiblue', f'Budget remaining: {remaining}μ$'),
-                ]))
-
-            except Exception as e:
-                self.logger.log(unique_name, type='error', error=str(e))
-                error_msg = f"Error in subcontext '{unique_name}': {str(e)}"
-
-                # CRITICAL: If we got a tool_call but hit an error before adding the result,
-                # we MUST add an error result to maintain conversation history integrity
-                if tool_call is not None:
-                    try:
-                        subcontext.add_tool_result(tool_call, f"Error: {str(e)}")
-                    except:
-                        pass  # If this fails, we're in a bad state anyway
-
-                self.main_context.add_message('user', error_msg)
-                print_formatted_text(FormattedText([('ansired', error_msg)]))
-                break  # Exit loop on error
 
     def _generate_unique_context_name(self, context_type: str) -> str:
         """
@@ -376,27 +155,6 @@ class MACA:
 
         return subcontext
 
-    def _build_subcontext_summary(
-        self, unique_name: str, tool_name: str, rationale: str,
-        tokens: int, cost: int, duration: float, diff_stats: str, result: any
-    ) -> str:
-        """Build a summary message to send back to main context."""
-        summary = f"Subcontext '{unique_name}' executed tool: {tool_name}\n\n"
-        summary += f"Rationale: {rationale}\n\n"
-        summary += f"Tokens used: {tokens}, Cost: {cost}μ$, Duration: {duration:.2f}s\n\n"
-
-        if diff_stats:
-            summary += f"Changes made (git diff --numstat):\n{diff_stats}\n\n"
-        else:
-            summary += "No file changes made.\n\n"
-
-        # Include result summary (truncated)
-        result_str = str(result)[:500]
-        summary += f"Result: {result_str}\n\n"
-
-        summary += "Do you want to continue this subcontext or take a different action?"
-
-        return summary
 
     def handle_completion(self, result: str) -> bool:
         """
@@ -528,18 +286,18 @@ class MACA:
 
             # Main context loop
             while True:
-                # Run main context
-                tool_call = self.run_main_context()
+                # Run main context (single iteration mode)
+                run_result = self.main_context.run(
+                    budget=None,
+                    logger=self.logger,
+                    single_iteration=True,
+                    maca=self
+                )
 
-                # Execute the tool
-                result, should_run_subcontext, subcontext_name = self.execute_main_tool(tool_call)
-
-                if result == 'COMPLETE':
+                # Check if main context completed the task
+                if run_result['completed'] and run_result['tool_name'] in ['main_complete', 'complete']:
                     # Handle completion
-                    arguments = json.loads(tool_call['function']['arguments'])
-                    completion_result = arguments.get('result', 'Task completed')
-
-                    approved = self.handle_completion(completion_result)
+                    approved = self.handle_completion(run_result['tool_result'])
 
                     if approved:
                         # Merged successfully, start new task
@@ -548,12 +306,8 @@ class MACA:
                         # User wants changes, continue main loop
                         continue
 
-                # Add result to main context BEFORE running subcontext
-                self.main_context.add_tool_result(tool_call, result)
-
-                # Now run the subcontext if needed
-                if should_run_subcontext:
-                    self.run_subcontext(subcontext_name)
+                # Main context executed a tool, continue loop
+                # (Context.run already added tool result to context)
 
 
 def main():
