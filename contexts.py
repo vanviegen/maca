@@ -17,14 +17,14 @@ class ContextError(Exception):
     pass
 
 
-class BaseContext:
-    """Base class for all contexts."""
+class Context:
+    """Context for managing LLM interactions."""
 
     def __init__(
         self,
         context_id: str,
         context_type: str,
-        model: str,
+        model: str = "auto",
         api_key: Optional[str] = None,
         worktree_path: Optional[Path] = None
     ):
@@ -34,31 +34,38 @@ class BaseContext:
         Args:
             context_id: Unique identifier for this context
             context_type: Type of context (main, code_analysis, research, etc.)
-            model: Model to use for this context
+            model: Model to use for this context ("auto" to use default from prompt)
             api_key: OpenRouter API key (defaults to env var)
             worktree_path: Path to the worktree (for loading AGENTS.md)
         """
         self.context_id = context_id
         self.context_type = context_type
-        self.model = model
         self.api_key = api_key or os.environ.get('OPENROUTER_API_KEY')
         self.worktree_path = worktree_path
         self.messages = []
-        self.last_usage = {}
+        self.cumulative_cost = 0
         self.agents_md_content = None
         self.last_head_commit = None
+        self.default_model = 'openai/gpt-5-mini'
+        self.tool_names = []
 
         if not self.api_key:
             raise ContextError("OPENROUTER_API_KEY not set")
 
-        # Load system prompt
+        # Load system prompt and parse metadata
         self._load_system_prompt()
+
+        # Set model (use provided or default from prompt)
+        if model == "auto":
+            self.model = self.default_model
+        else:
+            self.model = model
 
         # Load AGENTS.md if it exists
         self._load_agents_md()
 
         # Add unique name info for subcontexts (main context doesn't need this)
-        if self.context_type != 'main':
+        if self.context_type != '_main':
             self.messages.append({
                 'role': 'system',
                 'content': f"# Your Context Info\n\nYour unique name: **{self.context_id}**\n\nYou can use this name to create guaranteed unique files in .scratch/ directory (e.g., `.scratch/{self.context_id}-output.txt`)."
@@ -69,7 +76,7 @@ class BaseContext:
             self.last_head_commit = get_head_commit(cwd=self.worktree_path)
 
     def _load_system_prompt(self):
-        """Load the system prompt from markdown files."""
+        """Load the system prompt from markdown files and parse metadata."""
         # Find the prompts directory (next to the script)
         script_dir = Path(__file__).parent
         prompts_dir = script_dir / 'prompts'
@@ -92,7 +99,35 @@ class BaseContext:
         if not prompt_path.exists():
             raise ContextError(f"System prompt not found: {prompt_path}")
 
-        system_prompt = prompt_path.read_text()
+        prompt_content = prompt_path.read_text()
+
+        # Split into headers and prompt body on first blank line
+        parts = prompt_content.split('\n\n', 1)
+        if len(parts) != 2:
+            raise ContextError(f"Prompt file {prompt_path} must have headers separated by blank line")
+        
+        headers_text, system_prompt = parts
+        
+        # Parse headers
+        for line in headers_text.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+                
+            if ':' not in line:
+                raise ContextError(f"Invalid header format in {prompt_path}: {line}")
+            
+            key, value = line.split(':', 1)
+            key = key.strip()
+            value = value.strip()
+            
+            if key == 'default_model':
+                self.default_model = value
+            elif key == 'tools':
+                self.tool_names = [name.strip() for name in value.split(',')]
+            else:
+                raise ContextError(f"Unknown header key in {prompt_path}: {key}")
+        
         self.messages.append({
             'role': 'system',
             'content': system_prompt
@@ -202,11 +237,10 @@ class BaseContext:
         })
 
     def get_tool_schemas(self) -> List[Dict]:
-        """Get tool schemas for this context type."""
-        if self.context_type == 'main':
-            return tools.get_tool_schemas('main')
-        else:
-            return tools.get_tool_schemas('subcontext')
+        """Get tool schemas for this context."""
+        # Add rationale to tools for non-main contexts (subcontexts need rationale)
+        add_rationale = (self.context_type != '_main')
+        return tools.get_tool_schemas(self.tool_names, add_rationale=add_rationale)
 
     def call_llm(self, logger=None) -> Dict[str, Any]:
         """
@@ -235,12 +269,9 @@ class BaseContext:
             'model': self.model,
             'messages': self.messages,
             'tools': tool_schemas,
+            'usage': {"include": True},
             'tool_choice': 'required',  # Force tool use
         }
-
-        # Log full prompt
-        if logger:
-            logger.log(self.context_id, type='full_prompt', messages=str(self.messages))
 
         try:
             req = urllib.request.Request(
@@ -256,14 +287,12 @@ class BaseContext:
                 raise ContextError(f"LLM API error: {error_body}")
             raise ContextError(f"LLM API error: {str(e)}")
 
-        # Log full response
-        if logger:
-            logger.log(self.context_id, type='full_response', response=str(result))
-
         # Extract response
         choice = result['choices'][0]
         message = choice['message']
-        self.last_usage = result.get('usage', {})
+
+        cost = int(result['usage']['cost' * 1_000_000]) # Convert dollars to microdollars
+        self.cumulative_cost += cost
 
         # Add assistant message to history
         self.messages.append(message)
@@ -274,6 +303,8 @@ class BaseContext:
         # Validate: must have exactly one tool call
         if len(tool_calls) != 1:
             raise ContextError(f"Expected exactly 1 tool call, got {len(tool_calls)}")
+
+        logger.log(self.context_id, type='response', message=message, cost=cost, tool_call=tool_calls[0])
 
         return {
             'message': message,
@@ -286,9 +317,7 @@ class BaseContext:
         tool_name = tool_call['function']['name']
         arguments = json.loads(tool_call['function']['arguments'])
 
-        context_tool_type = 'main' if self.context_type == 'main' else 'subcontext'
-
-        result = tools.execute_tool(tool_name, arguments, context_tool_type)
+        result = tools.execute_tool(tool_name, arguments)
         return result
 
     def add_tool_result(self, tool_call: Dict, result: Any):
@@ -299,129 +328,3 @@ class BaseContext:
             'tool_call_id': tool_call['id'],
             'content': str(result)
         })
-
-
-class MainContext(BaseContext):
-    """Main orchestrator context."""
-
-    def __init__(self, model: str = "anthropic/claude-sonnet-4.5", api_key: Optional[str] = None, worktree_path: Optional[Path] = None):
-        super().__init__(
-            context_id='main',
-            context_type='main',
-            model=model,
-            api_key=api_key,
-            worktree_path=worktree_path
-        )
-
-
-class CodeAnalysisContext(BaseContext):
-    """Context for analyzing code and creating/maintaining AGENTS.md."""
-
-    def __init__(self, unique_name: str, model: str = "anthropic/claude-sonnet-4.5", api_key: Optional[str] = None, worktree_path: Optional[Path] = None):
-        super().__init__(
-            context_id=unique_name,
-            context_type='code_analysis',
-            model=model,
-            api_key=api_key,
-            worktree_path=worktree_path
-        )
-
-
-class ResearchContext(BaseContext):
-    """Context for web research and information gathering."""
-
-    def __init__(self, unique_name: str, model: str = "anthropic/claude-sonnet-4.5", api_key: Optional[str] = None, worktree_path: Optional[Path] = None):
-        super().__init__(
-            context_id=unique_name,
-            context_type='research',
-            model=model,
-            api_key=api_key,
-            worktree_path=worktree_path
-        )
-
-
-class ImplementationContext(BaseContext):
-    """Context for implementing code based on specifications."""
-
-    def __init__(self, unique_name: str, model: str = "anthropic/claude-sonnet-4.5", api_key: Optional[str] = None, worktree_path: Optional[Path] = None):
-        super().__init__(
-            context_id=unique_name,
-            context_type='implementation',
-            model=model,
-            api_key=api_key,
-            worktree_path=worktree_path
-        )
-
-
-class ReviewContext(BaseContext):
-    """Context for reviewing code quality and correctness."""
-
-    def __init__(self, unique_name: str, model: str = "anthropic/claude-sonnet-4.5", api_key: Optional[str] = None, worktree_path: Optional[Path] = None):
-        super().__init__(
-            context_id=unique_name,
-            context_type='review',
-            model=model,
-            api_key=api_key,
-            worktree_path=worktree_path
-        )
-
-
-class MergeContext(BaseContext):
-    """Context for resolving merge conflicts."""
-
-    def __init__(self, unique_name: str, model: str = "anthropic/claude-sonnet-4.5", api_key: Optional[str] = None, worktree_path: Optional[Path] = None):
-        super().__init__(
-            context_id=unique_name,
-            context_type='merge',
-            model=model,
-            api_key=api_key,
-            worktree_path=worktree_path
-        )
-
-
-class FileProcessorContext(BaseContext):
-    """Context for processing individual files in batch operations."""
-
-    def __init__(self, unique_name: str, model: str = "qwen/qwen3-coder-30b-a3b-instruct", api_key: Optional[str] = None, worktree_path: Optional[Path] = None):
-        super().__init__(
-            context_id=unique_name,
-            context_type='file_processor',
-            model=model,
-            api_key=api_key,
-            worktree_path=worktree_path
-        )
-
-
-# Context type registry for creation
-CONTEXT_TYPES = {
-    'code_analysis': CodeAnalysisContext,
-    'research': ResearchContext,
-    'implementation': ImplementationContext,
-    'review': ReviewContext,
-    'merge': MergeContext,
-    'file_processor': FileProcessorContext
-}
-
-
-def create_context(unique_name: str, context_type: str, model: str = "auto", worktree_path: Optional[Path] = None) -> BaseContext:
-    """
-    Create a new context of the specified type.
-
-    Args:
-        unique_name: Unique identifier for the context
-        context_type: Type of context to create
-        model: Model to use (or "auto" for default)
-        worktree_path: Path to the worktree
-
-    Returns:
-        New context instance
-    """
-    if context_type not in CONTEXT_TYPES:
-        raise ContextError(f"Unknown context type: {context_type}")
-
-    if model == "auto":
-        # Use default model for each context type
-        model = "anthropic/claude-sonnet-4.5"
-
-    context_class = CONTEXT_TYPES[context_type]
-    return context_class(unique_name, model, worktree_path=worktree_path)

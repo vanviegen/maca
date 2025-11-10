@@ -12,6 +12,7 @@ from prompt_toolkit.history import FileHistory
 # Global variables set by the orchestrator
 WORKTREE_PATH = None
 REPO_ROOT = None
+MACA_INSTANCE = None  # Reference to the MACA orchestrator instance
 
 # Setup shared input history
 HISTORY_FILE = Path.home() / '.maca' / 'history'
@@ -19,42 +20,21 @@ HISTORY_FILE.parent.mkdir(exist_ok=True)
 HISTORY = FileHistory(str(HISTORY_FILE))
 
 
-# Tool registry
-_MAIN_TOOLS = {}
-_SUBCONTEXT_TOOLS = {}
-_FILE_PROCESSOR_TOOLS = {}
+# Tool registry - single registry for all tools
+_TOOLS = {}
 
 
-def tool(context_type='subcontext'):
+def tool(func):
     """
     Decorator to register a function as an LLM tool.
 
-    Args:
-        context_type: 'main', 'subcontext', or 'file_processor' to determine which context can use this tool
+    Tools are registered by name and schemas are generated on-demand
+    based on the context that uses them.
     """
-    def decorator(func):
-        # Generate schema from function
-        schema = generate_tool_schema(func, context_type)
-
-        # Register tool
-        if context_type == 'main':
-            _MAIN_TOOLS[func.__name__] = {
-                'function': func,
-                'schema': schema
-            }
-        elif context_type == 'file_processor':
-            _FILE_PROCESSOR_TOOLS[func.__name__] = {
-                'function': func,
-                'schema': schema
-            }
-        else:
-            _SUBCONTEXT_TOOLS[func.__name__] = {
-                'function': func,
-                'schema': schema
-            }
-
-        return func
-    return decorator
+    _TOOLS[func.__name__] = {
+        'function': func
+    }
+    return func
 
 
 def python_type_to_json_type(py_type) -> Dict:
@@ -101,7 +81,7 @@ def python_type_to_json_type(py_type) -> Dict:
         return {'type': 'string'}
 
 
-def generate_tool_schema(func, context_type='subcontext') -> Dict:
+def generate_tool_schema(func, add_rationale: bool = False) -> Dict:
     """Generate OpenAI-compatible function schema from a Python function."""
     sig = inspect.signature(func)
     type_hints = get_type_hints(func)
@@ -156,8 +136,8 @@ def generate_tool_schema(func, context_type='subcontext') -> Dict:
         if param.default == inspect.Parameter.empty:
             required.append(param_name)
 
-    # Add automatic rationale parameter only for subcontext tools
-    if context_type == 'subcontext':
+    # Add automatic rationale parameter if requested
+    if add_rationale:
         properties['rationale'] = {
             'type': 'string',
             'description': 'Explanation of why this tool is being called and what you expect to accomplish'
@@ -179,42 +159,35 @@ def generate_tool_schema(func, context_type='subcontext') -> Dict:
     }
 
 
-def get_tool_schemas(context_type='subcontext') -> List[Dict]:
-    """Get all tool schemas for a given context type."""
-    if context_type == 'main':
-        # Main context gets ALL tools (both main-only and subcontext tools)
-        all_tools = {**_SUBCONTEXT_TOOLS, **_MAIN_TOOLS}
-        return [tool_info['schema'] for tool_info in all_tools.values()]
-    elif context_type == 'file_processor':
-        # File processor contexts only get file_processor tools
-        return [tool_info['schema'] for tool_info in _FILE_PROCESSOR_TOOLS.values()]
-    else:
-        # Subcontexts only get subcontext tools
-        return [tool_info['schema'] for tool_info in _SUBCONTEXT_TOOLS.values()]
+def get_tool_schemas(tool_names: List[str], add_rationale: bool = False) -> List[Dict]:
+    """
+    Get tool schemas for the specified tool names.
+
+    Args:
+        tool_names: List of tool names to generate schemas for
+        add_rationale: Whether to add rationale parameter to all tools
+
+    Returns:
+        List of tool schemas
+    """
+    schemas = []
+    for tool_name in tool_names:
+        if tool_name not in _TOOLS:
+            raise ValueError(f"Unknown tool: {tool_name}")
+
+        tool_info = _TOOLS[tool_name]
+        schema = generate_tool_schema(tool_info['function'], add_rationale=add_rationale)
+        schemas.append(schema)
+
+    return schemas
 
 
-def execute_tool(tool_name: str, arguments: Dict, context_type='subcontext') -> Any:
+def execute_tool(tool_name: str, arguments: Dict) -> Any:
     """Execute a tool with the given arguments."""
-    # Try to find the tool in the appropriate registry
-    if context_type == 'main':
-        # Main context can use both main-only and subcontext tools
-        if tool_name in _MAIN_TOOLS:
-            tool_info = _MAIN_TOOLS[tool_name]
-        elif tool_name in _SUBCONTEXT_TOOLS:
-            tool_info = _SUBCONTEXT_TOOLS[tool_name]
-        else:
-            raise ValueError(f"Unknown tool: {tool_name}")
-    elif context_type == 'file_processor':
-        # File processor contexts can only use file_processor tools
-        if tool_name not in _FILE_PROCESSOR_TOOLS:
-            raise ValueError(f"Unknown tool: {tool_name}")
-        tool_info = _FILE_PROCESSOR_TOOLS[tool_name]
-    else:
-        # Subcontexts can only use subcontext tools
-        if tool_name not in _SUBCONTEXT_TOOLS:
-            raise ValueError(f"Unknown tool: {tool_name}")
-        tool_info = _SUBCONTEXT_TOOLS[tool_name]
+    if tool_name not in _TOOLS:
+        raise ValueError(f"Unknown tool: {tool_name}")
 
+    tool_info = _TOOLS[tool_name]
     func = tool_info['function']
 
     # Remove rationale from arguments before calling (it's just for logging)
@@ -224,10 +197,10 @@ def execute_tool(tool_name: str, arguments: Dict, context_type='subcontext') -> 
 
 
 # ==============================================================================
-# SUBCONTEXT TOOLS
+# TOOLS
 # ==============================================================================
 
-@tool('subcontext')
+@tool
 def read_files(file_paths: List[str], start_line: int = 1, max_lines: int = 250) -> List[Dict[str, Any]]:
     """
     Read one or more files, optionally with line range limits.
@@ -283,7 +256,7 @@ def read_files(file_paths: List[str], start_line: int = 1, max_lines: int = 250)
     return results
 
 
-@tool('subcontext')
+@tool
 def list_files(path_regex: str = ".*", max_files: int = 50) -> Dict[str, Any]:
     """
     List files in the worktree matching a regular expression pattern.
@@ -411,7 +384,7 @@ def list_files(path_regex: str = ".*", max_files: int = 50) -> Dict[str, Any]:
         }
 
 
-@tool('subcontext')
+@tool
 def update_files(updates: List[Dict[str, str]]) -> None:
     """
     Update one or more files with new content.
@@ -423,8 +396,6 @@ def update_files(updates: List[Dict[str, str]]) -> None:
     Args:
         updates: List of update specifications
     """
-    from . import WORKTREE_PATH
-
     for update in updates:
         file_path = update['file_path']
         full_path = Path(WORKTREE_PATH) / file_path
@@ -461,7 +432,7 @@ def update_files(updates: List[Dict[str, str]]) -> None:
             raise ValueError(f"Invalid update specification: {update}")
 
 
-@tool('subcontext')
+@tool
 def search(glob_pattern: str, regex: str, max_results: int = 10, lines_before: int = 2, lines_after: int = 2) -> List[Dict[str, Any]]:
     """
     Search for a regex pattern in files matching a glob pattern.
@@ -509,7 +480,7 @@ def search(glob_pattern: str, regex: str, max_results: int = 10, lines_before: i
     return results
 
 
-@tool('subcontext')
+@tool
 def shell(command: str, docker_image: str = "debian:stable", docker_runs: List[str] = None, head: int = 50, tail: int = 50) -> Dict[str, Any]:
     """
     Execute a shell command in a Docker container.
@@ -540,8 +511,8 @@ def shell(command: str, docker_image: str = "debian:stable", docker_runs: List[s
     )
 
 
-@tool('subcontext')
-def complete(result: str) -> None:
+@tool
+def subcontext_complete(result: str) -> None:
     """
     Signal that your subtask is complete and return the result to the main context.
 
@@ -566,11 +537,7 @@ def complete(result: str) -> None:
     pass
 
 
-# ==============================================================================
-# MAIN CONTEXT TOOLS
-# ==============================================================================
-
-@tool('main')
+@tool
 def get_user_input(prompt: str, preset_answers: List[str] = None) -> str:
     """
     Get input from the user interactively.
@@ -604,11 +571,15 @@ def get_user_input(prompt: str, preset_answers: List[str] = None) -> str:
         return pt_prompt(f"{prompt}\n> ", history=HISTORY)
 
 
-@tool('main')
-def create_subcontext(context_type: str, task: str, model: str = "auto") -> str:
+@tool
+def create_subcontext(context_type: str, task: str, model: str = "auto", budget: int = 20000) -> str:
     """
     Create a new subcontext to work on a specific task.
     The subcontext will be automatically named (e.g., research1, implementation2, etc.)
+
+    The subcontext will run autonomously until its budget is exhausted or it calls complete().
+    Only when the budget is exceeded will control return to you for verification.
+    All tool calls and rationales will still be logged to your context for monitoring.
 
     Available context types:
     - code_analysis: Analyze codebases, understand architecture
@@ -623,15 +594,47 @@ def create_subcontext(context_type: str, task: str, model: str = "auto") -> str:
         context_type: Type of context (code_analysis, research, implementation, review, merge)
         task: Description of the task for this subcontext
         model: Model to use ("auto" for default, or specific model name like "qwen/qwen3-coder-30b-a3b-instruct")
+        budget: Maximum cost in microdollars (μ$) before returning control (default: 20000μ$ = $0.02)
 
     Returns:
         Confirmation message with the auto-generated name
     """
-    # Handled by the orchestrator
-    return f"Created subcontext of type '{context_type}'"
+    import contexts
+    from prompt_toolkit import print_formatted_text
+    from prompt_toolkit.formatted_text import FormattedText
+
+    maca = MACA_INSTANCE
+    if not maca:
+        raise ValueError("MACA instance not initialized")
+
+    # Validate context type - reject special (underscore-prefixed) context types
+    if context_type.startswith('_'):
+        raise ValueError(f"Cannot create subcontext of type '{context_type}'. Types starting with '_' are reserved for special contexts.")
+
+    # Auto-generate unique name and create subcontext
+    unique_name = maca._generate_unique_context_name(context_type)
+    maca._create_and_register_subcontext(unique_name, context_type, model, task)
+
+    # Initialize budget tracking
+    maca.subcontext_budgets[unique_name] = budget
+    maca.subcontext_spent[unique_name] = 0
+
+    result = f"Created {context_type} subcontext '{unique_name}' with budget {budget}μ$"
+    maca.logger.log('main', type='tool_result', tool_name='create_subcontext', result=result, duration=0)
+
+    print_formatted_text(FormattedText([
+        ('', '  '),
+        ('ansigreen', 'Created subcontext:'),
+        ('', f' {unique_name} ({context_type}), budget: {budget}μ$'),
+    ]))
+
+    # Run the subcontext autonomously
+    maca.run_subcontext(unique_name)
+
+    return result
 
 
-@tool('main')
+@tool
 def run_oneshot_per_file(path_regex: str, task: str, file_limit: int = 5, model: str = "auto") -> str:
     """
     Run a one-shot file_processor on each file matching path_regex.
@@ -657,24 +660,63 @@ def run_oneshot_per_file(path_regex: str, task: str, file_limit: int = 5, model:
     return f"Running file_processor on files matching '{path_regex}'"
 
 
-@tool('main')
-def continue_subcontext(unique_name: str, guidance: str = "") -> str:
+@tool
+def continue_subcontext(unique_name: str, guidance: str = "", budget: int = 20000) -> str:
     """
     Continue running an existing subcontext, optionally with additional guidance.
+
+    The subcontext will run autonomously until its budget is exhausted or it calls complete().
+    Only when the budget is exceeded will control return to you for verification.
+    All tool calls and rationales will still be logged to your context for monitoring.
 
     Args:
         unique_name: The unique identifier of the subcontext to continue
         guidance: Optional additional guidance or feedback for the subcontext
+        budget: Maximum cost in microdollars (μ$) before returning control (default: 20000μ$ = $0.02)
 
     Returns:
         Confirmation message
     """
-    # Handled by the orchestrator
-    return f"Continuing subcontext '{unique_name}'"
+    from prompt_toolkit import print_formatted_text
+    from prompt_toolkit.formatted_text import FormattedText
+
+    maca = MACA_INSTANCE
+    if not maca:
+        raise ValueError("MACA instance not initialized")
+
+    if unique_name not in maca.subcontexts:
+        raise ValueError(f"Unknown subcontext: {unique_name}")
+
+    # Add guidance if provided
+    if guidance:
+        maca.subcontexts[unique_name].add_message('user', guidance)
+
+    # Update budget (add to existing budget)
+    if unique_name not in maca.subcontext_budgets:
+        maca.subcontext_budgets[unique_name] = budget
+        maca.subcontext_spent[unique_name] = 0
+    else:
+        maca.subcontext_budgets[unique_name] += budget
+
+    result = f"Continuing subcontext '{unique_name}' with additional budget {budget}μ$"
+    maca.logger.log('main', type='tool_result', tool_name='continue_subcontext', result=result, duration=0)
+
+    spent = maca.subcontext_spent.get(unique_name, 0)
+    remaining = maca.subcontext_budgets[unique_name] - spent
+    print_formatted_text(FormattedText([
+        ('', '  '),
+        ('ansigreen', 'Continuing subcontext:'),
+        ('', f' {unique_name}, budget: {remaining}μ$ remaining'),
+    ]))
+
+    # Run the subcontext autonomously
+    maca.run_subcontext(unique_name)
+
+    return result
 
 
-@tool('main')
-def complete(result: str) -> None:
+@tool
+def main_complete(result: str) -> None:
     """
     Signal that the ENTIRE user task is complete and you're ready to end the session.
 
@@ -694,11 +736,7 @@ def complete(result: str) -> None:
     pass
 
 
-# ==============================================================================
-# FILE_PROCESSOR TOOLS
-# ==============================================================================
-
-@tool('file_processor')
+@tool
 def update_files_and_complete(updates: List[Dict[str, str]], result: str) -> None:
     """
     Update files and signal completion. This is the ONLY tool available to file_processor contexts.
@@ -711,7 +749,6 @@ def update_files_and_complete(updates: List[Dict[str, str]], result: str) -> Non
     """
     # First perform the updates
     if updates:
-        from . import WORKTREE_PATH
         for update in updates:
             file_path = update['file_path']
             full_path = Path(WORKTREE_PATH) / file_path

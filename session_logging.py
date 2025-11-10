@@ -91,12 +91,10 @@ class SessionLogger:
         for key, value in kwargs.items():
             formatted_value, suffix = self._format_value(value)
             lines.append(f'{key}{suffix}: {formatted_value}')
-        
-        # Add blank line separator
-        lines.append('')
 
         with open(log_path, 'a') as f:
             f.write('\n'.join(lines))
+            f.write('\n\n')  # Add blank line separator between log entries
 
     def read_log(self, context_id: str = 'main') -> list:
         """
@@ -177,5 +175,5 @@ class SessionLogger:
         # Don't forget the last entry if file doesn't end with blank line
         if current_entry:
             entries.append(current_entry)
-        
+
         return entries
