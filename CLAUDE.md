@@ -72,7 +72,7 @@ MACA orchestrates specialized contexts that communicate through tool calls:
 - `AGENTS.md` loaded as system message, updates appended as diffs
 - OpenRouter API used for all LLM calls
 
-**Session Logging** (`session_logging.py`)
+**Session Logging** (`logger.py`)
 - Human-readable logs per context in `.maca/<session_id>/<context_id>.log`
 - HEREDOC format for multiline values
 - Tracks: LLM calls, tool invocations, tokens, costs, git changes
@@ -117,7 +117,7 @@ MACA orchestrates specialized contexts that communicate through tool calls:
 - `contexts.py` - Context classes and LLM interaction
 - `tools.py` - Tool system with reflection-based schemas
 - `git_ops.py` - Git worktree and branch management
-- `session_logging.py` - Human-readable session logs
+- `logger.py` - Human-readable session logs
 - `docker_ops.py` - Container execution for shell commands
 
 **System Prompts** (in `prompts/`)

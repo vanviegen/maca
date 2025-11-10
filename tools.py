@@ -1,28 +1,19 @@
 #!/usr/bin/env python3
 """Tool system with reflection-based schema generation."""
 
+from dataclasses import dataclass
 import inspect
 import re
 import os
+from prompt_toolkit import prompt as pt_prompt
+from prompt_toolkit.shortcuts import radiolist_dialog
 from pathlib import Path
 from typing import get_type_hints, get_origin, get_args, Any, Dict, List, Union
-import typing
-from prompt_toolkit.history import FileHistory
 
-# Global variables set by the orchestrator
-WORKTREE_PATH = None
-REPO_ROOT = None
-MACA_INSTANCE = None  # Reference to the MACA orchestrator instance
-
-# Setup shared input history
-HISTORY_FILE = Path.home() / '.maca' / 'history'
-HISTORY_FILE.parent.mkdir(exist_ok=True)
-HISTORY = FileHistory(str(HISTORY_FILE))
-
+from maca import maca
 
 # Tool registry - single registry for all tools
 _TOOLS = {}
-
 
 def tool(func):
     """
@@ -140,7 +131,7 @@ def generate_tool_schema(func, add_rationale: bool = False) -> Dict:
     if add_rationale:
         properties['rationale'] = {
             'type': 'string',
-            'description': 'Explanation of why this tool is being called and what you expect to accomplish'
+            'description': '**Very brief** (max 20 words) explanation of why this tool is being called and what you expect to accomplish'
         }
         required.append('rationale')
 
@@ -159,7 +150,7 @@ def generate_tool_schema(func, add_rationale: bool = False) -> Dict:
     }
 
 
-def get_tool_schemas(tool_names: List[str], add_rationale: bool = False) -> List[Dict]:
+def get_tool_schemas(tool_names: List[str], add_rationale: bool = True) -> List[Dict]:
     """
     Get tool schemas for the specified tool names.
 
@@ -195,6 +186,9 @@ def execute_tool(tool_name: str, arguments: Dict) -> Any:
 
     return func(**exec_args)
 
+@dataclass
+class ReadyResult:
+    result: Any
 
 # ==============================================================================
 # TOOLS
@@ -217,7 +211,7 @@ def read_files(file_paths: List[str], start_line: int = 1, max_lines: int = 250)
     """
     results = []
     for file_path in file_paths:
-        full_path = Path(WORKTREE_PATH) / file_path
+        full_path = Path(maca.worktree_path) / file_path
 
         if not full_path.exists():
             results.append({
@@ -290,7 +284,7 @@ def list_files(path_regex: str = ".*", max_files: int = 50) -> Dict[str, Any]:
     """
     import random
 
-    worktree = Path(WORKTREE_PATH)
+    worktree = Path(maca.worktree_path)
     matches = []
     pattern = re.compile(path_regex)
 
@@ -366,22 +360,17 @@ def list_files(path_regex: str = ".*", max_files: int = 50) -> Dict[str, Any]:
 
     total_count = len(matches)
 
+    # If we have more matches than max_files, return random sampling
+    if total_count > max_files:
+        matches = random.sample(matches, max_files)
+
     # Sort by path
     matches.sort(key=lambda x: x["path"])
 
-    # If we have more matches than max_files, return random sampling
-    if total_count > max_files:
-        sampled = random.sample(matches, max_files)
-        sampled.sort(key=lambda x: x["path"])
-        return {
-            'total_count': total_count,
-            'files': sampled
-        }
-    else:
-        return {
-            'total_count': total_count,
-            'files': matches
-        }
+    return {
+        'total_count': total_count,
+        'files': matches
+    }
 
 
 @tool
@@ -398,7 +387,7 @@ def update_files(updates: List[Dict[str, str]]) -> None:
     """
     for update in updates:
         file_path = update['file_path']
-        full_path = Path(WORKTREE_PATH) / file_path
+        full_path = Path(maca.worktree_path) / file_path
 
         # Ensure parent directory exists
         full_path.parent.mkdir(parents=True, exist_ok=True)
@@ -447,7 +436,7 @@ def search(glob_pattern: str, regex: str, max_results: int = 10, lines_before: i
     Returns:
         List of matches with file_path, line_number, and context lines
     """
-    worktree = Path(WORKTREE_PATH)
+    worktree = Path(maca.worktree_path)
     results = []
     pattern = re.compile(regex)
 
@@ -502,8 +491,6 @@ def shell(command: str, docker_image: str = "debian:stable", docker_runs: List[s
 
     return run_in_container(
         command=command,
-        worktree_path=Path(WORKTREE_PATH),
-        repo_root=Path(REPO_ROOT),
         docker_image=docker_image,
         docker_runs=docker_runs,
         head=head,
@@ -533,7 +520,7 @@ def subcontext_complete(result: str) -> bool:
     Args:
         result: Summary of what was accomplished (and optionally mention .scratch/ files with details)
     """
-    return True
+    return ReadyResult(result)
 
 
 @tool
@@ -548,9 +535,6 @@ def get_user_input(prompt: str, preset_answers: List[str] = None) -> str:
     Returns:
         The user's input
     """
-    from prompt_toolkit import prompt as pt_prompt
-    from prompt_toolkit.shortcuts import radiolist_dialog
-
     if preset_answers:
         # Show radio list dialog
         choices = [(answer, answer) for answer in preset_answers]
@@ -563,11 +547,11 @@ def get_user_input(prompt: str, preset_answers: List[str] = None) -> str:
         ).run()
 
         if result == '__custom__':
-            return pt_prompt(f"{prompt}\n> ", history=HISTORY)
+            return pt_prompt(f"{prompt}\n> ", history=maca.history)
         return result
     else:
         # Simple text input
-        return pt_prompt(f"{prompt}\n> ", history=HISTORY)
+        return pt_prompt(f"{prompt}\n> ", history=maca.history)
 
 
 @tool
@@ -598,41 +582,28 @@ def create_subcontext(context_type: str, task: str, model: str = "auto", budget:
     Returns:
         Confirmation message with the auto-generated name
     """
-    import contexts
-    from prompt_toolkit import print_formatted_text
-    from prompt_toolkit.formatted_text import FormattedText
-
-    maca = MACA_INSTANCE
-    if not maca:
-        raise ValueError("MACA instance not initialized")
+    import context
+    from utils import color_print
 
     # Validate context type - reject special (underscore-prefixed) context types
     if context_type.startswith('_'):
         raise ValueError(f"Cannot create subcontext of type '{context_type}'. Types starting with '_' are reserved for special contexts.")
 
-    # Auto-generate unique name and create subcontext
-    unique_name = maca._generate_unique_context_name(context_type)
-    subcontext = maca._create_and_register_subcontext(unique_name, context_type, model, task)
+    # Create subcontext (it will auto-generate unique name and register itself)
+    subcontext = context.Context(
+        context_type=context_type,
+        model=model,
+        initial_message=task
+    )
 
-    print_formatted_text(FormattedText([
-        ('', '  '),
+    color_print(
+        '  ',
         ('ansigreen', 'Created subcontext:'),
-        ('', f' {unique_name} ({context_type}), budget: {budget}μ$'),
-    ]))
+        f' {subcontext.context_id} ({context_type}), budget: {budget}μ$',
+    )
 
     # Run the subcontext autonomously
-    run_result = subcontext.run(budget=budget, logger=maca.logger, maca=maca)
-
-    # Build summary for main context
-    summary = f"Subcontext '{unique_name}' ({context_type}):\n"
-    summary += f"Status: {'Completed' if run_result['completed'] else 'Budget exceeded'}\n"
-    summary += f"Cost: {run_result['cost']}μ$\n\n"
-    summary += run_result['summary']
-
-    # Add summary to main context
-    maca.main_context.add_message('user', summary)
-
-    return summary
+    return subcontext.run(budget=budget)
 
 
 @tool
@@ -657,14 +628,9 @@ def run_oneshot_per_file(path_regex: str, task: str, file_limit: int = 5, model:
     Returns:
         Summary of processing all files
     """
-    import contexts
-    from prompt_toolkit import print_formatted_text
-    from prompt_toolkit.formatted_text import FormattedText
+    import context
+    from utils import color_print
     from pathlib import Path
-
-    maca = MACA_INSTANCE
-    if not maca:
-        raise ValueError("MACA instance not initialized")
 
     # Get list of files matching the regex
     file_list_result = list_files(path_regex=path_regex, max_files=file_limit)
@@ -679,10 +645,10 @@ def run_oneshot_per_file(path_regex: str, task: str, file_limit: int = 5, model:
     if len(files) > file_limit:
         files = files[:file_limit]
 
-    print_formatted_text(FormattedText([
-        ('', '  '),
+    color_print(
+        '  ',
         ('ansigreen', f'Processing {len(files)} files with file_processor...'),
-    ]))
+    )
 
     # Process each file
     results = []
@@ -691,10 +657,10 @@ def run_oneshot_per_file(path_regex: str, task: str, file_limit: int = 5, model:
     for i, file_info in enumerate(files, 1):
         file_path = file_info['path']
 
-        print_formatted_text(FormattedText([
-            ('', '  '),
+        color_print(
+            '  ',
             ('ansicyan', f'[{i}/{len(files)}] Processing: {file_path}'),
-        ]))
+        )
 
         # Read file contents
         file_result = read_files([file_path])
@@ -708,20 +674,20 @@ def run_oneshot_per_file(path_regex: str, task: str, file_limit: int = 5, model:
         # Create unique name for this file processor
         unique_name = f"file_processor{i}"
 
-        # Create file_processor context
-        context = contexts.Context(
-            context_id=unique_name,
+        # Create file_processor context (special type, doesn't auto-register)
+        context = context.Context(
             context_type='_file_processor',
             model=model,
-            worktree_path=Path(WORKTREE_PATH)
         )
+        # Manually set the context_id since it's a special context
+        context.context_id = unique_name
 
         # Add task and file contents
         initial_message = f"{task}\n\nFile: {file_path}\n\nContents:\n{file_contents}"
         context.add_message('user', initial_message)
 
         # Run context (will execute once and complete)
-        run_result = context.run(budget=None, logger=maca.logger, maca=maca)
+        run_result = context.run(budget=None)
 
         total_cost += run_result['cost']
 
@@ -756,12 +722,7 @@ def continue_subcontext(unique_name: str, guidance: str = "", budget: int = 2000
     Returns:
         Confirmation message
     """
-    from prompt_toolkit import print_formatted_text
-    from prompt_toolkit.formatted_text import FormattedText
-
-    maca = MACA_INSTANCE
-    if not maca:
-        raise ValueError("MACA instance not initialized")
+    from utils import color_print
 
     if unique_name not in maca.subcontexts:
         raise ValueError(f"Unknown subcontext: {unique_name}")
@@ -772,25 +733,14 @@ def continue_subcontext(unique_name: str, guidance: str = "", budget: int = 2000
     if guidance:
         subcontext.add_message('user', guidance)
 
-    print_formatted_text(FormattedText([
-        ('', '  '),
+    color_print(
+        '  ',
         ('ansigreen', 'Continuing subcontext:'),
-        ('', f' {unique_name}, budget: {budget}μ$'),
-    ]))
+        f' {unique_name}, budget: {budget}μ$',
+    )
 
     # Run the subcontext autonomously
-    run_result = subcontext.run(budget=budget, logger=maca.logger, maca=maca)
-
-    # Build summary for main context
-    summary = f"Subcontext '{unique_name}' continued:\n"
-    summary += f"Status: {'Completed' if run_result['completed'] else 'Budget exceeded'}\n"
-    summary += f"Cost: {run_result['cost']}μ$\n\n"
-    summary += run_result['summary']
-
-    # Add summary to main context
-    maca.main_context.add_message('user', summary)
-
-    return summary
+    return subcontext.run(budget=budget)
 
 
 @tool
@@ -810,7 +760,7 @@ def main_complete(result: str) -> bool:
     Args:
         result: Summary of everything that was accomplished in the entire session
     """
-    return True
+    return ReadyResult(result)
 
 
 @tool
@@ -820,15 +770,23 @@ def update_files_and_complete(updates: List[Dict[str, str]], result: str) -> boo
 
     This is a one-shot tool - the context terminates immediately after calling it.
 
+    Each update can either:
+        1. Write entire file: {"file_path": "path/to/file", "data": "new content"}
+        2. Search and replace: {"file_path": "path/to/file", "old_data": "search", "new_data": "replacement", "allow_multiple": true}
+
+    Note that for search and replace, old_data must match exactly (including whitespace and newlines). If it does not appear or appears
+    multiple times (and allow_multiple is false), an error is raised. "allow_multiple" default to false (so you can leave it out for
+    the common case of single replacement).
+
     Args:
-        updates: List of file update specifications (same format as update_files tool)
+        updates: List of file update specifications
         result: Brief summary of what was done with this file (goes to Main context)
     """
     # First perform the updates
     if updates:
         for update in updates:
             file_path = update['file_path']
-            full_path = Path(WORKTREE_PATH) / file_path
+            full_path = Path(maca.worktree_path) / file_path
 
             # Ensure parent directory exists
             full_path.parent.mkdir(parents=True, exist_ok=True)
@@ -861,4 +819,4 @@ def update_files_and_complete(updates: List[Dict[str, str]], result: str) -> boo
             else:
                 raise ValueError(f"Invalid update specification: {update}")
 
-    return True
+    return ReadyResult(result)

@@ -28,15 +28,9 @@ Do NOT include:
 - Every single dependency
 - Implementation details that are obvious from code
 
-## Work Efficiently
-
-**Target: Complete most analyses in 3-5 tool calls total**
-
-Batch your operations:
-
 ## Analysis Best Practices
 
-1. **Start Broad**: Use list_files with regex like "\\.(py|js|md|json|yml)$" to find all relevant files
+1. **Start Broad**: Use list_files initially without a regex filter to get an impression of the codebase
 2. **Batch Read**: Read ALL interesting files in ONE read_files call (it handles multiple files)
 3. **Search Strategically**: Use search to find specific implementations
 4. **Document Findings**: Create/update AGENTS.md with:
@@ -48,6 +42,8 @@ Batch your operations:
 5. **Verify Understanding**: Cross-reference code to ensure accuracy
 6. **Be Conservative**: Only update AGENTS.md when truly needed
 7. **Work in Batches**: Combine operations to minimize total tool calls
+
+**IMPORTANT**: Work efficiently by reducing the number of tool calls.
 
 ## AGENTS.md Format
 
@@ -72,14 +68,13 @@ Structure your documentation clearly and concisely:
 [Critical conventions, gotchas, or context]
 ```
 
-Keep it SHORT - aim for under 50 lines total.
+Keep it SHORT - aim for under 150 lines total.
 
 ## Detailed Analysis Output
 
-When the Main Context requests **detailed analysis** or **extensive information**:
-1. **Create .scratch/ files** for detailed results (e.g., `.scratch/analysis.md`, `.scratch/dependencies.txt`)
-2. **Return a summary** via complete() with key findings
-3. **Mention the files** where detailed data was saved
+When the Main Context requests a specific kind of analysis, provide detailed results by:
+1. **Creating .scratch/ files** for detailed results (e.g., `.scratch/analysis.md`, `.scratch/dependencies.txt`)
+2. **Returning a summary** via complete() with key findings, mentioning the paths of created scratch files
 
 For simple questions, just return the answer via complete() without creating files.
 

@@ -3,56 +3,53 @@
 
 import argparse
 import sys
-import os
 from pathlib import Path
 from typing import Dict, Optional
 
 from prompt_toolkit import prompt as pt_prompt
 from prompt_toolkit.shortcuts import radiolist_dialog
-from prompt_toolkit import print_formatted_text
-from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.history import FileHistory
 
 import git_ops
-import contexts
+import context
 import tools
-from session_logging import SessionLogger
-
-
-# Global state that tools need access to
-tools.WORKTREE_PATH = None
-tools.REPO_ROOT = None
-
-# Setup history file
-HISTORY_FILE = Path.home() / '.maca' / 'history'
-HISTORY_FILE.parent.mkdir(exist_ok=True)
-HISTORY = FileHistory(str(HISTORY_FILE))
+from utils import color_print
 
 
 class MACA:
     """Main orchestration class for the multi-agent coding assistant."""
 
-    def __init__(self, repo_path: str = '.'):
-        """
-        Initialize the assistant.
+    def __init__(self):
+        parser = argparse.ArgumentParser(
+            prog='maca',
+            description='Multi-Agent Coding Assistant',
+        )
+        parser.add_argument('task', nargs='*', help='Initial task description')
+        parser.add_argument('-m', '--model', default='anthropic/claude-sonnet-4.5',
+                            help='Model to use for main context')
+        parser.add_argument('-d', '--directory', default='.',
+                            help='Project directory (default: current directory)')
+        args = parser.parse_args()
 
-        Args:
-            repo_path: Path to the git repository
-        """
-        self.repo_path = Path(repo_path).resolve()
+        self.repo_path = Path(args.directory).resolve()
+        self.initial_prompt = ' '.join(args.task) if args.task else None
         self.repo_root = None
         self.session_id = None
         self.worktree_path = None
         self.branch_name = None
-        self.logger = None
         self.main_context = None
-        self.subcontexts: Dict[str, contexts.Context] = {}
+        self.subcontexts: Dict[str, context.Context] = {}
         self.context_counters: Dict[str, int] = {}  # Track counter per context type for auto-naming
+
+        # Setup shared input history
+        history_file = Path.home() / '.maca' / 'history'
+        history_file.parent.mkdir(exist_ok=True)
+        self.history = FileHistory(str(history_file))
 
     def ensure_git_repo(self):
         """Ensure we're in a git repository, or offer to initialize one."""
         if not git_ops.is_git_repo(self.repo_path):
-            print_formatted_text(FormattedText([('ansired', 'Not in a git repository.')]))
+            color_print(('ansired', 'Not in a git repository.'))
 
             response = radiolist_dialog(
                 title='Git Repository Required',
@@ -68,7 +65,7 @@ class MACA:
                 sys.exit(0)
 
             git_ops.init_git_repo(self.repo_path)
-            print_formatted_text(FormattedText([('ansigreen', 'Git repository initialized.')]))
+            color_print(('ansigreen', 'Git repository initialized.'))
 
         self.repo_root = git_ops.get_repo_root(self.repo_path)
 
@@ -87,17 +84,11 @@ class MACA:
         tools.REPO_ROOT = str(self.repo_root)
         tools.MACA_INSTANCE = self
 
-        # Initialize session logger
-        self.logger = SessionLogger(self.repo_root, self.session_id)
-
-        print_formatted_text(FormattedText([
+        color_print(
             ('ansigreen', f'Session {self.session_id} created'),
-            ('', ' (branch: '),
-            ('ansicyan', self.branch_name),
-            ('', ', worktree: '),
-            ('ansicyan', str(self.worktree_path.relative_to(self.repo_root))),
-            ('', ')'),
-        ]))
+            ' (branch: ', ('ansicyan', self.branch_name),
+            ', worktree: ', ('ansicyan', str(self.worktree_path.relative_to(self.repo_root))), ')',
+        )
 
     def get_initial_prompt(self, prompt_arg: Optional[str] = None) -> str:
         """Get the initial prompt from user."""
@@ -105,55 +96,9 @@ class MACA:
             return prompt_arg
 
         while True:
-            print_formatted_text(FormattedText([('ansiyellow', 'Enter your task (press Alt+Enter or Esc+Enter to submit):')]))
-
-            prompt = pt_prompt("> ", multiline=True, history=HISTORY).strip()
-
+            color_print(('ansiyellow', 'Enter your task (press Alt+Enter or Esc+Enter to submit):'))
+            prompt = pt_prompt("> ", multiline=True, history=self.history).strip()
             return prompt
-
-
-    def _generate_unique_context_name(self, context_type: str) -> str:
-        """
-        Generate a unique name for a context by auto-incrementing a counter.
-
-        Args:
-            context_type: Type of context (e.g., 'code_analysis', 'implementation', etc.)
-
-        Returns:
-            Unique name like 'code_analysis1', 'implementation2', etc.
-        """
-        if context_type not in self.context_counters:
-            self.context_counters[context_type] = 0
-        self.context_counters[context_type] += 1
-        return f"{context_type}{self.context_counters[context_type]}"
-
-    def _create_and_register_subcontext(
-        self, unique_name: str, context_type: str, model: str, initial_message: str = None
-    ) -> contexts.BaseContext:
-        """
-        Create a subcontext and register it.
-
-        Args:
-            unique_name: Unique identifier for this context
-            context_type: Type of context to create
-            model: Model to use for this context
-            initial_message: Optional initial user message to add to context
-
-        Returns:
-            The created subcontext
-        """
-        subcontext = contexts.Context(
-            context_id=unique_name,
-            context_type=context_type,
-            model=model,
-            worktree_path=self.worktree_path
-        )
-        self.subcontexts[unique_name] = subcontext
-
-        if initial_message:
-            subcontext.add_message('user', initial_message)
-
-        return subcontext
 
 
     def handle_completion(self, result: str) -> bool:
@@ -166,11 +111,11 @@ class MACA:
         Returns:
             True if approved and merged, False if user wants changes
         """
-        print_formatted_text(FormattedText([
-            ('', '\n'),
+        color_print(
+            '\n',
             ('ansigreen', 'Task completed!'),
-            ('', f'\n{result}\n'),
-        ]))
+            f'\n{result}\n',
+        )
 
         # Ask for approval
         response = radiolist_dialog(
@@ -187,7 +132,7 @@ class MACA:
             self.merge_and_cleanup()
             return True
         elif response == 'no':
-            feedback = pt_prompt("What changes do you want?\n> ", multiline=True, history=HISTORY)
+            feedback = pt_prompt("What changes do you want?\n> ", multiline=True, history=self.history)
             self.main_context.add_message('user', feedback)
             return False
         else:
@@ -196,10 +141,10 @@ class MACA:
 
     def merge_and_cleanup(self):
         """Merge the session branch into main and cleanup."""
-        print_formatted_text(FormattedText([('ansicyan', 'Merging changes...')]))
+        color_print(('ansicyan', 'Merging changes...'))
 
         # Get a commit message
-        commit_msg = pt_prompt("Enter commit message for the squashed commit:\n> ", multiline=True, history=HISTORY)
+        commit_msg = pt_prompt("Enter commit message for the squashed commit:\n> ", multiline=True, history=self.history)
 
         # Merge
         success, message = git_ops.merge_to_main(
@@ -210,7 +155,7 @@ class MACA:
         )
 
         if not success:
-            print_formatted_text(FormattedText([('ansired', f'Merge failed: {message}')]))
+            color_print(('ansired', f'Merge failed: {message}'))
             print("You may need to resolve conflicts manually or spawn a merge context.")
             # TODO: Spawn merge context here
             sys.exit(1)
@@ -218,12 +163,12 @@ class MACA:
         # Cleanup
         git_ops.cleanup_session(self.repo_root, self.worktree_path, self.branch_name)
 
-        print_formatted_text(FormattedText([('ansigreen', '✓ Merged and cleaned up')]))
+        color_print(('ansigreen', '✓ Merged and cleaned up'))
 
         # Reset session for next task
         self.create_session()
 
-    def run(self, initial_prompt: Optional[str] = None):
+    def run(self):
         """
         Main orchestration loop.
 
@@ -237,8 +182,7 @@ class MACA:
         self.create_session()
 
         # Initialize main context
-        self.main_context = contexts.Context(
-            context_id='main',
+        self.main_context = context.Context(
             context_type='_main',
             worktree_path=self.worktree_path
         )
@@ -261,8 +205,11 @@ class MACA:
         # Main loop
         while True:
             # Get initial prompt if this is a new task
-            prompt = self.get_initial_prompt(initial_prompt)
-            initial_prompt = None  # Only use command line arg for first iteration
+            prompt = self.initial_prompt
+            if prompt:
+                self.initial_prompt = None  # Only use command line arg for first iteration
+            else:
+                prompt = self.get_initial_prompt()
 
             if not prompt:
                 print("No task provided. Exiting.")
@@ -281,7 +228,6 @@ class MACA:
                 # Add to main context
                 self.main_context.add_message('user', prompt)
 
-            # self.logger.log('main', type='prompt', prompt=prompt)
             self.first_llm_call = False
 
             # Main context loop
@@ -289,9 +235,7 @@ class MACA:
                 # Run main context (single iteration mode)
                 run_result = self.main_context.run(
                     budget=None,
-                    logger=self.logger,
                     single_iteration=True,
-                    maca=self
                 )
 
                 # Check if main context completed the task
@@ -310,27 +254,7 @@ class MACA:
                 # (Context.run already added tool result to context)
 
 
-def main():
-    """Main entry point."""
-    parser = argparse.ArgumentParser(
-        prog='maca',
-        description='Multi-Agent Coding Assistant - A multi-context AI coding assistant',
-    )
-    parser.add_argument('task', nargs='*', help='Initial task description')
-    parser.add_argument('-m', '--model', default='anthropic/claude-sonnet-4.5',
-                        help='Model to use for main context')
-    parser.add_argument('-d', '--directory', default='.',
-                        help='Project directory (default: current directory)')
-
-    args = parser.parse_args()
-
-    # Combine task arguments
-    task = ' '.join(args.task) if args.task else None
-
-    # Create and run assistant
-    assistant = MACA(args.directory)
-    assistant.run(task)
-
 
 if __name__ == '__main__':
-    main()
+    maca = MACA()
+    maca.run()
