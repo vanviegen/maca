@@ -137,12 +137,12 @@ class MACA:
             # Log the LLM call
             tokens = usage.get('prompt_tokens', 0) + usage.get('completion_tokens', 0)
             cost = usage.get('cost', 0)
-            self.logger.log_llm_call(self.main_context.model, tokens, cost, 'main')
+            self.logger.log('main', type='llm_call', model=self.main_context.model, tokens=tokens, cost=cost)
 
             # Log tool call
             tool_name = tool_call['function']['name']
             arguments = json.loads(tool_call['function']['arguments'])
-            self.logger.log_tool_call(tool_name, arguments, 'main')
+            self.logger.log('main', type='tool_call', tool_name=tool_name, arguments=str(arguments))
 
             print_formatted_text(HTML(
                 f"<ansigreen>→</ansigreen> Tool: <ansiyellow>{tool_name}</ansiyellow>"
@@ -151,7 +151,7 @@ class MACA:
             return tool_call
 
         except Exception as e:
-            self.logger.log_error(str(e), 'main')
+            self.logger.log('main', type='error', error=str(e))
             raise
 
     def execute_main_tool(self, tool_call: Dict) -> tuple:
@@ -169,7 +169,7 @@ class MACA:
                 arguments['prompt'],
                 arguments.get('preset_answers')
             )
-            self.logger.log_tool_result(tool_name, result, 0, 'main')
+            self.logger.log('main', type='tool_result', tool_name=tool_name, result=str(result), duration=0)
             return (result, False, None)
 
         elif tool_name == 'create_subcontext':
@@ -194,7 +194,7 @@ class MACA:
             subcontext.add_message('user', task)
 
             result = f"Created {context_type} subcontext '{unique_name}'"
-            self.logger.log_tool_result(tool_name, result, 0, 'main')
+            self.logger.log('main', type='tool_result', tool_name=tool_name, result=result, duration=0)
 
             print_formatted_text(HTML(
                 f"  <ansigreen>Created subcontext:</ansigreen> {unique_name} ({context_type})"
@@ -237,7 +237,7 @@ class MACA:
             # Check file limit
             if len(matching_files) > file_limit:
                 error_msg = f"Matched {len(matching_files)} files, exceeds limit of {file_limit}. Use list_files(r'{path_regex}') first to see what matches, then adjust regex or increase file_limit."
-                self.logger.log_tool_result(tool_name, error_msg, 0, 'main')
+                self.logger.log('main', type='tool_result', tool_name=tool_name, result=error_msg, duration=0)
                 print_formatted_text(HTML(f"  <ansired>Error:</ansired> {error_msg}"))
                 return (error_msg, False, None)
 
@@ -268,7 +268,7 @@ class MACA:
                 results.append(f"{file_path} -> {file_unique_name}")
 
             result = f"Created {len(matching_files)} file_processor subcontexts:\n" + "\n".join(results)
-            self.logger.log_tool_result(tool_name, result, 0, 'main')
+            self.logger.log('main', type='tool_result', tool_name=tool_name, result=result, duration=0)
 
             print_formatted_text(HTML(
                 f"  <ansigreen>Created {len(matching_files)} file_processor subcontexts</ansigreen>"

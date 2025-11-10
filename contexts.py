@@ -241,7 +241,7 @@ class BaseContext:
 
         # Log full prompt
         if logger:
-            logger.log_full_prompt(self.messages, self.context_id)
+            logger.log(self.context_id, type='full_prompt', messages=str(self.messages))
 
         # Display full prompt if verbose
         if verbose:
@@ -272,7 +272,7 @@ class BaseContext:
 
         # Log full response
         if logger:
-            logger.log_full_response(result, self.context_id)
+            logger.log(self.context_id, type='full_response', response=str(result))
 
         # Display full response if verbose
         if verbose:
