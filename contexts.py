@@ -208,13 +208,12 @@ class BaseContext:
         else:
             return tools.get_tool_schemas('subcontext')
 
-    def call_llm(self, logger=None, verbose=False) -> Dict[str, Any]:
+    def call_llm(self, logger=None) -> Dict[str, Any]:
         """
         Call the LLM and return the response.
 
         Args:
             logger: Optional session logger
-            verbose: If True, print full prompts and responses
 
         Returns:
             Dict with 'message' and 'tool_calls' keys
@@ -243,19 +242,6 @@ class BaseContext:
         if logger:
             logger.log(self.context_id, type='full_prompt', messages=str(self.messages))
 
-        # Display full prompt if verbose
-        if verbose:
-            from prompt_toolkit import print_formatted_text, HTML
-            print_formatted_text(HTML("\n<ansiyellow>=== FULL PROMPT ===</ansiyellow>"))
-            for i, msg in enumerate(self.messages):
-                role = msg.get('role', 'unknown')
-                content = msg.get('content', '')
-                if content:
-                    print_formatted_text(HTML(f"<ansicyan>[{i}] {role}:</ansicyan>"))
-                    print_formatted_text(content)
-                    print()
-            print_formatted_text(HTML("<ansiyellow>===================</ansiyellow>\n"))
-
         try:
             req = urllib.request.Request(
                 "https://openrouter.ai/api/v1/chat/completions",
@@ -273,14 +259,6 @@ class BaseContext:
         # Log full response
         if logger:
             logger.log(self.context_id, type='full_response', response=str(result))
-
-        # Display full response if verbose
-        if verbose:
-            from prompt_toolkit import print_formatted_text, HTML
-            print_formatted_text(HTML("\n<ansiyellow>=== FULL RESPONSE ===</ansiyellow>"))
-            response_str = json.dumps(result, indent=2)
-            print_formatted_text(response_str)
-            print_formatted_text(HTML("<ansiyellow>=====================</ansiyellow>\n"))
 
         # Extract response
         choice = result['choices'][0]

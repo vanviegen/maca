@@ -284,7 +284,7 @@ def read_files(file_paths: List[str], start_line: int = 1, max_lines: int = 250)
 
 
 @tool('subcontext')
-def list_files(path_regex: str = r".*", max_files: int = 50) -> Dict[str, Any]:
+def list_files(path_regex: str = ".*", max_files: int = 50) -> Dict[str, Any]:
     """
     List files in the worktree matching a regular expression pattern.
 
@@ -292,20 +292,28 @@ def list_files(path_regex: str = r".*", max_files: int = 50) -> Dict[str, Any]:
     Use this to get an impression of what files exist matching a pattern.
 
     Use | to match multiple file types efficiently in one call.
-    Examples:
-    - r"\.py$" - All Python files
-    - r"\.(py|js|ts)$" - Python, JavaScript, and TypeScript files
-    - r"^src/.*\.(py|md)$" - Python and Markdown files in src/
-    - r"(test_.*\.py|.*_test\.py)$" - Python test files
-    - r"^[^/\\]*$" - Files in top directory only (no subdirectories)
+    Examples (as JSON strings):
+    - "\\.py$" - All Python files
+    - "\\.(py|js|ts)$" - Python, JavaScript, and TypeScript files
+    - "^src/.*\\.(py|md)$" - Python and Markdown files in src/
+    - "(test_.*\\.py|.*_test\\.py)$" - Python test files
+    - "^[^/\\\\]*$" - Files in top directory only (no subdirectories)
 
     Args:
         path_regex: Regular expression to match file paths (applied to full relative path)
         max_files: Maximum number of files to return (default: 50)
 
     Returns:
-        Dict with 'total_count' (int) and 'files' (list of paths). If total_count > max_files,
-        'files' contains random sampling.
+        Dict with 'total_count' (int) and 'files' (list of file info objects).
+        Each file object contains:
+        - path: relative path string
+        - bytes: file size in bytes
+        - lines: number of lines (for text files, omitted for binary/large files)
+        - type: "directory", "symlink", or "executable" (omitted for regular files)
+        - target: symlink target (only for symlinks)
+        - entries: number of entries in directory (only for directories)
+
+        If total_count > max_files, 'files' contains random sampling.
     """
     import random
 
@@ -313,32 +321,93 @@ def list_files(path_regex: str = r".*", max_files: int = 50) -> Dict[str, Any]:
     matches = []
     pattern = re.compile(path_regex)
 
+    def get_file_info(path: Path, rel_path_str: str) -> Dict[str, Any]:
+        """Get detailed info about a file/directory."""
+        info = {"path": rel_path_str}
+
+        try:
+            stat = path.lstat()  # Use lstat to not follow symlinks
+
+            # Check if symlink
+            if path.is_symlink():
+                info["type"] = "symlink"
+                try:
+                    info["target"] = str(path.readlink())
+                except:
+                    info["target"] = "?"
+                return info
+
+            # Check if directory
+            if path.is_dir():
+                info["type"] = "directory"
+                try:
+                    entries = list(path.iterdir())
+                    info["entries"] = len(entries)
+                except:
+                    info["entries"] = 0
+                return info
+
+            # Regular file - get size
+            info["bytes"] = stat.st_size
+
+            # Check if executable
+            if stat.st_mode & 0o111:  # Check execute bits
+                info["type"] = "executable"
+
+            # Try to count lines for text files (skip large files)
+            if stat.st_size < 1024 * 1024:  # Only for files < 1MB
+                try:
+                    with open(path, 'r', encoding='utf-8', errors='strict') as f:
+                        info["lines"] = sum(1 for _ in f)
+                except:
+                    pass  # Binary or invalid encoding, skip line count
+
+        except Exception:
+            # If we can't stat the file, just return the path
+            pass
+
+        return info
+
     # Walk the entire tree and collect ALL matches
-    for root, dirs, files in os.walk(worktree):
+    for root, dirs, files in os.walk(worktree, followlinks=False):
         # Skip .git, .scratch, and other hidden directories
         dirs[:] = [d for d in dirs if not d.startswith('.')]
 
+        # Match directories
+        for dir_name in dirs:
+            full_path = Path(root) / dir_name
+            rel_path = full_path.relative_to(worktree)
+            rel_path_str = str(rel_path)
+
+            if pattern.search(rel_path_str):
+                matches.append(get_file_info(full_path, rel_path_str))
+
+        # Match files
         for file in files:
             full_path = Path(root) / file
             rel_path = full_path.relative_to(worktree)
             rel_path_str = str(rel_path)
 
             if pattern.search(rel_path_str):
-                matches.append(rel_path_str)
+                matches.append(get_file_info(full_path, rel_path_str))
 
     total_count = len(matches)
+
+    # Sort by path
+    matches.sort(key=lambda x: x["path"])
 
     # If we have more matches than max_files, return random sampling
     if total_count > max_files:
         sampled = random.sample(matches, max_files)
+        sampled.sort(key=lambda x: x["path"])
         return {
             'total_count': total_count,
-            'files': sorted(sampled)
+            'files': sampled
         }
     else:
         return {
             'total_count': total_count,
-            'files': sorted(matches)
+            'files': matches
         }
 
 
@@ -576,7 +645,7 @@ def run_oneshot_per_file(path_regex: str, task: str, file_limit: int = 5, model:
     multiple files individually, while keeping context sizes small.
 
     Args:
-        path_regex: Regex pattern to match files (e.g., r"\\.py$" for Python files)
+        path_regex: Regex pattern to match files (e.g., "\\.py$" for Python files)
         task: Task description for the file_processor (applied to each file)
         file_limit: Maximum files to process (default: 5, prevents accidental bulk operations)
         model: Model to use ("auto" for default, or specific model like "qwen/qwen3-coder-30b-a3b-instruct")

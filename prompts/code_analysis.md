@@ -33,7 +33,7 @@ Batch your operations:
 
 ## Analysis Best Practices
 
-1. **Start Broad**: Use list_files with regex like r"\.(py|js|md|json|yml)$" to find all relevant files
+1. **Start Broad**: Use list_files with regex like "\\.(py|js|md|json|yml)$" to find all relevant files
 2. **Batch Read**: Read ALL interesting files in ONE read_files call (it handles multiple files)
 3. **Search Strategically**: Use search to find specific implementations
 4. **Document Findings**: Create/update AGENTS.md with:

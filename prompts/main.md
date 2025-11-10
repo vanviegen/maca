@@ -54,7 +54,7 @@ You have access to ALL tools:
 
 Example:
 ```
-run_oneshot_per_file(r"\.py$", "Add type hints to all function parameters", file_limit=10)
+run_oneshot_per_file("\\.py$", "Add type hints to all function parameters", file_limit=10)
 ```
 
 ## Planning Workflow

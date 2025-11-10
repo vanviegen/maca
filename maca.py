@@ -11,7 +11,8 @@ import json
 
 from prompt_toolkit import prompt as pt_prompt
 from prompt_toolkit.shortcuts import radiolist_dialog
-from prompt_toolkit import print_formatted_text, HTML
+from prompt_toolkit import print_formatted_text
+from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.history import FileHistory
 
 import git_ops
@@ -49,12 +50,11 @@ class MACA:
         self.main_context = None
         self.subcontexts: Dict[str, contexts.BaseContext] = {}
         self.context_counters: Dict[str, int] = {}  # Track counter per context type for auto-naming
-        self.verbose = False
 
     def ensure_git_repo(self):
         """Ensure we're in a git repository, or offer to initialize one."""
         if not git_ops.is_git_repo(self.repo_path):
-            print_formatted_text(HTML("<ansired>Not in a git repository.</ansired>"))
+            print_formatted_text(FormattedText([('ansired', 'Not in a git repository.')]))
 
             response = radiolist_dialog(
                 title='Git Repository Required',
@@ -70,7 +70,7 @@ class MACA:
                 sys.exit(0)
 
             git_ops.init_git_repo(self.repo_path)
-            print_formatted_text(HTML("<ansigreen>Git repository initialized.</ansigreen>"))
+            print_formatted_text(FormattedText([('ansigreen', 'Git repository initialized.')]))
 
         self.repo_root = git_ops.get_repo_root(self.repo_path)
 
@@ -91,11 +91,14 @@ class MACA:
         # Initialize session logger
         self.logger = SessionLogger(self.repo_root, self.session_id)
 
-        print_formatted_text(HTML(
-            f"<ansigreen>Session {self.session_id} created</ansigreen> "
-            f"(branch: <ansicyan>{self.branch_name}</ansicyan>, "
-            f"worktree: <ansicyan>{self.worktree_path.relative_to(self.repo_root)}</ansicyan>)"
-        ))
+        print_formatted_text(FormattedText([
+            ('ansigreen', f'Session {self.session_id} created'),
+            ('', ' (branch: '),
+            ('ansicyan', self.branch_name),
+            ('', ', worktree: '),
+            ('ansicyan', str(self.worktree_path.relative_to(self.repo_root))),
+            ('', ')'),
+        ]))
 
     def get_initial_prompt(self, prompt_arg: Optional[str] = None) -> str:
         """Get the initial prompt from user."""
@@ -103,34 +106,18 @@ class MACA:
             return prompt_arg
 
         while True:
-            print_formatted_text(HTML("<ansiyellow>Enter your task (press Alt+Enter or Esc+Enter to submit):</ansiyellow>"))
-            if self.verbose:
-                print_formatted_text(HTML("<ansicyan>[Verbose mode: ON]</ansicyan>"))
+            print_formatted_text(FormattedText([('ansiyellow', 'Enter your task (press Alt+Enter or Esc+Enter to submit):')]))
 
             prompt = pt_prompt("> ", multiline=True, history=HISTORY).strip()
-
-            # Check for special commands
-            if prompt == '/verbose on':
-                self.verbose = True
-                print_formatted_text(HTML("<ansigreen>Verbose mode enabled</ansigreen>"))
-                continue
-            elif prompt == '/verbose off':
-                self.verbose = False
-                print_formatted_text(HTML("<ansigreen>Verbose mode disabled</ansigreen>"))
-                continue
-            elif prompt.startswith('/'):
-                print_formatted_text(HTML(f"<ansired>Unknown command: {prompt}</ansired>"))
-                print_formatted_text(HTML("Available commands: /verbose on, /verbose off"))
-                continue
 
             return prompt
 
     def run_main_context(self):
         """Run one iteration of the main context."""
         try:
-            print_formatted_text(HTML("<ansicyan>Main context thinking...</ansicyan>"))
+            print_formatted_text(FormattedText([('ansicyan', 'Main context thinking...')]))
 
-            response = self.main_context.call_llm(logger=self.logger, verbose=self.verbose)
+            response = self.main_context.call_llm(logger=self.logger)
             tool_call = response['tool_call']
             usage = response['usage']
 
@@ -144,9 +131,11 @@ class MACA:
             arguments = json.loads(tool_call['function']['arguments'])
             self.logger.log('main', type='tool_call', tool_name=tool_name, arguments=str(arguments))
 
-            print_formatted_text(HTML(
-                f"<ansigreen>→</ansigreen> Tool: <ansiyellow>{tool_name}</ansiyellow>"
-            ))
+            print_formatted_text(FormattedText([
+                ('ansigreen', '→'),
+                ('', ' Tool: '),
+                ('ansiyellow', tool_name),
+            ]))
 
             return tool_call
 
@@ -196,9 +185,11 @@ class MACA:
             result = f"Created {context_type} subcontext '{unique_name}'"
             self.logger.log('main', type='tool_result', tool_name=tool_name, result=result, duration=0)
 
-            print_formatted_text(HTML(
-                f"  <ansigreen>Created subcontext:</ansigreen> {unique_name} ({context_type})"
-            ))
+            print_formatted_text(FormattedText([
+                ('', '  '),
+                ('ansigreen', 'Created subcontext:'),
+                ('', f' {unique_name} ({context_type})'),
+            ]))
 
             return (result, True, unique_name)
 
@@ -238,7 +229,11 @@ class MACA:
             if len(matching_files) > file_limit:
                 error_msg = f"Matched {len(matching_files)} files, exceeds limit of {file_limit}. Use list_files(r'{path_regex}') first to see what matches, then adjust regex or increase file_limit."
                 self.logger.log('main', type='tool_result', tool_name=tool_name, result=error_msg, duration=0)
-                print_formatted_text(HTML(f"  <ansired>Error:</ansired> {error_msg}"))
+                print_formatted_text(FormattedText([
+                    ('', '  '),
+                    ('ansired', 'Error:'),
+                    ('', f' {error_msg}'),
+                ]))
                 return (error_msg, False, None)
 
             # Create one subcontext per file
@@ -270,9 +265,10 @@ class MACA:
             result = f"Created {len(matching_files)} file_processor subcontexts:\n" + "\n".join(results)
             self.logger.log('main', type='tool_result', tool_name=tool_name, result=result, duration=0)
 
-            print_formatted_text(HTML(
-                f"  <ansigreen>Created {len(matching_files)} file_processor subcontexts</ansigreen>"
-            ))
+            print_formatted_text(FormattedText([
+                ('', '  '),
+                ('ansigreen', f'Created {len(matching_files)} file_processor subcontexts'),
+            ]))
 
             # Return first subcontext name to run
             if matching_files:
@@ -295,9 +291,11 @@ class MACA:
             result = f"Continuing subcontext '{unique_name}'"
             self.logger.log_tool_result(tool_name, result, 0, 'main')
 
-            print_formatted_text(HTML(
-                f"  <ansigreen>Continuing subcontext:</ansigreen> {unique_name}"
-            ))
+            print_formatted_text(FormattedText([
+                ('', '  '),
+                ('ansigreen', 'Continuing subcontext:'),
+                ('', f' {unique_name}'),
+            ]))
 
             return (result, True, unique_name)
 
@@ -312,12 +310,12 @@ class MACA:
         subcontext = self.subcontexts[unique_name]
 
         try:
-            print_formatted_text(HTML(
-                f"<ansicyan>  Subcontext '{unique_name}' thinking...</ansicyan>"
-            ))
+            print_formatted_text(FormattedText([
+                ('ansicyan', f"  Subcontext '{unique_name}' thinking..."),
+            ]))
 
             start_time = time.time()
-            response = subcontext.call_llm(logger=self.logger, verbose=self.verbose)
+            response = subcontext.call_llm(logger=self.logger)
             tool_call = response['tool_call']
             usage = response['usage']
 
@@ -332,11 +330,16 @@ class MACA:
 
             self.logger.log_tool_call(tool_name, arguments, unique_name)
 
-            print_formatted_text(HTML(
-                f"  <ansigreen>→</ansigreen> Tool: <ansiyellow>{tool_name}</ansiyellow>"
-            ))
+            print_formatted_text(FormattedText([
+                ('', '  '),
+                ('ansigreen', '→'),
+                ('', ' Tool: '),
+                ('ansiyellow', tool_name),
+            ]))
             if 'rationale' in arguments:
-                print_formatted_text(HTML(f"    Rationale: {arguments['rationale']}"))
+                print_formatted_text(FormattedText([
+                    ('', f"    Rationale: {arguments['rationale']}"),
+                ]))
 
             # Execute tool
             tool_start = time.time()
@@ -363,16 +366,18 @@ class MACA:
                 git_ops.commit_changes(self.worktree_path, commit_msg)
                 self.logger.log_commit(commit_msg, diff_stats, unique_name)
 
-                print_formatted_text(HTML(
-                    f"    <ansigreen>✓ Committed changes</ansigreen>"
-                ))
+                print_formatted_text(FormattedText([
+                    ('', '    '),
+                    ('ansigreen', '✓ Committed changes'),
+                ]))
 
                 # Check if AGENTS.md was updated and refresh all contexts
                 if self.main_context.update_agents_md():
                     agents_md_updated = True
-                    print_formatted_text(HTML(
-                        f"    <ansicyan>AGENTS.md updated - refreshed all contexts</ansicyan>"
-                    ))
+                    print_formatted_text(FormattedText([
+                        ('', '    '),
+                        ('ansicyan', 'AGENTS.md updated - refreshed all contexts'),
+                    ]))
                     # Update all subcontexts too
                     for ctx in self.subcontexts.values():
                         ctx.update_agents_md()
@@ -404,7 +409,7 @@ class MACA:
             self.logger.log_error(str(e), unique_name)
             error_msg = f"Error in subcontext '{unique_name}': {str(e)}"
             self.main_context.add_message('user', error_msg)
-            print_formatted_text(HTML(f"<ansired>{error_msg}</ansired>"))
+            print_formatted_text(FormattedText([('ansired', error_msg)]))
 
     def _build_subcontext_summary(
         self, unique_name: str, tool_name: str, rationale: str,
@@ -438,15 +443,18 @@ class MACA:
         Returns:
             True if approved and merged, False if user wants changes
         """
-        print_formatted_text(HTML(f"\n<ansigreen>Task completed!</ansigreen>\n{result}\n"))
+        print_formatted_text(FormattedText([
+            ('', '\n'),
+            ('ansigreen', 'Task completed!'),
+            ('', f'\n{result}\n'),
+        ]))
 
         # Show summary
         stats = self.logger.get_stats()
-        print_formatted_text(HTML(
-            f"<ansicyan>Session stats:</ansicyan> "
-            f"{stats['total_tokens']} tokens, "
-            f"${stats['total_cost']:.6f} cost"
-        ))
+        print_formatted_text(FormattedText([
+            ('ansicyan', 'Session stats:'),
+            ('', f" {stats['total_tokens']} tokens, ${stats['total_cost']:.6f} cost"),
+        ]))
 
         # Ask for approval
         response = radiolist_dialog(
@@ -472,7 +480,7 @@ class MACA:
 
     def merge_and_cleanup(self):
         """Merge the session branch into main and cleanup."""
-        print_formatted_text(HTML("<ansicyan>Merging changes...</ansicyan>"))
+        print_formatted_text(FormattedText([('ansicyan', 'Merging changes...')]))
 
         # Get a commit message
         commit_msg = pt_prompt("Enter commit message for the squashed commit:\n> ", multiline=True, history=HISTORY)
@@ -486,7 +494,7 @@ class MACA:
         )
 
         if not success:
-            print_formatted_text(HTML(f"<ansired>Merge failed: {message}</ansired>"))
+            print_formatted_text(FormattedText([('ansired', f'Merge failed: {message}')]))
             print("You may need to resolve conflicts manually or spawn a merge context.")
             # TODO: Spawn merge context here
             sys.exit(1)
@@ -494,7 +502,7 @@ class MACA:
         # Cleanup
         git_ops.cleanup_session(self.repo_root, self.worktree_path, self.branch_name)
 
-        print_formatted_text(HTML("<ansigreen>✓ Merged and cleaned up</ansigreen>"))
+        print_formatted_text(FormattedText([('ansigreen', '✓ Merged and cleaned up')]))
 
         # Reset session for next task
         self.create_session()

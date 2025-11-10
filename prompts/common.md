@@ -70,15 +70,15 @@ Each worktree has a `.scratch/` directory for temporary files:
 read_files(["src/main.py", "src/utils.py", "tests/test_main.py"])
 
 # GOOD: Use regex with | for multiple types
-list_files(r"\.(py|js|ts)$")
+list_files("\\.(py|js|ts)$")
 
 # BAD: Multiple separate reads
 read_files(["src/main.py"])
 read_files(["src/utils.py"])
 
 # BAD: Multiple list_files calls
-list_files(r"\.py$")
-list_files(r"\.js$")
+list_files("\\.py$")
+list_files("\\.js$")
 ```
 
 ## Communication Between Contexts
