@@ -12,7 +12,6 @@ from prompt_toolkit.shortcuts import radiolist_dialog
 from pathlib import Path
 from typing import get_type_hints, get_origin, get_args, Any, Dict, List, Union, Optional
 
-from maca import maca
 from utils import color_print
 from docker_ops import run_in_container
 import git_ops
@@ -22,7 +21,7 @@ import urllib.request
 import os
 
 
-def check_path(path: str) -> str:
+def check_path(path: str, worktree_path: Path) -> str:
     """
     Validate that a path is within the current directory and doesn't escape via symlinks.
 
@@ -43,14 +42,15 @@ def check_path(path: str) -> str:
     
     # Check if the resolved path is within the current directory
     try:
-        resolved_path.relative_to(maca.worktree_path)
+        resolved_path.relative_to(worktree_path)
     except ValueError:
-        raise ValueError(f"Path '{path}' (resolves to '{resolved_path}') is outside the worktree directory '{maca.worktree_path}'")
+        raise ValueError(f"Path '{path}' (resolves to '{resolved_path}') is outside the worktree directory '{worktree_path}'")
 
     return resolved_path
 
 
 def get_matching_files(
+    worktree_path: Path,
     include: Optional[Union[str, List[str]]] = "**",
     exclude: Optional[Union[str, List[str]]] = ".*"
 ) -> List[Path]:
@@ -58,6 +58,7 @@ def get_matching_files(
     Get list of files matching include/exclude glob patterns.
 
     Args:
+        worktree_path: Path to the worktree
         include: Glob pattern(s) to include. Can be None, a string, or list of strings.
                  Defaults to "**" (all files).
         exclude: Glob pattern(s) to exclude. Can be None, a string, or list of strings.
@@ -66,7 +67,7 @@ def get_matching_files(
     Returns:
         List of Path objects for matching files (not directories)
     """
-    worktree = Path(maca.worktree_path)
+    worktree = Path(worktree_path)
 
     # Normalize include patterns
     if include is None:
@@ -295,9 +296,17 @@ def get_all_tool_schemas(add_rationale: bool = False) -> List[Dict]:
     return get_tool_schemas(list(_TOOLS.keys()), add_rationale=add_rationale)
 
 
-def execute_tool(tool_name: str, arguments: Dict) -> Any:
+def execute_tool(tool_name: str, arguments: Dict, worktree_path: Path, repo_root: Path, history, maca) -> Any:
     """
     Execute a tool with the given arguments.
+
+    Args:
+        tool_name: Name of the tool to execute
+        arguments: Tool arguments
+        worktree_path: Path to the worktree
+        repo_root: Path to the repository root
+        history: Prompt history for user input
+        maca: MACA instance for accessing context
 
     Returns:
         Tuple of (immediate_result, context_summary) where:
@@ -312,6 +321,12 @@ def execute_tool(tool_name: str, arguments: Dict) -> Any:
 
     # Remove rationale from arguments before calling (it's just for logging)
     exec_args = {k: v for k, v in arguments.items() if k != 'rationale'}
+
+    # Add context parameters
+    exec_args['worktree_path'] = worktree_path
+    exec_args['repo_root'] = repo_root
+    exec_args['history'] = history
+    exec_args['maca'] = maca
 
     result = func(**exec_args)
 
@@ -330,12 +345,13 @@ class ReadyResult:
 # TOOLS
 # ==============================================================================
 
-def _read_files_helper(file_paths: List[str], max_lines: int = None) -> List[Dict[str, Any]]:
+def _read_files_helper(file_paths: List[str], worktree_path: Path, max_lines: int = None) -> List[Dict[str, Any]]:
     """
     Helper function to read files. Not exposed as a tool.
 
     Args:
         file_paths: List of file paths to read
+        worktree_path: Path to the worktree
         max_lines: Maximum number of lines to read per file (None = all lines)
 
     Returns:
@@ -344,7 +360,7 @@ def _read_files_helper(file_paths: List[str], max_lines: int = None) -> List[Dic
     results = []
 
     for file_path in file_paths:
-        full_path = check_path(file_path)
+        full_path = check_path(file_path, worktree_path)
 
         if not full_path.exists():
             results.append({
@@ -388,7 +404,11 @@ def _read_files_helper(file_paths: List[str], max_lines: int = None) -> List[Dic
 def list_files(
     include: Union[str, List[str]] = "**",
     exclude: Optional[Union[str, List[str]]] = ".*",
-    max_files: int = 50
+    max_files: int = 50,
+    worktree_path: Path = None,
+    repo_root: Path = None,
+    history = None,
+    maca = None
 ) -> tuple[Dict[str, Any], str]:
     """
     List files in the worktree matching include/exclude glob patterns.
@@ -413,7 +433,7 @@ def list_files(
         Immediate: Dict with 'total_count' and 'files' list
         Long-term context: Brief summary (e.g., "list_files: found 15 files")
     """
-    worktree = Path(maca.worktree_path)
+    worktree = Path(worktree_path)
 
     def get_file_info(path: Path) -> Dict[str, Any]:
         """Get detailed info about a file."""
@@ -445,7 +465,7 @@ def list_files(
         return info
 
     # Get matching files using helper
-    matching_files = get_matching_files(include=include, exclude=exclude)
+    matching_files = get_matching_files(worktree_path=worktree_path, include=include, exclude=exclude)
 
     # Build file info for each match
     matches = [get_file_info(path) for path in matching_files]
@@ -475,7 +495,14 @@ def list_files(
 
 
 @tool
-def update_files(updates: List[Dict[str, str]], summary: Optional[str] = None) -> tuple[None, str]:
+def update_files(
+    updates: List[Dict[str, str]],
+    summary: Optional[str] = None,
+    worktree_path: Path = None,
+    repo_root: Path = None,
+    history = None,
+    maca = None
+) -> tuple[None, str]:
     """
     Update one or more files with new content.
 
@@ -496,7 +523,7 @@ def update_files(updates: List[Dict[str, str]], summary: Optional[str] = None) -
 
     for update in updates:
         file_path = update['file_path']
-        full_path = check_path(file_path)
+        full_path = check_path(file_path, worktree_path)
 
         # Track if file exists before update
         existed_before = full_path.exists()
@@ -558,7 +585,11 @@ def search(
     exclude: Optional[Union[str, List[str]]] = ".*",
     max_results: int = 10,
     lines_before: int = 2,
-    lines_after: int = 2
+    lines_after: int = 2,
+    worktree_path: Path = None,
+    repo_root: Path = None,
+    history = None,
+    maca = None
 ) -> tuple[List[Dict[str, Any]], str]:
     """
     Search for a regex pattern in file contents, filtering files by glob patterns.
@@ -575,13 +606,13 @@ def search(
         Immediate: List of matches with file_path, line_number, and context lines
         Long-term context: Brief summary (e.g., "search: found 5 matches in 3 files")
     """
-    worktree = Path(maca.worktree_path)
+    worktree = Path(worktree_path)
     results = []
     content_pattern = re.compile(regex)
     files_with_matches = set()
 
     # Get matching files using helper
-    matching_files = get_matching_files(include=include, exclude=exclude)
+    matching_files = get_matching_files(worktree_path=worktree_path, include=include, exclude=exclude)
 
     for file_path in matching_files:
         rel_path_str = str(file_path.relative_to(worktree))
@@ -615,7 +646,17 @@ def search(
 
 
 @tool
-def shell(command: str, docker_image: str = "debian:stable", docker_runs: List[str] = None, head: int = 50, tail: int = 50) -> tuple[Dict[str, Any], str]:
+def shell(
+    command: str,
+    docker_image: str = "debian:stable",
+    docker_runs: List[str] = None,
+    head: int = 50,
+    tail: int = 50,
+    worktree_path: Path = None,
+    repo_root: Path = None,
+    history = None,
+    maca = None
+) -> tuple[Dict[str, Any], str]:
     """
     Execute a shell command in a Docker container.
 
@@ -636,6 +677,8 @@ def shell(command: str, docker_image: str = "debian:stable", docker_runs: List[s
 
     result = run_in_container(
         command=command,
+        worktree_path=worktree_path,
+        repo_root=repo_root,
         docker_image=docker_image,
         docker_runs=docker_runs,
         head=head,
@@ -654,7 +697,14 @@ def shell(command: str, docker_image: str = "debian:stable", docker_runs: List[s
 
 
 @tool
-def get_user_input(prompt: str, preset_answers: List[str] = None) -> tuple[str, str]:
+def get_user_input(
+    prompt: str,
+    preset_answers: List[str] = None,
+    worktree_path: Path = None,
+    repo_root: Path = None,
+    history = None,
+    maca = None
+) -> tuple[str, str]:
     """
     Get input from the user interactively.
 
@@ -678,12 +728,12 @@ def get_user_input(prompt: str, preset_answers: List[str] = None) -> tuple[str, 
         ).run()
 
         if result == '__custom__':
-            answer = pt_prompt(f"{prompt}\n> ", history=maca.history)
+            answer = pt_prompt(f"{prompt}\n> ", history=history)
         else:
             answer = result
     else:
         # Simple text input
-        answer = pt_prompt(f"{prompt}\n> ", history=maca.history)
+        answer = pt_prompt(f"{prompt}\n> ", history=history)
 
     # Build summary - truncate long answers
     answer_summary = answer[:100]
@@ -703,7 +753,11 @@ def process_files(
     exclude: Optional[Union[str, List[str]]] = ".*",
     file_limit: int = 5,
     single_batch: bool = True,
-    model: str = "anthropic/claude-sonnet-4.5"
+    model: str = "anthropic/claude-sonnet-4.5",
+    worktree_path: Path = None,
+    repo_root: Path = None,
+    history = None,
+    maca = None
 ) -> Dict[str, Any]:
     """
     Read and process files with instructions.
@@ -736,7 +790,7 @@ def process_files(
             Long-term context: Summary like "process_files: processed 5 files (4 successful)"
     """
     # Get list of files matching the patterns
-    file_list_result, _ = list_files(include=include, exclude=exclude, max_files=file_limit)
+    file_list_result, _ = list_files(include=include, exclude=exclude, max_files=file_limit, worktree_path=worktree_path, repo_root=repo_root, history=history, maca=maca)
     files = file_list_result['files']
 
     error_result = None
@@ -756,7 +810,7 @@ def process_files(
         file_contents_list = []
         for file_info in files:
             file_path = file_info['path']
-            file_result = _read_files_helper([file_path])
+            file_result = _read_files_helper([file_path], worktree_path)
             if file_result[0].get('error'):
                 file_contents_list.append(f"File: {file_path}\n\nError: {file_result[0]['error']}")
             else:
@@ -788,7 +842,7 @@ def process_files(
             color_print('  ', ('ansicyan', f'[{i}/{len(files)}] Processing: {file_path}'))
 
             # Read file contents
-            file_result = _read_files_helper([file_path])
+            file_result = _read_files_helper([file_path], worktree_path)
             if file_result[0].get('error'):
                 results[file_path] = {
                     'success': False,
@@ -851,7 +905,7 @@ def process_files(
                 tool_args = json.loads(tool_call['function']['arguments'])
 
                 # Execute the tool
-                tool_result, _ = execute_tool(called_tool_name, tool_args)
+                tool_result, _ = execute_tool(called_tool_name, tool_args, worktree_path, repo_root, history, maca)
 
                 results[file_path] = {
                     'success': True,
@@ -878,7 +932,14 @@ def process_files(
 
 
 @tool
-def complete(result: str, commit_msg: str | None) -> bool:
+def complete(
+    result: str,
+    commit_msg: str | None,
+    worktree_path: Path = None,
+    repo_root: Path = None,
+    history = None,
+    maca = None
+) -> bool:
     """
     Signal that the user's task is complete and ready for review.
 
@@ -912,11 +973,11 @@ def complete(result: str, commit_msg: str | None) -> bool:
         color_print(('ansicyan', 'Merging changes...'))
 
         # Merge
-        success, message = git_ops.merge_to_main(maca.repo_root, maca.worktree_path, maca.branch_name, commit_msg or result)
+        success, message = git_ops.merge_to_main(repo_root, worktree_path, maca.branch_name, commit_msg or result)
 
         if success:
             # Cleanup
-            git_ops.cleanup_session(maca.repo_root, maca.worktree_path, maca.branch_name)
+            git_ops.cleanup_session(repo_root, worktree_path, maca.branch_name)
             color_print(('ansigreen', '✓ Merged and cleaned up'))
         else:
             color_print(('ansired', f'Merge failed: {message}'))
@@ -925,8 +986,8 @@ def complete(result: str, commit_msg: str | None) -> bool:
         return ReadyResult(result)
 
     elif response == 'no':
-        feedback = pt_prompt("What changes do you want?\n> ", multiline=True, history=maca.history)
-        maca.context.add_message({"role": "user", "content": feedback})
+        feedback = pt_prompt("What changes do you want?\n> ", multiline=True, history=history)
+        maca.add_message({"role": "user", "content": feedback})
         return 'User rejected result and provided feedback.'
     else:
         print("Keeping worktree for manual review.")

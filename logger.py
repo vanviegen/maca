@@ -75,10 +75,10 @@ class Logger:
         log_path = repo_root / '.maca' / str(session_id) / f"{context_id}.log"
         if not log_path.exists():
             return False
-        
+
         # Parse entries separated by blank lines
         current_entry = {}
-        delimiter = key = value = None
+        delimiter = key = value = is_json = None
 
         with open(log_path, 'r') as f:
             for line in f:
@@ -108,6 +108,9 @@ class Logger:
                     # Check for HEREDOC
                     if value.startswith('<<<'):
                         # Extract key (with potential ! suffix)
+                        is_json = key.endswith('!')
+                        if is_json:
+                            key = key[:-1]
                         delimiter = value[3:]
                         value = ''
                         continue

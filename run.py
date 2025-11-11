@@ -1,4 +1,4 @@
-from maca import maca
+from maca import MACA
 import argparse
 
 parser = argparse.ArgumentParser(
@@ -12,4 +12,6 @@ parser.add_argument('-d', '--directory', default='.',
                     help='Project directory (default: current directory)')
 args = parser.parse_args()
 
-maca.run(args.directory, ' '.join(args.task) if args.task else None, args.model)
+# Create MACA instance and run
+maca = MACA(args.directory, ' '.join(args.task) if args.task else None, args.model)
+maca.run()

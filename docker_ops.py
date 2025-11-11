@@ -8,8 +8,6 @@ import hashlib
 from pathlib import Path
 from typing import List, Dict, Optional
 
-from maca import maca
-
 
 class ContainerError(Exception):
     """Container operation failed."""
@@ -108,6 +106,8 @@ def truncate_output(output: str, head: int, tail: int) -> str:
 
 def run_in_container(
     command: str,
+    worktree_path: Path,
+    repo_root: Path,
     docker_image: str = "debian:stable",
     docker_runs: Optional[List[str]] = None,
     head: int = 50,
@@ -140,8 +140,8 @@ def run_in_container(
         image = docker_image
 
     # Resolve absolute paths
-    worktree_abs = maca.worktree_path.resolve()
-    repo_root_abs = maca.repo_root.resolve()
+    worktree_abs = worktree_path.resolve()
+    repo_root_abs = repo_root.resolve()
     git_dir = repo_root_abs / '.git'
 
     # Build the container run command
