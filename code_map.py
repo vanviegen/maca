@@ -1,44 +1,199 @@
 #!/usr/bin/env python3
-"""Generate a code map for a Python project.
+"""Generate a code map for software projects in multiple languages.
 
-This module uses tree-sitter to parse Python files and generate a hierarchical
+This module uses tree-sitter to parse source files and generate a hierarchical
 code map showing classes, functions, methods, and their relationships.
+
+Supported languages: Python, JavaScript, TypeScript, Go, Rust, Java, C, C++, Ruby
 """
 
 import sys
 from pathlib import Path
-from typing import Dict, List, Set, Tuple, Optional
-from dataclasses import dataclass
+from typing import Dict, List, Set, Optional, Tuple
+from dataclasses import dataclass, field
 from tree_sitter import Parser, Language, Node
-import tree_sitter_python
+
+# Language imports - will be loaded dynamically
+LANGUAGE_MODULES = {
+    'python': 'tree_sitter_python',
+    'javascript': 'tree_sitter_javascript',
+    'typescript': 'tree_sitter_typescript',
+    'go': 'tree_sitter_go',
+    'rust': 'tree_sitter_rust',
+    'java': 'tree_sitter_java',
+    'c': 'tree_sitter_c',
+    'cpp': 'tree_sitter_cpp',
+    'ruby': 'tree_sitter_ruby',
+}
 
 
 @dataclass
 class Definition:
-    """Represents a code definition (class, function, or method)."""
+    """Represents a code definition (class, function, method, struct, interface, etc.)."""
     name: str
-    type: str  # 'class', 'function', or 'method'
+    type: str  # 'class', 'function', 'method', 'struct', 'interface', etc.
     start_line: int
     end_line: int
     file_path: str
     params: List[str]
-    parent: Optional[str] = None  # For methods, the class name
+    parent: Optional[str] = None  # For methods, the class/struct name
     id: Optional[str] = None
-    uses: Set[str] = None  # IDs of definitions this one uses
+    uses: Set[str] = field(default_factory=set)
 
-    def __post_init__(self):
-        if self.uses is None:
-            self.uses = set()
+
+class LanguageConfig:
+    """Configuration for parsing a specific language."""
+
+    def __init__(self, name: str, extensions: List[str], node_types: Dict[str, List[str]]):
+        """
+        Initialize language configuration.
+
+        Args:
+            name: Language name
+            extensions: File extensions for this language
+            node_types: Mapping of definition types to tree-sitter node types
+        """
+        self.name = name
+        self.extensions = extensions
+        self.node_types = node_types
+        self.self_params = []  # Parameters to exclude (like 'self', 'this')
+
+
+# Language configurations
+LANGUAGE_CONFIGS = {
+    'python': LanguageConfig(
+        name='python',
+        extensions=['.py'],
+        node_types={
+            'class': ['class_definition'],
+            'function': ['function_definition'],
+        }
+    ),
+    'javascript': LanguageConfig(
+        name='javascript',
+        extensions=['.js', '.jsx', '.mjs'],
+        node_types={
+            'class': ['class_declaration'],
+            'function': ['function_declaration', 'method_definition', 'arrow_function'],
+        }
+    ),
+    'typescript': LanguageConfig(
+        name='typescript',
+        extensions=['.ts', '.tsx'],
+        node_types={
+            'class': ['class_declaration'],
+            'interface': ['interface_declaration'],
+            'function': ['function_declaration', 'method_definition', 'arrow_function'],
+        }
+    ),
+    'go': LanguageConfig(
+        name='go',
+        extensions=['.go'],
+        node_types={
+            'struct': ['type_declaration'],  # Go uses type declarations
+            'function': ['function_declaration', 'method_declaration'],
+        }
+    ),
+    'rust': LanguageConfig(
+        name='rust',
+        extensions=['.rs'],
+        node_types={
+            'struct': ['struct_item'],
+            'enum': ['enum_item'],
+            'trait': ['trait_item'],
+            'function': ['function_item'],
+        }
+    ),
+    'java': LanguageConfig(
+        name='java',
+        extensions=['.java'],
+        node_types={
+            'class': ['class_declaration'],
+            'interface': ['interface_declaration'],
+            'function': ['method_declaration'],
+        }
+    ),
+    'c': LanguageConfig(
+        name='c',
+        extensions=['.c', '.h'],
+        node_types={
+            'struct': ['struct_specifier'],
+            'function': ['function_definition'],
+        }
+    ),
+    'cpp': LanguageConfig(
+        name='cpp',
+        extensions=['.cpp', '.hpp', '.cc', '.hh', '.cxx', '.hxx'],
+        node_types={
+            'class': ['class_specifier'],
+            'struct': ['struct_specifier'],
+            'function': ['function_definition'],
+        }
+    ),
+    'ruby': LanguageConfig(
+        name='ruby',
+        extensions=['.rb'],
+        node_types={
+            'class': ['class'],
+            'module': ['module'],
+            'function': ['method'],
+        }
+    ),
+}
+
+# Set self parameters for languages
+LANGUAGE_CONFIGS['python'].self_params = ['self', 'cls']
+LANGUAGE_CONFIGS['javascript'].self_params = ['this']
+LANGUAGE_CONFIGS['typescript'].self_params = ['this']
+LANGUAGE_CONFIGS['ruby'].self_params = ['self']
 
 
 class CodeMapGenerator:
-    """Generates code maps from Python source files."""
+    """Generates code maps from source files in multiple languages."""
 
     def __init__(self):
-        """Initialize the parser with Python grammar."""
-        self.parser = Parser(Language(tree_sitter_python.language()))
-        self.definitions: Dict[str, Definition] = {}  # key: (file_path, name, parent?)
+        """Initialize the generator."""
+        self.definitions: Dict[str, Definition] = {}
         self.id_counter = 1
+        self.parsers: Dict[str, Parser] = {}
+        self.loaded_languages: Set[str] = set()
+
+    def _load_language(self, lang_name: str) -> Optional[Parser]:
+        """Load a tree-sitter language parser."""
+        if lang_name in self.parsers:
+            return self.parsers[lang_name]
+
+        if lang_name not in LANGUAGE_MODULES:
+            return None
+
+        try:
+            module_name = LANGUAGE_MODULES[lang_name]
+            module = __import__(module_name)
+
+            # Special handling for TypeScript which has two languages
+            if lang_name == 'typescript':
+                language = Language(module.language_typescript())
+            else:
+                language = Language(module.language())
+
+            parser = Parser(language)
+            self.parsers[lang_name] = parser
+            self.loaded_languages.add(lang_name)
+            return parser
+        except ImportError:
+            print(f"Warning: {module_name} not installed, skipping {lang_name} files", file=sys.stderr)
+            return None
+        except Exception as e:
+            print(f"Warning: Failed to load {lang_name}: {e}", file=sys.stderr)
+            return None
+
+    def _detect_language(self, file_path: Path) -> Optional[LanguageConfig]:
+        """Detect the language of a file based on its extension."""
+        suffix = file_path.suffix.lower()
+        for lang_name, config in LANGUAGE_CONFIGS.items():
+            if suffix in config.extensions:
+                return config
+        return None
 
     def _get_definition_key(self, file_path: str, name: str, parent: Optional[str] = None) -> str:
         """Generate a unique key for a definition."""
@@ -46,44 +201,61 @@ class CodeMapGenerator:
             return f"{file_path}::{parent}.{name}"
         return f"{file_path}::{name}"
 
-    def _extract_params(self, parameters_node: Node) -> List[str]:
-        """Extract parameter names and types from a function/method definition."""
+    def _extract_identifier(self, node: Node) -> Optional[str]:
+        """Extract identifier name from a node."""
+        if node.type == 'identifier':
+            return node.text.decode('utf-8')
+
+        # Look for identifier in children
+        for child in node.children:
+            if child.type == 'identifier':
+                return child.text.decode('utf-8')
+            # Handle type_identifier (TypeScript, Go, etc.)
+            if child.type == 'type_identifier':
+                return child.text.decode('utf-8')
+            # Handle name field
+            if child.type == 'name':
+                return child.text.decode('utf-8')
+
+        return None
+
+    def _extract_params(self, node: Node, lang_config: LanguageConfig) -> List[str]:
+        """Extract parameter names from a function/method definition."""
         params = []
-        if not parameters_node:
+
+        # Find the parameters node
+        params_node = None
+        for child in node.children:
+            if child.type in ['parameters', 'parameter_list', 'formal_parameters']:
+                params_node = child
+                break
+
+        if not params_node:
             return params
 
-        for child in parameters_node.children:
-            if child.type == 'identifier':
-                params.append(child.text.decode('utf-8'))
-            elif child.type == 'typed_parameter':
-                # Get the identifier part before the type annotation
-                for subchild in child.children:
-                    if subchild.type == 'identifier':
-                        params.append(subchild.text.decode('utf-8'))
-                        break
-            elif child.type == 'default_parameter':
-                # Get the identifier part before the default value
-                for subchild in child.children:
-                    if subchild.type == 'identifier':
-                        params.append(subchild.text.decode('utf-8'))
-                        break
-            elif child.type == 'typed_default_parameter':
-                # Get the identifier part
-                for subchild in child.children:
-                    if subchild.type == 'identifier':
-                        params.append(subchild.text.decode('utf-8'))
-                        break
+        # Extract parameter identifiers
+        for child in params_node.children:
+            param_name = None
 
-        # Remove 'self' and 'cls' from parameters
-        params = [p for p in params if p not in ('self', 'cls')]
+            if child.type == 'identifier':
+                param_name = child.text.decode('utf-8')
+            elif child.type in ['parameter', 'parameter_declaration', 'formal_parameter']:
+                # Look for identifier in parameter
+                param_name = self._extract_identifier(child)
+            elif 'parameter' in child.type or 'param' in child.type:
+                param_name = self._extract_identifier(child)
+
+            if param_name and param_name not in lang_config.self_params:
+                params.append(param_name)
+
         return params
 
-    def _extract_identifiers(self, node: Node, source: bytes) -> Set[str]:
+    def _extract_identifiers(self, node: Node) -> Set[str]:
         """Extract all identifier names used in a node's body."""
         identifiers = set()
 
         def visit(n: Node):
-            if n.type == 'identifier':
+            if n.type in ['identifier', 'type_identifier']:
                 identifiers.add(n.text.decode('utf-8'))
             for child in n.children:
                 visit(child)
@@ -91,69 +263,91 @@ class CodeMapGenerator:
         visit(node)
         return identifiers
 
-    def _parse_file(self, file_path: Path) -> None:
-        """Parse a single Python file and extract definitions."""
+    def _parse_file(self, file_path: Path, lang_config: LanguageConfig) -> None:
+        """Parse a single source file and extract definitions."""
+        parser = self._load_language(lang_config.name)
+        if not parser:
+            return
+
         try:
             source = file_path.read_bytes()
-            tree = self.parser.parse(source)
+            tree = parser.parse(source)
             root = tree.root_node
 
-            self._extract_definitions(root, source, str(file_path))
+            self._extract_definitions(root, source, str(file_path), lang_config)
         except Exception as e:
             print(f"Warning: Failed to parse {file_path}: {e}", file=sys.stderr)
 
-    def _extract_definitions(self, node: Node, source: bytes, file_path: str, parent_class: Optional[str] = None) -> None:
-        """Recursively extract class and function definitions from AST."""
-        if node.type == 'class_definition':
-            # Extract class name
-            class_name = None
+    def _extract_definitions(
+        self,
+        node: Node,
+        source: bytes,
+        file_path: str,
+        lang_config: LanguageConfig,
+        parent_class: Optional[str] = None
+    ) -> None:
+        """Recursively extract definitions from AST."""
+
+        # Check if this is a container type (class, struct, interface, etc.)
+        is_container = False
+        container_type = None
+        for def_type, node_types in lang_config.node_types.items():
+            if def_type in ['class', 'struct', 'interface', 'enum', 'trait', 'module']:
+                if node.type in node_types:
+                    is_container = True
+                    container_type = def_type
+                    break
+
+        if is_container:
+            name = self._extract_identifier(node)
             body_node = None
 
+            # Find the body/block
             for child in node.children:
-                if child.type == 'identifier':
-                    class_name = child.text.decode('utf-8')
-                elif child.type == 'block':
+                if child.type in ['block', 'class_body', 'declaration_list', 'field_declaration_list', 'body']:
                     body_node = child
+                    break
 
-            if class_name:
-                # Create definition for the class
+            if name:
                 definition = Definition(
-                    name=class_name,
-                    type='class',
+                    name=name,
+                    type=container_type,
                     start_line=node.start_point[0] + 1,
                     end_line=node.end_point[0] + 1,
                     file_path=file_path,
                     params=[],
                     parent=None
                 )
-                key = self._get_definition_key(file_path, class_name)
+                key = self._get_definition_key(file_path, name)
                 self.definitions[key] = definition
 
-                # Recursively process class body for methods
+                # Process body for methods
                 if body_node:
-                    self._extract_definitions(body_node, source, file_path, parent_class=class_name)
+                    self._extract_definitions(body_node, source, file_path, lang_config, parent_class=name)
 
-            # Don't recurse further - we've already processed the class body
             return
 
-        elif node.type == 'function_definition':
-            # Extract function/method name and parameters
-            func_name = None
-            params_node = None
+        # Check if this is a function/method
+        is_function = False
+        for def_type, node_types in lang_config.node_types.items():
+            if def_type == 'function':
+                if node.type in node_types:
+                    is_function = True
+                    break
+
+        if is_function:
+            func_name = self._extract_identifier(node)
             body_node = None
 
+            # Find the body/block
             for child in node.children:
-                if child.type == 'identifier':
-                    func_name = child.text.decode('utf-8')
-                elif child.type == 'parameters':
-                    params_node = child
-                elif child.type == 'block':
+                if child.type in ['block', 'body', 'statement_block', 'compound_statement']:
                     body_node = child
+                    break
 
             if func_name:
-                params = self._extract_params(params_node)
+                params = self._extract_params(node, lang_config)
 
-                # Create definition for the function/method
                 definition = Definition(
                     name=func_name,
                     type='method' if parent_class else 'function',
@@ -168,16 +362,14 @@ class CodeMapGenerator:
 
                 # Extract identifiers used in the function body
                 if body_node:
-                    identifiers = self._extract_identifiers(body_node, source)
-                    # Store for later reference resolution
+                    identifiers = self._extract_identifiers(body_node)
                     definition.uses = identifiers
 
-            # Don't recurse further - we don't want nested functions
             return
 
         # Recursively process children for other node types
         for child in node.children:
-            self._extract_definitions(child, source, file_path, parent_class)
+            self._extract_definitions(child, source, file_path, lang_config, parent_class)
 
     def _assign_ids_and_resolve_references(self) -> None:
         """Assign IDs to definitions and resolve cross-references."""
@@ -198,7 +390,7 @@ class CodeMapGenerator:
                 definition.uses = resolved_uses
 
     def generate_map(self, directory: str) -> str:
-        """Generate a code map for all Python files in the directory.
+        """Generate a code map for all supported files in the directory.
 
         Args:
             directory: Path to the directory to scan
@@ -210,18 +402,25 @@ class CodeMapGenerator:
         if not dir_path.exists():
             raise ValueError(f"Directory does not exist: {directory}")
 
-        # Find all Python files
-        python_files = sorted(dir_path.rglob("*.py"))
+        # Find all source files
+        source_files = []
+        for config in LANGUAGE_CONFIGS.values():
+            for ext in config.extensions:
+                source_files.extend(dir_path.rglob(f"*{ext}"))
+
+        source_files = sorted(set(source_files))
 
         # Parse all files
-        for file_path in python_files:
+        for file_path in source_files:
             # Skip hidden directories and common exclusions
             if any(part.startswith('.') for part in file_path.parts):
                 continue
-            if '__pycache__' in file_path.parts:
+            if any(part in ['node_modules', '__pycache__', 'target', 'build', 'dist'] for part in file_path.parts):
                 continue
 
-            self._parse_file(file_path)
+            lang_config = self._detect_language(file_path)
+            if lang_config:
+                self._parse_file(file_path, lang_config)
 
         # Assign IDs and resolve references
         self._assign_ids_and_resolve_references()
@@ -252,39 +451,39 @@ class CodeMapGenerator:
 
             definitions = by_file[file_path]
 
-            # Separate classes and top-level functions
-            classes = [d for d in definitions if d.type == 'class']
+            # Separate containers (classes, structs, etc.) and top-level functions
+            containers = [d for d in definitions if d.type in ['class', 'struct', 'interface', 'enum', 'trait', 'module']]
             functions = [d for d in definitions if d.type == 'function']
 
             # Sort by line number
-            classes.sort(key=lambda d: d.start_line)
+            containers.sort(key=lambda d: d.start_line)
             functions.sort(key=lambda d: d.start_line)
 
-            # Output classes and their methods
-            for cls in classes:
-                uses_str = f", uses {', '.join(sorted(cls.uses))}" if cls.uses else ""
-                lines.append(f"  class {cls.name} [{cls.id}, lines {cls.start_line}-{cls.end_line}{uses_str}]")
+            # Output containers and their methods
+            for container in containers:
+                uses_str = f", uses {' '.join(sorted(container.uses))}" if container.uses else ""
+                lines.append(f"  {container.id} {container.type} {container.name} [lines {container.start_line}-{container.end_line}{uses_str}]")
 
-                # Find methods for this class
-                methods = [d for d in definitions if d.type == 'method' and d.parent == cls.name]
+                # Find methods for this container
+                methods = [d for d in definitions if d.type == 'method' and d.parent == container.name]
                 methods.sort(key=lambda d: d.start_line)
 
                 for method in methods:
                     params_str = ", ".join(method.params) if method.params else ""
-                    uses_str = f", uses {', '.join(sorted(method.uses))}" if method.uses else ""
-                    lines.append(f"    method {method.name}({params_str}) [{method.id}, lines {method.start_line}-{method.end_line}{uses_str}]")
+                    uses_str = f", uses {' '.join(sorted(method.uses))}" if method.uses else ""
+                    lines.append(f"    {method.id} method {method.name}({params_str}) [lines {method.start_line}-{method.end_line}{uses_str}]")
 
             # Output top-level functions
             for func in functions:
                 params_str = ", ".join(func.params) if func.params else ""
-                uses_str = f", uses {', '.join(sorted(func.uses))}" if func.uses else ""
-                lines.append(f"  function {func.name}({params_str}) [{func.id}, lines {func.start_line}-{func.end_line}{uses_str}]")
+                uses_str = f", uses {' '.join(sorted(func.uses))}" if func.uses else ""
+                lines.append(f"  {func.id} function {func.name}({params_str}) [lines {func.start_line}-{func.end_line}{uses_str}]")
 
         return "\n".join(lines)
 
 
 def generate_code_map(directory: str) -> str:
-    """Generate a code map for a Python project.
+    """Generate a code map for a software project.
 
     Args:
         directory: Path to the directory to scan
