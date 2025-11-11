@@ -296,7 +296,7 @@ class Context:
 
         duration = int((time.time() - start_time) * 1000)  # in ms
         self.logger.log(tag='llm_call', model=self.model, cost=cost, prompt_tokens=usage['prompt_tokens'], completion_tokens=usage['completion_tokens'], duration=duration)
-        # self.logger.log(tag='full_response', **result) # debugging only
+        self.logger.log(tag='full_response', **result) # debugging only
 
         # Add assistant message to history
         self.add_message(message)

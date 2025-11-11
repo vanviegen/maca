@@ -671,36 +671,57 @@ def ask_main_question(question: str) -> bool:
     In case you need clarification from the main context before completing your task,
     you can use this tool to ask a question.
     """
-    return ReadyResult(f"The subcontext has a question for the main context:\n{question}\n\nIf you want the subcontext to proceed, answer its question as guidance in a continue_subcontext call. If needed, you can get_user_input first.")
+    return ReadyResult(f"The subcontext has a question for the main context:\n{question}\n\nIf you want the subcontext to proceed, answer its question as guidance in a continue_subcontext call. If needed, you can ask_user_questions first.")
+
+@dataclass
+class Question:
+    """A single question with optional preset answers."""
+    prompt: str
+    preset_answers: Optional[List[str]] = None
 
 @tool
-def get_user_input(prompt: str, preset_answers: List[str] = None) -> str:
+def ask_user_questions(questions: List[Dict[str, Any]]) -> str:
     """
-    Get input from the user interactively.
+    Ask the user one or more questions interactively.
+
+    Each question can optionally provide preset answer choices. The LLM is highly encouraged
+    to provide likely answers when possible to make it easier for the user.
 
     Args:
-        prompt: The prompt to display to the user
-        preset_answers: Optional list of preset answer choices
+        questions: List of question objects, each with:
+            - prompt: The question to ask the user
+            - preset_answers: Optional list of likely answer choices
 
     Returns:
-        The user's input
+        A formatted string containing all answers, clearly separated
     """
-    if preset_answers:
-        # Show choice selection
-        choices = [(answer, answer) for answer in preset_answers]
-        choices.append(('__custom__', 'Other (custom input)'))
+    answers = []
+    
+    for i, q in enumerate(questions, 1):
+        prompt_text = q.get('prompt', '')
+        preset_answers = q.get('preset_answers')
+        
+        if preset_answers:
+            # Show choice selection
+            choices = [(answer, answer) for answer in preset_answers]
+            choices.append(('__custom__', 'Other (custom input)'))
 
-        result = choice(
-            message=prompt,
-            options=choices
-        )
+            result = choice(
+                message=f"Question {i}/{len(questions)}: {prompt_text}",
+                options=choices
+            )
 
-        if result == '__custom__':
-            return pt_prompt(f"{prompt}\n> ", history=maca.history)
-        return result
-    else:
-        # Simple text input
-        return pt_prompt(f"{prompt}\n> ", history=maca.history)
+            if result == '__custom__':
+                answer = pt_prompt(f"> ", history=maca.history)
+            else:
+                answer = result
+        else:
+            # Simple text input
+            answer = pt_prompt(f"Question {i}/{len(questions)}: {prompt_text}\n> ", history=maca.history)
+        
+        answers.append(f"Q{i}: {prompt_text}\nA{i}: {answer}")
+    
+    return "\n\n".join(answers)
 
 
 @tool

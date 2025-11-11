@@ -33,7 +33,7 @@ MACA orchestrates specialized contexts that communicate through tool calls:
 - Delegates to specialized subcontexts
 - Can work directly for simple tasks
 - Manages the `.scratch/PLAN.md` file for complex tasks
-- Has access to ALL tools (both main-specific and subcontext tools)
+- Has access to ALL tools (both main-specific like ask_user_questions and subcontext tools)
 
 **Specialized Subcontexts** (defined by prompt files in `prompts/`)
 - `code_analysis`: Analyzes codebases, creates/maintains AGENTS.md
