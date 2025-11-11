@@ -350,9 +350,6 @@ class Context:
             tool_name = tool_call['function']['name']
             tool_args = json.loads(tool_call['function']['arguments'])
 
-            # Log tool call
-            self.logger.log(tag='tool_call', tool=tool_name, args=str(tool_args))
-
             # Print tool info
             color_print(indent, ('ansigreen', '→'), ' Tool: ', ('ansiyellow', f"{tool_name}({tool_args})"))
 
@@ -376,9 +373,9 @@ class Context:
             self.logger.log(tag='tool_call', tool=tool_name, args=tool_args, duration=tool_duration, result=result, completed=completed)
 
             self.add_message({
-                'type': 'function_call_output',
-                'call_id': tool_call['id'],
-                'output': result if isinstance(result, str) else json.dumps(result)
+                'role': 'tool',
+                'tool_call_id': tool_call['id'],
+                'content': result if isinstance(result, str) else json.dumps(result)
             })
 
             # Check for git changes and commit if needed

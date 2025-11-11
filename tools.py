@@ -33,11 +33,12 @@ def check_path(path: str) -> str:
         ValueError: If the path is outside the current directory or symlinks outside
     """
     # Convert the input path to absolute and resolve all symlinks
+    # Relative paths are resolved relative to the worktree, not CWD
     try:
-        resolved_path = Path(path).resolve()
+        resolved_path = (Path(maca.worktree_path) / path).resolve()
     except (OSError, RuntimeError) as e:
         raise ValueError(f"Cannot resolve path '{path}': {e}")
-    
+
     # Check if the resolved path is within the current directory
     try:
         resolved_path.relative_to(maca.worktree_path)
@@ -47,9 +48,51 @@ def check_path(path: str) -> str:
     return resolved_path
 
 
+def parse_gitignore_files(exclude_files: Optional[List[str]]) -> List[str]:
+    """
+    Parse gitignore-style files and return list of exclusion patterns.
+
+    Args:
+        exclude_files: List of paths to gitignore-style files to parse
+
+    Returns:
+        List of exclusion patterns extracted from all files
+    """
+    if not exclude_files:
+        return []
+
+    worktree = Path(maca.worktree_path)
+    patterns = []
+
+    for ignore_file_path in exclude_files:
+        ignore_file = worktree / ignore_file_path
+        if not ignore_file.exists() or not ignore_file.is_file():
+            continue
+
+        try:
+            with open(ignore_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    # Skip blank lines and comments
+                    if not line or line.startswith('#'):
+                        continue
+                    # Skip negation patterns (! prefix) - would require more complex logic
+                    if line.startswith('!'):
+                        continue
+                    # Remove trailing spaces
+                    line = line.rstrip()
+                    patterns.append(line)
+        except Exception:
+            # Skip files that can't be read
+            continue
+
+    return patterns
+
+
 def get_matching_files(
     include: Optional[Union[str, List[str]]] = "**",
-    exclude: Optional[Union[str, List[str]]] = ".*"
+    exclude: Optional[Union[str, List[str]]] = ".*",
+    exclude_files: Optional[List[str]] = None
 ) -> List[Path]:
     """
     Get list of files matching include/exclude glob patterns.
@@ -59,6 +102,8 @@ def get_matching_files(
                  Defaults to "**" (all files).
         exclude: Glob pattern(s) to exclude. Can be None, a string, or list of strings.
                  Defaults to ".*" (hidden files/directories).
+        exclude_files: List of paths to gitignore-style files to read exclusion patterns from.
+                      Defaults to None.
 
     Returns:
         List of Path objects for matching files (not directories)
@@ -80,6 +125,11 @@ def get_matching_files(
         exclude_patterns = [exclude]
     else:
         exclude_patterns = exclude
+
+    # Add patterns from exclude_files
+    if exclude_files:
+        gitignore_patterns = parse_gitignore_files(exclude_files)
+        exclude_patterns = list(exclude_patterns) + gitignore_patterns
 
     # Collect all matching files
     matching_files = set()
@@ -360,6 +410,7 @@ def read_files(file_paths: List[str], start_line: int = 1, max_lines: int = 250)
 def list_files(
     include: Union[str, List[str]] = "**",
     exclude: Optional[Union[str, List[str]]] = ".*",
+    exclude_files: Optional[List[str]] = None,
     max_files: int = 50
 ) -> Dict[str, Any]:
     """
@@ -379,6 +430,7 @@ def list_files(
     Args:
         include: Glob pattern(s) to include (default: "**" for all files)
         exclude: Glob pattern(s) to exclude (default: ".*" for hidden files)
+        exclude_files: List of paths to gitignore-style files to read exclusion patterns from (default: ['.gitignore'])
         max_files: Maximum number of files to return (default: 50)
 
     Returns:
@@ -392,6 +444,9 @@ def list_files(
         If total_count > max_files, 'files' contains random sampling, which can be
         helpful for getting an impression of a directory structure with many files.
     """
+    # Default exclude_files to ['.gitignore'] if not specified
+    if exclude_files is None:
+        exclude_files = ['.gitignore']
     worktree = Path(maca.worktree_path)
 
     def get_file_info(path: Path) -> Dict[str, Any]:
@@ -424,7 +479,7 @@ def list_files(
         return info
 
     # Get matching files using helper
-    matching_files = get_matching_files(include=include, exclude=exclude)
+    matching_files = get_matching_files(include=include, exclude=exclude, exclude_files=exclude_files)
 
     # Build file info for each match
     matches = [get_file_info(path) for path in matching_files]
@@ -496,6 +551,7 @@ def search(
     regex: str,
     include: Optional[Union[str, List[str]]] = "**",
     exclude: Optional[Union[str, List[str]]] = ".*",
+    exclude_files: Optional[List[str]] = None,
     max_results: int = 10,
     lines_before: int = 2,
     lines_after: int = 2
@@ -507,6 +563,7 @@ def search(
         regex: Regular expression to search for in file contents
         include: Glob pattern(s) to include (default: "**" for all files)
         exclude: Glob pattern(s) to exclude (default: ".*" for hidden files)
+        exclude_files: List of paths to gitignore-style files to read exclusion patterns from (default: ['.gitignore'])
         max_results: Maximum number of matches to return
         lines_before: Number of context lines before each match
         lines_after: Number of context lines after each match
@@ -514,12 +571,16 @@ def search(
     Returns:
         List of matches with file_path, line_number, and context lines
     """
+    # Default exclude_files to ['.gitignore'] if not specified
+    if exclude_files is None:
+        exclude_files = ['.gitignore']
+
     worktree = Path(maca.worktree_path)
     results = []
     content_pattern = re.compile(regex)
 
     # Get matching files using helper
-    matching_files = get_matching_files(include=include, exclude=exclude)
+    matching_files = get_matching_files(include=include, exclude=exclude, exclude_files=exclude_files)
 
     for file_path in matching_files:
         rel_path_str = str(file_path.relative_to(worktree))
@@ -694,6 +755,7 @@ def run_oneshot_per_file(
     task: str,
     include: Optional[Union[str, List[str]]] = "**",
     exclude: Optional[Union[str, List[str]]] = ".*",
+    exclude_files: Optional[List[str]] = None,
     file_limit: int = 5,
     model: str = "auto"
 ) -> str:
@@ -712,14 +774,19 @@ def run_oneshot_per_file(
         task: Task description for the file_processor (applied to each file)
         include: Glob pattern(s) to include (default: "**" for all files)
         exclude: Glob pattern(s) to exclude (default: ".*" for hidden files)
+        exclude_files: List of paths to gitignore-style files to read exclusion patterns from (default: ['.gitignore'])
         file_limit: Maximum files to process (default: 5, prevents accidental bulk operations)
         model: Model to use ("auto" for default, or specific model like "qwen/qwen3-coder-30b-a3b-instruct")
 
     Returns:
         An object keyed by path names with values being {completed: bool, result: str, cost: number} objects.
     """
+    # Default exclude_files to ['.gitignore'] if not specified
+    if exclude_files is None:
+        exclude_files = ['.gitignore']
+
     # Get list of files matching the patterns
-    file_list_result = list_files(include=include, exclude=exclude, max_files=file_limit)
+    file_list_result = list_files(include=include, exclude=exclude, exclude_files=exclude_files, max_files=file_limit)
     files = file_list_result['files']
 
     if len(files) < file_list_result['total_count']:
