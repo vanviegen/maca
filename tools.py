@@ -869,9 +869,6 @@ def main_complete(result: str, commit_msg: str | None) -> bool:
     """
     Signal that the ENTIRE user task is complete and you're ready to end the session.
 
-    This is different from subcontext complete() - this signals that ALL work is done,
-    including any multi-phase plans, and you're ready to return control to the user.
-
     Only call this when:
     - All planned phases are complete
     - All subtasks have been implemented and verified
@@ -885,39 +882,44 @@ def main_complete(result: str, commit_msg: str | None) -> bool:
            were made, this should be `null`.
     """
 
+    if not git_ops.get_commits_between(git_ops.get_head_commit(maca.repo_root), maca.branch_name, maca.repo_root):
+        return ReadyResult(result)
+
     color_print('\n', ('ansigreen', 'Task completed!'), f'\n\n{result}\n')
 
     # Ask for approval
-    response = radiolist_dialog(
-        title='Task Complete',
-        text='Are you satisfied with the result?',
-        values=[
-            ('yes', 'Yes, merge into main'),
-            ('no', 'No, I want changes'),
-            ('cancel', 'Cancel (keep worktree for manual review)')
+    response = choice(
+        message=f'{maca.worktree_path} -- How to proceed?',
+        options=[
+            ('merge', 'Merge into main'),
+            ('continue', 'Ask for further changes'),
+            ('cancel', 'Leave as-is for manual review'),
+            ('delete', 'Delete everything'),
         ]
-    ).run()
+    )
 
-    if response == 'yes':
+    if response == 'merge':
         color_print(('ansicyan', 'Merging changes...'))
 
         # Merge
-        success, message = git_ops.merge_to_main(maca.repo_root, maca.worktree_path, maca.branch_name, commit_msg or result)
+        conflict = git_ops.merge_to_main(maca.repo_root, maca.worktree_path, maca.branch_name, commit_msg or result)
 
-        if success:
-            # Cleanup
-            git_ops.cleanup_session(maca.repo_root, maca.worktree_path, maca.branch_name)
-            color_print(('ansigreen', '✓ Merged and cleaned up'))
-        else:
-            color_print(('ansired', f'Merge failed: {message}'))
-            print("You may need to resolve conflicts manually or spawn a merge context.")
-
+        if conflict:
+            color_print(('ansired', "Merge conflicts!"))
+            return f"Merge conflict while rebasing. Please resolve merge conflicts by doing `read_files` for the affected files and then `update_files` to resolve the conflicts. Then use shell tool with `git add <filename>.. && git rebase --continue`, before calling `main_complete` again with the same arguments to the merge try again. Here is the rebase output:\n\n{conflict}"
+        
+        # Cleanup
+        git_ops.cleanup_session(maca.repo_root, maca.worktree_path, maca.branch_name)
+        color_print(('ansigreen', '✓ Merged and cleaned up'))
         return ReadyResult(result)
     
-    elif response == 'no':
+    elif response == 'continue':
         feedback = pt_prompt("What changes do you want?\n> ", multiline=True, history=maca.history)
         maca.main_context.add_message({"role": "user", "content": feedback})
         return 'User rejected result and provided feedback.'
+    elif response == 'delete':
+        git_ops.cleanup_session(maca.repo_root, maca.worktree_path, maca.branch_name)
+        color_print(('ansired', '✓ Deleted worktree and branch'))
     else:
         print("Keeping worktree for manual review.")
         return ReadyResult(result)

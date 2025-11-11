@@ -118,7 +118,7 @@ def find_next_session_id(repo_root):
 
 def create_session_worktree(repo_root, session_id):
     """Create a new branch and worktree for the session."""
-    branch_name = f'maca-{session_id}'
+    branch_name = f'maca/{session_id}'
     session_dir = Path(repo_root) / '.maca' / str(session_id)
     worktree_path = session_dir / 'worktree'
 
@@ -149,22 +149,8 @@ def commit_changes(worktree_path, message):
     # Add all changes (including untracked files), but exclude .scratch and .maca
     run_git('add', '-A', ':!.scratch', ':!.maca', cwd=worktree_path)
 
-    # Check if there are changes to commit
-    result = run_git('diff', '--cached', '--quiet', cwd=worktree_path, check=False)
-    if result.returncode == 0:
-        # No changes to commit
-        return False
-
     # Commit
-    run_git('commit', '-m', message, cwd=worktree_path)
-    return True
-
-
-def get_diff_stats(worktree_path):
-    """Get the diff statistics for uncommitted changes."""
-    # Check both staged and unstaged changes
-    result = run_git('diff', '--numstat', 'HEAD', cwd=worktree_path, check=False)
-    return result.stdout.strip()
+    return run_git('commit', '-m', message, cwd=worktree_path, check=False).returncode == 0
 
 
 def squash_commits(repo_root, branch_name):
@@ -185,7 +171,7 @@ def squash_commits(repo_root, branch_name):
     return all_messages
 
 
-def generate_descriptive_branch_name(commit_message, repo_root):
+def generate_descriptive_branch_name(commit_message):
     """
     Generate a descriptive branch name from commit message.
 
@@ -213,75 +199,40 @@ def generate_descriptive_branch_name(commit_message, repo_root):
     if not name:
         name = 'changes'
 
-    # Check if maca/<name> exists, if so add suffix
-    base_name = name
-    counter = 2
-    while True:
-        full_branch = f'maca/{name}'
-        result = run_git('rev-parse', '--verify', full_branch, cwd=repo_root, check=False)
-        if result.returncode != 0:
-            # Branch doesn't exist, we can use it
-            break
-        # Branch exists, try next variant
-        name = f'{base_name}-{counter}'
-        counter += 1
-
     return name
 
 
-def merge_to_main(repo_root, worktree_path, branch_name, commit_message):
+def merge_to_main(root_path, worktree_path, org_branch_name, commit_message):
     """Merge the session branch into main using squash + rebase + ff strategy."""
-    main_branch = get_current_branch(cwd=repo_root)
-
-    # First, squash all commits in the worktree
-    # We do this by checking out the branch and doing a soft reset
-    original_branch = get_current_branch(cwd=repo_root)
-
-    # Switch to the session branch in the main repo
-    run_git('checkout', branch_name, cwd=repo_root)
-
-    # Save the current HEAD commit hash (before squashing)
-    result = run_git('rev-parse', 'HEAD', cwd=repo_root)
-    original_head = result.stdout.strip()
-
-    # Get the merge base
-    result = run_git('merge-base', main_branch, branch_name, cwd=repo_root)
-    base_commit = result.stdout.strip()
+    root_branch = get_current_branch(cwd=root_path)
+    worktree_branch = get_current_branch(cwd=worktree_path)
 
     # Generate descriptive branch name for preserving history
-    descriptive_name = generate_descriptive_branch_name(commit_message, repo_root)
+    descriptive_branch = org_branch_name + '-' + generate_descriptive_branch_name(commit_message)
+    run_git('checkout', '-b', descriptive_branch, cwd=worktree_path, check=False) # May err if we rerun the main_complete after rebase conflict
+
+    # Get the merge base
+    base_commit = run_git('merge-base', root_branch, worktree_branch, cwd=worktree_path).stdout.strip()
 
     # Append preservation note to commit message
-    enhanced_message = commit_message
-    if not enhanced_message.endswith('\n'):
-        enhanced_message += '\n'
-    enhanced_message += f'\nThe original chain of MACA commits is kept in the maca/{descriptive_name} branch.'
+    enhanced_message = commit_message.rstrip() + f'\n\nThe original chain of MACA commits is kept in the {descriptive_branch} branch.'
 
     # Soft reset to base
-    run_git('reset', '--soft', base_commit, cwd=repo_root)
+    run_git('reset', '--soft', base_commit, cwd=worktree_path)
 
     # Commit everything as one commit with enhanced message
-    run_git('commit', '-m', enhanced_message, cwd=repo_root, check=False)
-
-    # Go back to main branch
-    run_git('checkout', main_branch, cwd=repo_root)
+    run_git('commit', '-m', enhanced_message, cwd=worktree_path)
 
     # Try to rebase the session branch onto main
-    result = run_git('rebase', main_branch, branch_name, cwd=repo_root, check=False)
+    result = run_git('rebase', root_branch, cwd=worktree_path, check=False)
 
     if result.returncode != 0:
         # Rebase failed, likely due to conflicts
         # Abort the rebase
-        run_git('rebase', '--abort', cwd=repo_root, check=False)
-        return False, "Merge conflicts detected"
+        return result.stdout
 
     # Fast-forward merge
-    run_git('merge', '--ff-only', branch_name, cwd=repo_root)
-
-    # Create the descriptive branch pointing at original HEAD
-    run_git('branch', f'maca/{descriptive_name}', original_head, cwd=repo_root)
-
-    return True, "Merged successfully"
+    run_git('merge', '--ff-only', worktree_branch, cwd=root_path)
 
 
 def cleanup_session(repo_root, worktree_path, branch_name):

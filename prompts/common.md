@@ -19,6 +19,12 @@ Each session runs in an isolated git worktree at `.maca/<session_id>/<tree>/`. T
 - Safe experimentation without affecting main branch
 - Clean rollback if needed
 
+## Automatic Commit and Merge
+The system automatically commits any changes after any tool call. When the Main Context
+signals completion (`main_complete`) of the entire task, the system asks the user if they want to merge changes
+back to the main branch. The system takes care of this. Therefore, do not (propose to) do
+any git commits or merges yourself, unless explicitly instructed.
+
 ### Docker Execution
 The `shell` tool executes commands in Docker/Podman containers:
 - Default image: `debian:stable` with build-essential, git, python3

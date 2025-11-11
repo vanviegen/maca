@@ -257,7 +257,7 @@ class Context:
         }
 
         # Enable caching for Anthropic and similar models
-        self._message[-1]["cache_control"] = {"type": "ephemeral"}
+        self._messages[-1]["cache_control"] = {"type": "ephemeral"}
 
         data = {
             'model': self.model,
@@ -282,7 +282,7 @@ class Context:
                 raise ContextError(f"LLM API error: {error_body}")
             raise ContextError(f"LLM API error: {str(e)}")
         finally:
-            del self._message[-1]["cache_control"]
+            del self._messages[-1]["cache_control"]
 
 
         # Extract response
@@ -337,7 +337,7 @@ class Context:
 
             # Check if AGENTS.md was updated and refresh all contexts
             if self._diff_agents_md():
-                color_print(indent, ('ansicyan', 'AGENTS.md updated in context'))
+                color_print(indent, ('ansigreen', '→'), ' AGENTS.md updated in context')
 
             # Check for HEAD changes before calling LLM
             self._check_head_changes()
@@ -368,18 +368,19 @@ class Context:
             tool_args = json.loads(tool_call['function']['arguments'])
 
             # Print tool info
-            color_print(indent, ('ansigreen', '→'), ' Tool: ', ('ansiyellow', f"{tool_name}({tool_args})"))
+            rationale = tool_args.pop('rationale', '')
+            color_print(indent, ('ansigreen', '→'), ' Tool: ', ('ansiyellow', f"{tool_name}"))
 
-            # Print rationale if present (subcontexts only)
-            rationale = tool_args.get('rationale', '')
+            # Print rationale if present
             if rationale:
-                color_print(f"    Rationale: {rationale}")
+                color_print(f"{indent}  Rationale: {rationale}")
 
             # Execute tool
             tool_start = time.time()
             try:
                 result = tools.execute_tool(tool_name, tool_args)
             except Exception as err:
+                color_print(indent, ('ansired', f"Error during tool execution: {err}"))
                 result = {"error": str(err)}
             finally:
                 tool_duration = int((time.time() - tool_start) * 1000)  # in ms
@@ -396,14 +397,11 @@ class Context:
                 'content': result if isinstance(result, str) else json.dumps(result)
             })
 
-            # Check for git changes and commit if needed
-            diff_stats = git_ops.get_diff_stats(maca.worktree_path)
-            if diff_stats:
-                # Commit changes
+            # Commit changes (if any)
+            if not run_complete or maca.worktree_path.exists():
                 commit_msg = f'{tool_name}: {rationale}' if rationale else tool_name
-                git_ops.commit_changes(maca.worktree_path, commit_msg)
-                self.logger.log(tag='commit', message=commit_msg, diff_stats=diff_stats)
-                color_print(indent, ('ansigreen', '✓ Committed changes'))
+                if git_ops.commit_changes(maca.worktree_path, commit_msg):
+                    color_print(indent, ('ansigreen', '✓ Committed changes'))
 
             # Build summary for this iteration
             abbr_args = json.dumps(tool_args)
