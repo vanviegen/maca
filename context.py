@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""Context classes for managing different types of LLM interactions."""
+"""Context class for managing LLM interactions."""
 
 import time
 from pathlib import Path
-from pathlib import Path
 from typing import Dict, Any, Optional
-import difflib
 import json
 import os
 import urllib.request
@@ -19,38 +17,22 @@ class ContextError(Exception):
 class Context:
     """Context for managing LLM interactions."""
 
-    instance_counters = {}
-
     def __init__(
         self,
-        context_type: str,
         model: str = "auto",
-        context_id=None,
         initial_message: Optional[str] = None
     ):
         """
         Initialize a context.
 
         Args:
-            context_type: Type of context (main, code_analysis, research, etc.)
             model: Model to use for this context ("auto" to use default from prompt)
             initial_message: Optional initial user message to add to context
         """
-        if not context_id:
-            # Auto-generate unique name
-            if context_type not in Context.instance_counters:
-                Context.instance_counters[context_type] = 0
-            Context.instance_counters[context_type] += 1
-            context_id = f"{context_type}{Context.instance_counters[context_type]}"
-            # Register this context
-            maca.subcontexts[context_id] = self
-        
-        self.context_id = context_id
-        self.context_type = context_type
+        self.context_id = "main"
         self.api_key = os.environ.get('OPENROUTER_API_KEY')
         self._messages = []
         self.cumulative_cost = 0
-        self.agents_md_content = None
         self.last_head_commit = None
         self.default_model = 'openai/gpt-5-mini'
 
@@ -62,22 +44,13 @@ class Context:
         # Load system prompt and parse metadata
         self.tool_names = []
         self._load_system_prompt()
-        self.tool_schemas = tools.get_tool_schemas(self.tool_names)
+        self.tool_schemas = tools.get_tool_schemas(self.tool_names, add_rationale=False)
 
         # Set model (use provided or default from prompt)
         if model == "auto":
             self.model = self.default_model
         else:
             self.model = model
-
-        # Load AGENTS.md if it exists
-        self._load_agents_md()
-
-        # Add unique name info
-        self.add_message({
-            'role': 'system',
-            'content': f"Your unique context identifier is: **{self.context_id}**"
-        })
 
         # Initialize HEAD tracking if we have a worktree
         self.last_head_commit = git_ops.get_head_commit(cwd=maca.worktree_path)
@@ -87,111 +60,48 @@ class Context:
             self.add_message({'role': 'user', 'content': initial_message})
 
     def _load_system_prompt(self):
-        """Load the system prompt from markdown files and parse metadata."""
-        # Find the prompts directory (next to the script)
+        """Load the system prompt from prompt.md and parse metadata."""
+        # Find prompt.md (next to the script)
         script_dir = Path(__file__).parent
-        prompts_dir = script_dir / 'prompts'
+        prompt_path = script_dir / 'prompt.md'
 
-        # First load common.md (shared across all contexts)
-        common_path = prompts_dir / 'common.md'
-        if not common_path.exists():
-            raise ContextError(f"Common prompt not found: {common_path}")
-        common_prompt = common_path.read_text()
-
-        self.add_message({
-            'role': 'system',
-            'content': common_prompt
-        })
-
-        # Then load context-specific prompt
-        prompt_path = prompts_dir / f'{self.context_type}.md'
         if not prompt_path.exists():
             raise ContextError(f"System prompt not found: {prompt_path}")
+
         prompt_content = prompt_path.read_text()
 
         # Split into headers and prompt body on first blank line
         parts = prompt_content.split('\n\n', 1)
         if len(parts) != 2:
             raise ContextError(f"Prompt file {prompt_path} must have headers separated by blank line")
-        
+
         headers_text, system_prompt = parts
-        
+
         # Parse headers
         for line in headers_text.split('\n'):
             line = line.strip()
             if not line:
                 continue
-                
+
             if ':' not in line:
                 raise ContextError(f"Invalid header format in {prompt_path}: {line}")
-            
+
             key, value = line.split(':', 1)
             key = key.strip()
             value = value.strip()
-            
+
             if key == 'default_model':
                 self.default_model = value
             elif key == 'tools':
                 self.tool_names = [name.strip() for name in value.split(',')]
             else:
                 raise ContextError(f"Unknown header key in {prompt_path}: {key}")
-        
+
         self.add_message({
             'role': 'system',
             'content': system_prompt
         })
 
-    def _load_agents_md(self):
-        """Load AGENTS.md from the worktree if it exists."""
-        if not maca.worktree_path:
-            return
-
-        agents_path = maca.worktree_path / 'AGENTS.md'
-        if agents_path.exists():
-            content = agents_path.read_text()
-            self.agents_md_content = content
-            self.add_message({
-                'role': 'system',
-                'content': f"# Project Context (AGENTS.md)\n\n{content}"
-            })
-
-    def _diff_agents_md(self):
-        """
-        Check if AGENTS.md has been updated and append diff to context.
-
-        This appends only the diff rather than full content to keep context small.
-        """
-        agents_path = maca.worktree_path / 'AGENTS.md'
-        if not agents_path.exists():
-            return False
-
-        new_content = agents_path.read_text()
-
-        # Check if content has changed
-        if new_content == self.agents_md_content:
-            return False
-        
-        old_lines = self.agents_md_content.splitlines(keepends=True) if self.agents_md_content else []
-        new_lines = new_content.splitlines(keepends=True)
-
-        # Generate unified diff
-        diff = difflib.unified_diff(
-            old_lines,
-            new_lines,
-            fromfile='AGENTS.md (previous)',
-            tofile='AGENTS.md (current)',
-            lineterm=''
-        )
-        diff_text = '\n'.join(diff)
-
-        self.agents_md_content = new_content
-
-        # Append diff to keep caches active
-        self.add_message({
-            'role': 'system',
-            'content': f"# AGENTS.md Updated\n\nThe following changes were made to AGENTS.md:\n\n```diff\n{diff_text}\n```"
-        })
-        return True
 
     def _check_head_changes(self):
         """
@@ -294,33 +204,19 @@ class Context:
         self.logger.log(tag="message", **message)
         self._messages.append(message)
 
-    def run(self, budget=None):
+    def run(self):
         """
-        Run this context until completion or budget exceeded.
+        Run this context until completion.
 
-        Args:
-            budget: Maximum cost in microdollars before returning (None = unlimited)
-
-        Returns: (str)
-            dict with:
-            - completed: bool (True if completed normally, False if budget exceeded)
-            - summary: str (summary of what happened)
-            - cost: int (total cost in microdollars for this run)
+        Returns:
+            None (runs until complete() is called)
         """
-        total_cost = 0
         completed = False
-        summary_parts = []
-        is_subcontext = (self.context_type != '_main')
-        indent = '  ' if is_subcontext else ''
 
-        # Loop until completion or budget exceeded
+        # Loop until completion
         while not completed:
             # Print thinking message
-            color_print(('ansicyan', f"{indent}Context '{self.context_id}' thinking..."))
-
-            # Check if AGENTS.md was updated and refresh all contexts
-            if self._diff_agents_md():
-                color_print(indent, ('ansicyan', 'AGENTS.md updated in context'))
+            color_print(('ansicyan', "Thinking..."))
 
             # Check for HEAD changes before calling LLM
             self._check_head_changes()
@@ -331,8 +227,7 @@ class Context:
                     result = self.call_llm()
                     break
                 except Exception as err:
-                    color_print(indent, ('ansired', f"Error during LLM call: {err}. Retrying..."))
-                    summary_parts.append(f"Error during LLM call: {err}")
+                    color_print(('ansired', f"Error during LLM call: {err}. Retrying..."))
                     self.logger.log(tag='error', error=str(err))
             else:
                 break
@@ -340,7 +235,6 @@ class Context:
             # Extract tool calls
             message = result['message']
             cost = result['cost']
-            total_cost += cost
 
             # Extract tool info
             tool_calls = message.get('tool_calls', [])
@@ -354,67 +248,42 @@ class Context:
             self.logger.log(tag='tool_call', tool=tool_name, args=str(tool_args))
 
             # Print tool info
-            color_print(indent, ('ansigreen', '→'), ' Tool: ', ('ansiyellow', f"{tool_name}({tool_args})"))
-
-            # Print rationale if present (subcontexts only)
-            rationale = tool_args.get('rationale', '')
-            if rationale:
-                color_print(f"    Rationale: {rationale}")
+            color_print(('ansigreen', '→'), ' Tool: ', ('ansiyellow', f"{tool_name}({tool_args})"))
 
             # Execute tool
             tool_start = time.time()
             try:
-                result = tools.execute_tool(tool_name, tool_args)
+                tool_result = tools.execute_tool(tool_name, tool_args)
                 tool_duration = time.time() - tool_start
             except Exception as err:
-                result = {"error": str(err)}
+                tool_result = {"error": str(err)}
+                tool_duration = time.time() - tool_start
 
-            if isinstance(result, tools.ReadyResult):
-                result = result.result
+            if isinstance(tool_result, tools.ReadyResult):
+                tool_result = tool_result.result
                 completed = True
 
-            self.logger.log(tag='tool_call', tool=tool_name, args=tool_args, duration=tool_duration, result=result, completed=completed)
+            self.logger.log(tag='tool_result', tool=tool_name, duration=tool_duration, result=tool_result, completed=completed)
 
             self.add_message({
                 'type': 'function_call_output',
                 'call_id': tool_call['id'],
-                'output': result if isinstance(result, str) else json.dumps(result)
+                'output': tool_result if isinstance(tool_result, str) else json.dumps(tool_result)
             })
 
             # Check for git changes and commit if needed
             diff_stats = git_ops.get_diff_stats(maca.worktree_path)
             if diff_stats:
                 # Commit changes
-                commit_msg = f'{tool_name}: {rationale}' if rationale else tool_name
+                commit_msg = tool_name
                 git_ops.commit_changes(maca.worktree_path, commit_msg)
                 self.logger.log(tag='commit', message=commit_msg, diff_stats=diff_stats)
-                color_print(indent, ('ansigreen', '✓ Committed changes'))
-
-            # Build summary for this iteration
-            abbr_args = json.dumps(tool_args)
-            if len(abbr_args) > 120:
-                abbr_args = abbr_args[:80] + '...'
-            iteration_summary = f"Called {tool_name}({abbr_args}) because: {rationale}"
-            summary_parts.append(iteration_summary)
+                color_print(('ansigreen', '✓ Committed changes'))
 
             if completed:
-                color_print(indent, ('ansigreen', f'✓ Context {self.context_id} completed. Cost: {total_cost}μ$'))
+                color_print(('ansigreen', f'✓ Task completed. Total cost: {self.cumulative_cost}μ$'))
                 self.logger.log(tag='complete')
-                summary_parts.append(result)
                 break
-
-            # Check budget (only for subcontexts)
-            if budget is not None and total_cost > budget:
-                budget_msg = f"Context '{self.context_id}' budget exceeded (spent {total_cost}μ$ of {budget}μ$)"
-                color_print(indent, ('ansiyellow', budget_msg))
-                summary_parts.append(budget_msg)
-                break
-
-        return {
-            'summary': "\n".join(summary_parts),
-            'completed': True,
-            'cost': total_cost
-        }
 
 
 

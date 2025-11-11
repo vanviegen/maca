@@ -11,19 +11,16 @@ from prompt_toolkit.history import FileHistory
 
 
 class MACA:
-    """Main orchestration class for the multi-agent coding assistant."""
+    """Main orchestration class for the coding assistant."""
 
     def __init__(self):
         self.initial_prompt = None
         self.repo_path = None
-        self.initial_prompt = None
         self.repo_root = None
         self.session_id = None
         self.worktree_path = None
         self.branch_name = None
-        self.main_context = None
-        self.subcontexts: Dict[str, context.Context] = {}
-        self.context_counters: Dict[str, int] = {}  # Track counter per context type for auto-naming
+        self.context = None
 
     def ensure_git_repo(self):
         """Ensure we're in a git repository, or offer to initialize one."""
@@ -76,17 +73,18 @@ class MACA:
         # Create session
         self.create_session()
 
-        # Initialize main context
-        self.main_context = context.Context(context_type='_main', context_id='main', model=model or 'auto')
+        # Initialize context
+        self.context = context.Context(model=model or 'auto')
 
         # Auto-call list_files for top-level directory to give context about project structure
         try:
-            top_files_result = tools.execute_tool('list_files', {'path_regex': r'^[^/\\]*$'})
-            # Add as a system message so main context knows what files are in the top directory
+            top_files_result = tools.execute_tool('list_files', {'include': '*'})
+            # Add as a system message so context knows what files are in the top directory
             top_files_msg = f"Top-level directory contains {top_files_result['total_count']} files"
             if top_files_result['files']:
-                top_files_msg += f":\n" + "\n".join(f"- {f}" for f in top_files_result['files'])
-            self.main_context.add_message({'role': 'system', 'content': top_files_msg})
+                files_list = [f['path'] for f in top_files_result['files']]
+                top_files_msg += f":\n" + "\n".join(f"- {f}" for f in files_list)
+            self.context.add_message({'role': 'system', 'content': top_files_msg})
         except Exception as e:
             # Don't fail if this doesn't work
             pass
@@ -102,8 +100,8 @@ class MACA:
                 prompt = pt_prompt("> ", multiline=True, history=self.history).strip()
 
             if prompt:
-                self.main_context.add_message({"role": "user", "content": prompt})
-                self.main_context.run()
+                self.context.add_message({"role": "user", "content": prompt})
+                self.context.run()
 
 maca = MACA()
 

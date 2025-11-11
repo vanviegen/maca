@@ -15,8 +15,11 @@ from typing import get_type_hints, get_origin, get_args, Any, Dict, List, Union,
 from maca import maca
 from utils import color_print
 from docker_ops import run_in_container
-from context import Context
 import git_ops
+import json
+import time
+import urllib.request
+import os
 
 
 def check_path(path: str) -> str:
@@ -577,37 +580,6 @@ def shell(command: str, docker_image: str = "debian:stable", docker_runs: List[s
     )
 
 
-@tool
-def subcontext_complete(result: str) -> bool:
-    """
-    Signal that your subtask is complete and return the result to the main context.
-
-    This signals that YOU (the subcontext) are done with your specific task. The main context
-    may continue orchestrating other work after you complete.
-
-    For tasks involving analysis or generating extensive output:
-    - Place detailed results in files within .scratch/ directory (e.g., .scratch/analysis.md, .scratch/test-results.txt)
-    - The .scratch/ directory is temporary and git-ignored - files there are never committed
-    - Return a SUMMARY of findings in the result parameter
-    - Mention which .scratch/ files contain detailed data if the main context asked for analysis
-    - ONLY create .scratch/ files if the main context specifically requested analysis/detailed output
-
-    For regular implementation tasks:
-    - Just return a brief summary of what was done
-    - Do NOT create .scratch/ files unless specifically requested
-
-    Args:
-        result: Summary of what was accomplished (and optionally mention .scratch/ files with details)
-    """
-    return ReadyResult(f"Task completed with result:\n{result}")
-
-@tool
-def ask_main_question(question: str) -> bool:
-    """
-    In case you need clarification from the main context before completing your task,
-    you can use this tool to ask a question.
-    """
-    return ReadyResult(f"The subcontext has a question for the main context:\n{question}\n\nIf you want the subcontext to proceed, answer its question as guidance in a continue_subcontext call. If needed, you can get_user_input first.")
 
 @tool
 def get_user_input(prompt: str, preset_answers: List[str] = None) -> str:
@@ -640,93 +612,56 @@ def get_user_input(prompt: str, preset_answers: List[str] = None) -> str:
         return pt_prompt(f"{prompt}\n> ", history=maca.history)
 
 
-@tool
-def create_subcontext(context_type: str, task: str, model: str = "auto", budget: int = 20000) -> str:
-    """
-    Create a new subcontext to work on a specific task.
-    The subcontext will be automatically named (e.g., research1, implementation2, etc.)
-
-    The subcontext will run autonomously until its budget is exhausted or it calls complete().
-    Only when the budget is exceeded will control return to you for verification.
-    All tool calls and rationales will still be logged to your context for monitoring.
-
-    Available context types:
-    - code_analysis: Analyze codebases, understand architecture
-    - research: Gather information, look up documentation, find solutions
-    - implementation: Write and modify code
-    - review: Review code for quality, correctness, security
-    - merge: Resolve git merge conflicts
-
-    For processing multiple files with one-shot operations, use run_oneshot_per_file instead.
-
-    Args:
-        context_type: Type of context (code_analysis, research, implementation, review, merge)
-        task: Description of the task for this subcontext
-        model: Model to use ("auto" for default, or specific model name like "qwen/qwen3-coder-30b-a3b-instruct")
-        budget: Maximum cost in microdollars (μ$) before returning control (default: 20000μ$ = $0.02)
-
-    Returns:
-        Confirmation message with the auto-generated name
-    """
-    # Validate context type - reject special (underscore-prefixed) context types
-    if context_type.startswith('_'):
-        raise ValueError(f"Cannot create subcontext of type '{context_type}'. Types starting with '_' are reserved for special contexts.")
-
-    # Create subcontext (it will auto-generate unique name and register itself)
-    subcontext = Context(
-        context_type=context_type,
-        model=model,
-        initial_message=task
-    )
-
-    color_print(
-        '  ',
-        ('ansigreen', 'Created subcontext:'),
-        f' {subcontext.context_id} ({context_type}), budget: {budget}μ$',
-    )
-
-    # Run the subcontext autonomously
-    return subcontext.run(budget=budget)
 
 
 @tool
 def run_oneshot_per_file(
-    task: str,
+    system_prompt: str,
     include: Optional[Union[str, List[str]]] = "**",
     exclude: Optional[Union[str, List[str]]] = ".*",
     file_limit: int = 5,
-    model: str = "auto"
-) -> str:
+    model: str = "anthropic/claude-sonnet-4.5",
+    tool_name: str = "update_files"
+) -> Dict[str, Any]:
     """
-    Run a one-shot file_processor on each file matching include/exclude glob patterns.
+    Apply a task to multiple files individually using LLM calls.
 
-    Creates one file_processor instance per file. Each instance:
-    - Receives the file contents and task
-    - Has access to only update_files_and_complete tool
-    - Terminates after calling the tool (one-shot execution)
+    For each matching file, makes a single LLM call with:
+    - Your provided system prompt
+    - The file name and contents
+    - Access to one tool (default: update_files)
 
-    Useful for applying mechanical changes across multiple files, converting multiple files, or analyzing
-    multiple files individually, while keeping context sizes small.
+    Useful for applying mechanical changes across multiple files where each file
+    can be processed independently.
 
     Args:
-        task: Task description for the file_processor (applied to each file)
+        system_prompt: System prompt/instructions for processing each file
         include: Glob pattern(s) to include (default: "**" for all files)
         exclude: Glob pattern(s) to exclude (default: ".*" for hidden files)
         file_limit: Maximum files to process (default: 5, prevents accidental bulk operations)
-        model: Model to use ("auto" for default, or specific model like "qwen/qwen3-coder-30b-a3b-instruct")
+        model: Model to use (default: anthropic/claude-sonnet-4.5)
+        tool_name: Tool to make available (default: update_files)
 
     Returns:
-        An object keyed by path names with values being {completed: bool, result: str, cost: number} objects.
+        Dict keyed by file path with values being {success: bool, result: str, cost: int}
     """
     # Get list of files matching the patterns
     file_list_result = list_files(include=include, exclude=exclude, max_files=file_limit)
     files = file_list_result['files']
 
     if len(files) < file_list_result['total_count']:
-        return f"Error: Too many files match the pattern. Limit is {file_limit}. Please narrow the pattern or increase limit."
+        return {"error": f"Too many files match the pattern. Limit is {file_limit}. Please narrow the pattern or increase limit."}
 
     if not files:
-        return f"No files found matching patterns"
+        return {"error": "No files found matching patterns"}
+
+    # Get API key
+    api_key = os.environ.get('OPENROUTER_API_KEY')
+    if not api_key:
+        return {"error": "OPENROUTER_API_KEY not set"}
+
+    # Get tool schema for the allowed tool
+    tool_schemas = get_tool_schemas([tool_name], add_rationale=False)
 
     # Process each file
     results = {}
@@ -739,81 +674,102 @@ def run_oneshot_per_file(
         # Read file contents
         file_result = read_files([file_path])
         if file_result[0].get('error'):
-            error_msg = f"Error reading {file_path}: {file_result[0]['error']}"
-            results.append(error_msg)
+            results[file_path] = {
+                'success': False,
+                'result': f"Error reading file: {file_result[0]['error']}",
+                'cost': 0
+            }
             continue
 
         file_contents = file_result[0]['data']
 
-        # Create file_processor context (special type, doesn't auto-register)
-        initial_message = f"{task}\n\nFile: {file_path}\n\nContents:\n\n{file_contents}"
-        context = Context(context_type='_file_processor', model=model, initial_message=initial_message)
+        # Build messages
+        messages = [
+            {'role': 'system', 'content': system_prompt},
+            {'role': 'user', 'content': f"File: {file_path}\n\n{file_contents}"}
+        ]
 
-        # Run context (will execute once and complete)
-        run_result = context.run()
+        # Call LLM
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {api_key}',
+            'HTTP-Referer': 'https://github.com/vanviegen/maca',
+            'X-Title': 'MACA - Coding Assistant'
+        }
 
-        # Collect result
-        results[file_path] = run_result
+        data = {
+            'model': model,
+            'messages': messages,
+            'tools': tool_schemas,
+            'usage': {"include": True},
+            'tool_choice': 'required',
+        }
+
+        try:
+            req = urllib.request.Request(
+                "https://openrouter.ai/api/v1/chat/completions",
+                data=json.dumps(data).encode('utf-8'),
+                headers=headers
+            )
+            with urllib.request.urlopen(req) as response:
+                result = json.loads(response.read().decode('utf-8'))
+
+            # Extract response
+            choice = result['choices'][0]
+            message = choice['message']
+            usage = result.get('usage', {})
+            cost = int(usage.get('cost', 0) * 1_000_000)  # Convert to microdollars
+
+            # Extract and execute tool call
+            tool_calls = message.get('tool_calls', [])
+            if not tool_calls:
+                results[file_path] = {
+                    'success': False,
+                    'result': 'No tool call made by LLM',
+                    'cost': cost
+                }
+                continue
+
+            tool_call = tool_calls[0]
+            called_tool_name = tool_call['function']['name']
+            tool_args = json.loads(tool_call['function']['arguments'])
+
+            # Execute the tool
+            tool_result = execute_tool(called_tool_name, tool_args)
+
+            results[file_path] = {
+                'success': True,
+                'result': str(tool_result),
+                'cost': cost,
+                'tool_called': called_tool_name
+            }
+
+        except Exception as e:
+            results[file_path] = {
+                'success': False,
+                'result': f'Error: {str(e)}',
+                'cost': 0
+            }
 
     return results
 
 
-@tool
-def continue_subcontext(unique_name: str, guidance: str = "", budget: int = 20000) -> str:
-    """
-    Continue running an existing subcontext, optionally with additional guidance.
-
-    The subcontext will run autonomously until its budget is exhausted or it calls complete().
-    Only when the budget is exceeded will control return to you for verification.
-    All tool calls and rationales will still be logged to your context for monitoring.
-
-    Args:
-        unique_name: The unique identifier of the subcontext to continue
-        guidance: Optional additional guidance or feedback for the subcontext
-        budget: Maximum cost in microdollars (μ$) before returning control (default: 20000μ$ = $0.02)
-
-    Returns:
-        Confirmation message
-    """
-
-    if unique_name not in maca.subcontexts:
-        raise ValueError(f"Unknown subcontext: {unique_name}")
-
-    subcontext = maca.subcontexts[unique_name]
-
-    # Add guidance if provided
-    if guidance:
-        subcontext.add_message({"role": "user", "content": guidance})
-
-    color_print(
-        '  ',
-        ('ansigreen', 'Continuing subcontext:'),
-        f' {unique_name}, budget: {budget}μ$',
-    )
-
-    # Run the subcontext autonomously
-    return subcontext.run(budget=budget)
 
 
 @tool
-def main_complete(result: str, commit_msg: str | None) -> bool:
+def complete(result: str, commit_msg: str | None) -> bool:
     """
-    Signal that the ENTIRE user task is complete and you're ready to end the session.
-
-    This is different from subcontext complete() - this signals that ALL work is done,
-    including any multi-phase plans, and you're ready to return control to the user.
+    Signal that the user's task is complete and ready for review.
 
     Only call this when:
-    - All planned phases are complete
-    - All subtasks have been implemented and verified
-    - The user's original request has been fully satisfied
+    - All work is complete
+    - The user's request has been fully satisfied
     - No further work is needed
 
     Args:
         result: Answer to the user's question, or a short summary of what was accomplished
         commit_msg: Optional git commit message summarizing all the changes made (if any).
-           This should address only the final result, not intermediate steps. If no changes
-           were made, this should be `null`.
+           If no changes were made, this should be `null`.
     """
 
     color_print('\n', ('ansigreen', 'Task completed!'), f'\n{result}\n')
@@ -843,73 +799,16 @@ def main_complete(result: str, commit_msg: str | None) -> bool:
             color_print(('ansigreen', '✓ Merged and cleaned up'))
         else:
             color_print(('ansired', f'Merge failed: {message}'))
-            print("You may need to resolve conflicts manually or spawn a merge context.")
+            print("You may need to resolve conflicts manually.")
 
         return ReadyResult(result)
-    
+
     elif response == 'no':
         feedback = pt_prompt("What changes do you want?\n> ", multiline=True, history=maca.history)
-        maca.main_context.add_message({"role": "user", "content": feedback})
+        maca.context.add_message({"role": "user", "content": feedback})
         return 'User rejected result and provided feedback.'
     else:
         print("Keeping worktree for manual review.")
         return ReadyResult(result)
 
 
-@tool
-def update_files_and_complete(updates: List[Dict[str, str]], result: str) -> bool:
-    """
-    Update files and signal completion. This is the ONLY tool available to file_processor contexts.
-
-    This is a one-shot tool - the context terminates immediately after calling it.
-
-    Each update can either:
-        1. Write entire file: {"file_path": "path/to/file", "data": "new content"}
-        2. Search and replace: {"file_path": "path/to/file", "old_data": "search", "new_data": "replacement", "allow_multiple": true}
-
-    Note that for search and replace, old_data must match exactly (including whitespace and newlines). If it does not appear or appears
-    multiple times (and allow_multiple is false), an error is raised. "allow_multiple" default to false (so you can leave it out for
-    the common case of single replacement).
-
-    Args:
-        updates: List of file update specifications
-        result: Brief summary of what was done with this file (goes to Main context)
-    """
-    # First perform the updates
-    if updates:
-        for update in updates:
-            file_path = update['file_path']
-            full_path = Path(maca.worktree_path) / file_path
-
-            # Ensure parent directory exists
-            full_path.parent.mkdir(parents=True, exist_ok=True)
-
-            if 'data' in update:
-                # Full file write
-                full_path.write_text(update['data'])
-            elif 'old_data' in update and 'new_data' in update:
-                # Search and replace
-                if not full_path.exists():
-                    raise ValueError(f"Cannot search/replace in non-existent file: {file_path}")
-
-                content = full_path.read_text()
-                old_data = update['old_data']
-                new_data = update['new_data']
-                allow_multiple = update.get('allow_multiple', False)
-
-                count = content.count(old_data)
-                if count == 0:
-                    raise ValueError(f"Search string not found in {file_path}")
-                elif count > 1 and not allow_multiple:
-                    raise ValueError(f"Search string appears {count} times in {file_path}, but allow_multiple=false")
-
-                if allow_multiple:
-                    content = content.replace(old_data, new_data)
-                else:
-                    content = content.replace(old_data, new_data, 1)
-
-                full_path.write_text(content)
-            else:
-                raise ValueError(f"Invalid update specification: {update}")
-
-    return ReadyResult(result)
