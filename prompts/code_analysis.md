@@ -30,7 +30,7 @@ Do NOT include:
 
 ## Analysis Best Practices
 
-1. **Start Broad**: Use list_files initially without a regex filter to get an impression of the codebase
+1. **Start Broad**: Use list_files with default include/exclude to get an impression of the codebase
 2. **Batch Read**: Read ALL interesting files in ONE read_files call (it handles multiple files)
 3. **Search Strategically**: Use search to find specific implementations
 4. **Document Findings**: Create/update AGENTS.md with:

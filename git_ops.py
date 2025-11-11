@@ -120,7 +120,7 @@ def create_session_worktree(repo_root, session_id):
     """Create a new branch and worktree for the session."""
     branch_name = f'maca-{session_id}'
     session_dir = Path(repo_root) / '.maca' / str(session_id)
-    worktree_path = session_dir / '<tree>'
+    worktree_path = session_dir / 'worktree'
 
     # Ensure session directory exists
     session_dir.mkdir(parents=True, exist_ok=True)
@@ -128,8 +128,11 @@ def create_session_worktree(repo_root, session_id):
     # Get current branch to branch from
     current_branch = get_current_branch(cwd=repo_root)
 
+    # Clean up state worktrees and branches
+    run_git('worktree', 'prune', cwd=repo_root)
+
     # Create new branch
-    run_git('branch', branch_name, current_branch, cwd=repo_root)
+    run_git('branch', '-f', branch_name, current_branch, cwd=repo_root)
 
     # Create worktree
     run_git('worktree', 'add', str(worktree_path), branch_name, cwd=repo_root)

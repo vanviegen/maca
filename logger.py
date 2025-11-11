@@ -44,8 +44,6 @@ class Logger:
             context_id: Optional context identifier (main or subcontext name)
             **kwargs: Arbitrary key-value pairs to log
         """
-        context_id = context_id or 'main'
-
         # Increment global sequence number
         Logger.seq += 1
 

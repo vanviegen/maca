@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
 """Context classes for managing different types of LLM interactions."""
 
-from datetime import time
+import time
+from pathlib import Path
+from pathlib import Path
+from typing import Dict, Any, Optional
+import difflib
 import json
 import os
 import urllib.request
-import difflib
-from pathlib import Path
-from typing import Dict, List, Any, Optional
-from pathlib import Path
 
-from logger import Logger
-from maca import maca
-import tools
-from git_ops import get_head_commit, get_commits_between, get_changed_files_between
 
 class ContextError(Exception):
     """Context operation failed."""
@@ -57,15 +53,16 @@ class Context:
         self.agents_md_content = None
         self.last_head_commit = None
         self.default_model = 'openai/gpt-5-mini'
-        self.tool_names = []
+
         self.logger = Logger(maca.repo_root, maca.session_id, self.context_id)
-        self.tool_schemas = tools.get_tool_schemas(self.tool_names)
 
         if not self.api_key:
             raise ContextError("OPENROUTER_API_KEY not set")
 
         # Load system prompt and parse metadata
+        self.tool_names = []
         self._load_system_prompt()
+        self.tool_schemas = tools.get_tool_schemas(self.tool_names)
 
         # Set model (use provided or default from prompt)
         if model == "auto":
@@ -77,17 +74,17 @@ class Context:
         self._load_agents_md()
 
         # Add unique name info
-        self._messages.append({
+        self.add_message({
             'role': 'system',
             'content': f"Your unique context identifier is: **{self.context_id}**"
         })
 
         # Initialize HEAD tracking if we have a worktree
-        self.last_head_commit = get_head_commit(cwd=maca.worktree_path)
+        self.last_head_commit = git_ops.get_head_commit(cwd=maca.worktree_path)
 
         # Add initial message if provided
         if initial_message:
-            self.add_message('user', initial_message)
+            self.add_message({'role': 'user', 'content': initial_message})
 
     def _load_system_prompt(self):
         """Load the system prompt from markdown files and parse metadata."""
@@ -101,7 +98,7 @@ class Context:
             raise ContextError(f"Common prompt not found: {common_path}")
         common_prompt = common_path.read_text()
 
-        self._messages.append({
+        self.add_message({
             'role': 'system',
             'content': common_prompt
         })
@@ -139,21 +136,21 @@ class Context:
             else:
                 raise ContextError(f"Unknown header key in {prompt_path}: {key}")
         
-        self._messages.append({
+        self.add_message({
             'role': 'system',
             'content': system_prompt
         })
 
     def _load_agents_md(self):
         """Load AGENTS.md from the worktree if it exists."""
-        if not self.worktree_path:
+        if not maca.worktree_path:
             return
 
-        agents_path = self.worktree_path / 'AGENTS.md'
+        agents_path = maca.worktree_path / 'AGENTS.md'
         if agents_path.exists():
             content = agents_path.read_text()
             self.agents_md_content = content
-            self._messages.append({
+            self.add_message({
                 'role': 'system',
                 'content': f"# Project Context (AGENTS.md)\n\n{content}"
             })
@@ -190,7 +187,7 @@ class Context:
         self.agents_md_content = new_content
 
         # Append diff to keep caches active
-        self._messages.append({
+        self.add_message({
             'role': 'system',
             'content': f"# AGENTS.md Updated\n\nThe following changes were made to AGENTS.md:\n\n```diff\n{diff_text}\n```"
         })
@@ -202,15 +199,15 @@ class Context:
 
         If changed, add a system message with commit info and changed files.
         """
-        if not self.worktree_path or not self.last_head_commit:
+        if not maca.worktree_path or not self.last_head_commit:
             return
 
-        current_head = get_head_commit(cwd=self.worktree_path)
+        current_head = git_ops.get_head_commit(cwd=maca.worktree_path)
 
         if current_head != self.last_head_commit:
             # HEAD has changed, gather info
-            commits = get_commits_between(self.last_head_commit, current_head, cwd=self.worktree_path)
-            changed_files = get_changed_files_between(self.last_head_commit, current_head, cwd=self.worktree_path)
+            commits = git_ops.get_commits_between(self.last_head_commit, current_head, cwd=maca.worktree_path)
+            changed_files = git_ops.get_changed_files_between(self.last_head_commit, current_head, cwd=maca.worktree_path)
 
             if commits or changed_files:
                 # Build system message
@@ -226,7 +223,7 @@ class Context:
                     for filepath in changed_files:
                         message_parts.append(f"- {filepath}")
 
-                self._messages.append({
+                self.add_message({
                     'role': 'system',
                     'content': '\n'.join(message_parts)
                 })
@@ -241,8 +238,6 @@ class Context:
         Returns:
             Dict with 'message' and 'tool_calls' keys
         """
-        # Check for HEAD changes before calling LLM
-        self._check_head_changes()
 
         headers = {
             'Content-Type': 'application/json',
@@ -283,8 +278,8 @@ class Context:
         cost = int(usage.get('cost', 0) * 1_000_000)  # Convert dollars to microdollars
         self.cumulative_cost += cost
 
-        self.logger.log(type='llm_call', model=self.model, cost=cost, prompt_tokens=usage['prompt_tokens'], completion_tokens=usage['completion_tokens'], duration=time.time() - start_time)
-        self.logger.log(type='full_response', **result) # debugging only
+        self.logger.log(tag='llm_call', model=self.model, cost=cost, prompt_tokens=usage['prompt_tokens'], completion_tokens=usage['completion_tokens'], duration=time.time() - start_time)
+        self.logger.log(tag='full_response', **result) # debugging only
 
         # Add assistant message to history
         self.add_message(message)
@@ -296,12 +291,12 @@ class Context:
     
     def add_message(self, message: Dict):
         """Add a message dict to the context and the log."""
-        self.logger.log(type="message", **message)
+        self.logger.log(tag="message", **message)
         self._messages.append(message)
 
     def run(self, budget=None):
         """
-        Run this context until completion or budget .
+        Run this context until completion or budget exceeded.
 
         Args:
             budget: Maximum cost in microdollars before returning (None = unlimited)
@@ -312,11 +307,6 @@ class Context:
             - summary: str (summary of what happened)
             - cost: int (total cost in microdollars for this run)
         """
-        import time
-        import json
-        from utils import color_print
-        import git_ops
-
         total_cost = 0
         completed = False
         summary_parts = []
@@ -332,15 +322,19 @@ class Context:
             if self._diff_agents_md():
                 color_print(indent, ('ansicyan', 'AGENTS.md updated in context'))
 
+            # Check for HEAD changes before calling LLM
+            self._check_head_changes()
+
             # Call LLM
             for _ in range(3):  # Retry up to 3 times
                 try:
                     result = self.call_llm()
                     break
                 except Exception as err:
-                    self.logger.log(type='error', error=err)
+                    color_print(indent, ('ansired', f"Error during LLM call: {err}. Retrying..."))
+                    summary_parts.append(f"Error during LLM call: {err}")
+                    self.logger.log(tag='error', error=str(err))
             else:
-                summary_parts.append(f"Error during LLM call: {err}")
                 break
 
             # Extract tool calls
@@ -357,7 +351,7 @@ class Context:
             tool_args = json.loads(tool_call['function']['arguments'])
 
             # Log tool call
-            self.logger.log(type='tool_call', tool=tool_name, args=str(tool_args))
+            self.logger.log(tag='tool_call', tool=tool_name, args=str(tool_args))
 
             # Print tool info
             color_print(indent, ('ansigreen', '→'), ' Tool: ', ('ansiyellow', f"{tool_name}({tool_args})"))
@@ -379,7 +373,7 @@ class Context:
                 result = result.result
                 completed = True
 
-            self.logger.log(type='tool_call', tool=tool_name, args=tool_args, duration=tool_duration, result=result, completed=completed)
+            self.logger.log(tag='tool_call', tool=tool_name, args=tool_args, duration=tool_duration, result=result, completed=completed)
 
             self.add_message({
                 'type': 'function_call_output',
@@ -393,7 +387,7 @@ class Context:
                 # Commit changes
                 commit_msg = f'{tool_name}: {rationale}' if rationale else tool_name
                 git_ops.commit_changes(maca.worktree_path, commit_msg)
-                self.logger.log(type='commit', message=commit_msg, diff_stats=diff_stats)
+                self.logger.log(tag='commit', message=commit_msg, diff_stats=diff_stats)
                 color_print(indent, ('ansigreen', '✓ Committed changes'))
 
             # Build summary for this iteration
@@ -405,8 +399,8 @@ class Context:
 
             if completed:
                 color_print(indent, ('ansigreen', f'✓ Context {self.context_id} completed. Cost: {total_cost}μ$'))
-                self.logger.log(type='complete')
-                summary_parts.append(f"Task completed with result:\n{result}")
+                self.logger.log(tag='complete')
+                summary_parts.append(result)
                 break
 
             # Check budget (only for subcontexts)
@@ -421,3 +415,11 @@ class Context:
             'completed': True,
             'cost': total_cost
         }
+
+
+
+from logger import Logger
+from maca import maca
+from utils import color_print
+import tools
+import git_ops

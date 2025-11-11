@@ -10,4 +10,4 @@ fi
 # Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-"$VENV/bin/python" "$SCRIPT_DIR/maca.py" "$@"
+"$VENV/bin/python" "$SCRIPT_DIR/run.py" "$@"

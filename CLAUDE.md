@@ -106,7 +106,8 @@ MACA orchestrates specialized contexts that communicate through tool calls:
 
 **Tool Call Efficiency**
 - Batch operations: read multiple files in ONE call
-- Use regex with `|` to match multiple patterns
+- Use glob patterns with arrays to match multiple file types: `["**/*.py", "**/*.md"]`
+- Tools support include/exclude parameters for flexible file filtering
 - Subcontexts target 5-10 tool calls total
 - Keep communication brief and succinct (tokens are expensive)
 

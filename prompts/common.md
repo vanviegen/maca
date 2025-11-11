@@ -60,25 +60,28 @@ Each worktree has a `.scratch/` directory for temporary files:
 ### Efficiency First
 **Minimize tool calls** - batch operations whenever possible:
 - Read ALL relevant files in ONE `read_files` call
-- Use regex patterns with `|` to match multiple file types
+- Use glob pattern arrays to match multiple file types
 - Fix multiple issues in ONE `update_files` call
 - Default to reading 250 lines per file
 
 ### Examples of Efficient Tool Use
-```python
-# GOOD: Read multiple files at once
-read_files(["src/main.py", "src/utils.py", "tests/test_main.py"])
+```json
+// GOOD: Read multiple files at once
+{"name": "read_files", "arguments": {"file_paths": ["src/main.py", "src/utils.py", "tests/test_main.py"]}}
 
-# GOOD: Use regex with | for multiple types
-list_files("\\.(py|js|ts)$")
+// GOOD: Use glob pattern array for multiple types
+{"name": "list_files", "arguments": {"include": ["**/*.py", "**/*.js", "**/*.ts"]}}
 
-# BAD: Multiple separate reads
-read_files(["src/main.py"])
-read_files(["src/utils.py"])
+// GOOD: Single glob pattern
+{"name": "list_files", "arguments": {"include": "**/*.py"}}
 
-# BAD: Multiple list_files calls
-list_files("\\.py$")
-list_files("\\.js$")
+// BAD: Multiple separate read calls
+{"name": "read_files", "arguments": {"file_paths": ["src/main.py"]}}
+{"name": "read_files", "arguments": {"file_paths": ["src/utils.py"]}}
+
+// BAD: Multiple list_files calls for different types
+{"name": "list_files", "arguments": {"include": "**/*.py"}}
+{"name": "list_files", "arguments": {"include": "**/*.js"}}
 ```
 
 ## Communication Between Contexts

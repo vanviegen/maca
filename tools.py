@@ -4,13 +4,119 @@
 from dataclasses import dataclass
 import inspect
 import re
-import os
+import json
+import random
+from fnmatch import fnmatch
 from prompt_toolkit import prompt as pt_prompt
 from prompt_toolkit.shortcuts import radiolist_dialog
 from pathlib import Path
-from typing import get_type_hints, get_origin, get_args, Any, Dict, List, Union
+from typing import get_type_hints, get_origin, get_args, Any, Dict, List, Union, Optional
 
 from maca import maca
+from utils import color_print
+from docker_ops import run_in_container
+from context import Context
+import git_ops
+
+
+def check_path(path: str) -> str:
+    """
+    Validate that a path is within the current directory and doesn't escape via symlinks.
+
+    Args:
+        path: The path to check (relative or absolute)
+
+    Returns:
+        The original path if valid
+
+    Raises:
+        ValueError: If the path is outside the current directory or symlinks outside
+    """
+    # Convert the input path to absolute and resolve all symlinks
+    try:
+        resolved_path = Path(path).resolve()
+    except (OSError, RuntimeError) as e:
+        raise ValueError(f"Cannot resolve path '{path}': {e}")
+    
+    # Check if the resolved path is within the current directory
+    try:
+        resolved_path.relative_to(maca.worktree_path)
+    except ValueError:
+        raise ValueError(f"Path '{path}' (resolves to '{resolved_path}') is outside the worktree directory '{maca.worktree_path}'")
+
+    return resolved_path
+
+
+def get_matching_files(
+    include: Optional[Union[str, List[str]]] = "**",
+    exclude: Optional[Union[str, List[str]]] = ".*"
+) -> List[Path]:
+    """
+    Get list of files matching include/exclude glob patterns.
+
+    Args:
+        include: Glob pattern(s) to include. Can be None, a string, or list of strings.
+                 Defaults to "**" (all files).
+        exclude: Glob pattern(s) to exclude. Can be None, a string, or list of strings.
+                 Defaults to ".*" (hidden files/directories).
+
+    Returns:
+        List of Path objects for matching files (not directories)
+    """
+    worktree = Path(maca.worktree_path)
+
+    # Normalize include patterns
+    if include is None:
+        include_patterns = ["**"]
+    elif isinstance(include, str):
+        include_patterns = [include]
+    else:
+        include_patterns = include
+
+    # Normalize exclude patterns
+    if exclude is None:
+        exclude_patterns = []
+    elif isinstance(exclude, str):
+        exclude_patterns = [exclude]
+    else:
+        exclude_patterns = exclude
+
+    # Collect all matching files
+    matching_files = set()
+
+    for pattern in include_patterns:
+        for path in worktree.glob(pattern):
+            if path.is_file():
+                matching_files.add(path)
+
+    # Filter out excluded files
+    if exclude_patterns:
+        filtered_files = []
+        for file_path in matching_files:
+            rel_path_str = str(file_path.relative_to(worktree))
+
+            # Check if any exclude pattern matches
+            excluded = False
+            for exc_pattern in exclude_patterns:
+                # Check if pattern matches any part of the path
+                if fnmatch(rel_path_str, exc_pattern):
+                    excluded = True
+                    break
+                # Also check individual path components
+                for part in Path(rel_path_str).parts:
+                    if fnmatch(part, exc_pattern):
+                        excluded = True
+                        break
+                if excluded:
+                    break
+
+            if not excluded:
+                filtered_files.append(file_path)
+
+        return sorted(filtered_files)
+    else:
+        return sorted(matching_files)
+
 
 # Tool registry - single registry for all tools
 _TOOLS = {}
@@ -211,7 +317,7 @@ def read_files(file_paths: List[str], start_line: int = 1, max_lines: int = 250)
     """
     results = []
     for file_path in file_paths:
-        full_path = Path(maca.worktree_path) / file_path
+        full_path = check_path(file_path)
 
         if not full_path.exists():
             results.append({
@@ -251,23 +357,28 @@ def read_files(file_paths: List[str], start_line: int = 1, max_lines: int = 250)
 
 
 @tool
-def list_files(path_regex: str = ".*", max_files: int = 50) -> Dict[str, Any]:
+def list_files(
+    include: Union[str, List[str]] = "**",
+    exclude: Optional[Union[str, List[str]]] = ".*",
+    max_files: int = 50
+) -> Dict[str, Any]:
     """
-    List files in the worktree matching a regular expression pattern.
+    List files in the worktree matching include/exclude glob patterns.
 
     Returns a random sampling if more files match than max_files.
     Use this to get an impression of what files exist matching a pattern.
 
-    Use | to match multiple file types efficiently in one call.
-    Examples (as JSON strings):
-    - "\\.py$" - All Python files
-    - "\\.(py|js|ts)$" - Python, JavaScript, and TypeScript files
-    - "^src/.*\\.(py|md)$" - Python and Markdown files in src/
-    - "(test_.*\\.py|.*_test\\.py)$" - Python test files
-    - "^[^/\\\\]*$" - Files in top directory only (no subdirectories)
+    Examples:
+    - include="**/*.py" - All Python files
+    - include=["**/*.py", "**/*.md"] - Python and Markdown files
+    - include="src/**/*.py" - Python files in src/
+    - include="**/*test*.py" - Python test files
+    - include="*" - Files in top directory only (no subdirectories)
+    - exclude=[".*", "**/__pycache__/**"] - Exclude hidden files and pycache
 
     Args:
-        path_regex: Regular expression to match file paths (applied to full relative path)
+        include: Glob pattern(s) to include (default: "**" for all files)
+        exclude: Glob pattern(s) to exclude (default: ".*" for hidden files)
         max_files: Maximum number of files to return (default: 50)
 
     Returns:
@@ -276,49 +387,26 @@ def list_files(path_regex: str = ".*", max_files: int = 50) -> Dict[str, Any]:
         - path: relative path string
         - bytes: file size in bytes
         - lines: number of lines (for text files, omitted for binary/large files)
-        - type: "directory", "symlink", or "executable" (omitted for regular files)
-        - target: symlink target (only for symlinks)
-        - entries: number of entries in directory (only for directories)
+        - type: "executable" (omitted for regular files)
 
-        If total_count > max_files, 'files' contains random sampling.
+        If total_count > max_files, 'files' contains random sampling, which can be
+        helpful for getting an impression of a directory structure with many files.
     """
-    import random
-
     worktree = Path(maca.worktree_path)
-    matches = []
-    pattern = re.compile(path_regex)
 
-    def get_file_info(path: Path, rel_path_str: str) -> Dict[str, Any]:
-        """Get detailed info about a file/directory."""
+    def get_file_info(path: Path) -> Dict[str, Any]:
+        """Get detailed info about a file."""
+        rel_path_str = str(path.relative_to(worktree))
         info = {"path": rel_path_str}
 
         try:
-            stat = path.lstat()  # Use lstat to not follow symlinks
+            stat = path.lstat()
 
-            # Check if symlink
-            if path.is_symlink():
-                info["type"] = "symlink"
-                try:
-                    info["target"] = str(path.readlink())
-                except:
-                    info["target"] = "?"
-                return info
-
-            # Check if directory
-            if path.is_dir():
-                info["type"] = "directory"
-                try:
-                    entries = list(path.iterdir())
-                    info["entries"] = len(entries)
-                except:
-                    info["entries"] = 0
-                return info
-
-            # Regular file - get size
+            # Get file size
             info["bytes"] = stat.st_size
 
             # Check if executable
-            if stat.st_mode & 0o111:  # Check execute bits
+            if stat.st_mode & 0o111:
                 info["type"] = "executable"
 
             # Try to count lines for text files (skip large files)
@@ -335,28 +423,11 @@ def list_files(path_regex: str = ".*", max_files: int = 50) -> Dict[str, Any]:
 
         return info
 
-    # Walk the entire tree and collect ALL matches
-    for root, dirs, files in os.walk(worktree, followlinks=False):
-        # Skip .git, .scratch, and other hidden directories
-        dirs[:] = [d for d in dirs if not d.startswith('.')]
+    # Get matching files using helper
+    matching_files = get_matching_files(include=include, exclude=exclude)
 
-        # Match directories
-        for dir_name in dirs:
-            full_path = Path(root) / dir_name
-            rel_path = full_path.relative_to(worktree)
-            rel_path_str = str(rel_path)
-
-            if pattern.search(rel_path_str):
-                matches.append(get_file_info(full_path, rel_path_str))
-
-        # Match files
-        for file in files:
-            full_path = Path(root) / file
-            rel_path = full_path.relative_to(worktree)
-            rel_path_str = str(rel_path)
-
-            if pattern.search(rel_path_str):
-                matches.append(get_file_info(full_path, rel_path_str))
+    # Build file info for each match
+    matches = [get_file_info(path) for path in matching_files]
 
     total_count = len(matches)
 
@@ -386,8 +457,7 @@ def update_files(updates: List[Dict[str, str]]) -> None:
         updates: List of update specifications
     """
     for update in updates:
-        file_path = update['file_path']
-        full_path = Path(maca.worktree_path) / file_path
+        full_path = check_path(update['file_path'])
 
         # Ensure parent directory exists
         full_path.parent.mkdir(parents=True, exist_ok=True)
@@ -422,13 +492,21 @@ def update_files(updates: List[Dict[str, str]]) -> None:
 
 
 @tool
-def search(glob_pattern: str, regex: str, max_results: int = 10, lines_before: int = 2, lines_after: int = 2) -> List[Dict[str, Any]]:
+def search(
+    regex: str,
+    include: Optional[Union[str, List[str]]] = "**",
+    exclude: Optional[Union[str, List[str]]] = ".*",
+    max_results: int = 10,
+    lines_before: int = 2,
+    lines_after: int = 2
+) -> List[Dict[str, Any]]:
     """
-    Search for a regex pattern in files matching a glob pattern.
+    Search for a regex pattern in file contents, filtering files by glob patterns.
 
     Args:
-        glob_pattern: Glob pattern for files to search (e.g., "**/*.py")
-        regex: Regular expression to search for
+        regex: Regular expression to search for in file contents
+        include: Glob pattern(s) to include (default: "**" for all files)
+        exclude: Glob pattern(s) to exclude (default: ".*" for hidden files)
         max_results: Maximum number of matches to return
         lines_before: Number of context lines before each match
         lines_after: Number of context lines after each match
@@ -438,24 +516,26 @@ def search(glob_pattern: str, regex: str, max_results: int = 10, lines_before: i
     """
     worktree = Path(maca.worktree_path)
     results = []
-    pattern = re.compile(regex)
+    content_pattern = re.compile(regex)
 
-    for file_path in worktree.glob(glob_pattern):
-        if not file_path.is_file():
-            continue
+    # Get matching files using helper
+    matching_files = get_matching_files(include=include, exclude=exclude)
+
+    for file_path in matching_files:
+        rel_path_str = str(file_path.relative_to(worktree))
 
         try:
             with open(file_path, 'r') as f:
                 lines = f.readlines()
 
             for i, line in enumerate(lines):
-                if pattern.search(line):
+                if content_pattern.search(line):
                     start = max(0, i - lines_before)
                     end = min(len(lines), i + lines_after + 1)
                     context = ''.join(lines[start:end])
 
                     results.append({
-                        'file_path': str(file_path.relative_to(worktree)),
+                        'file_path': rel_path_str,
                         'line_number': i + 1,
                         'lines': context
                     })
@@ -484,7 +564,6 @@ def shell(command: str, docker_image: str = "debian:stable", docker_runs: List[s
     Returns:
         Dict with stdout, stderr, and exit_code
     """
-    from docker_ops import run_in_container
 
     if docker_runs is None:
         docker_runs = []
@@ -520,8 +599,15 @@ def subcontext_complete(result: str) -> bool:
     Args:
         result: Summary of what was accomplished (and optionally mention .scratch/ files with details)
     """
-    return ReadyResult(result)
+    return ReadyResult(f"Task completed with result:\n{result}")
 
+@tool
+def ask_main_question(question: str) -> bool:
+    """
+    In case you need clarification from the main context before completing your task,
+    you can use this tool to ask a question.
+    """
+    return ReadyResult(f"The subcontext has a question for the main context:\n{question}\n\nIf you want the subcontext to proceed, answer its question as guidance in a continue_subcontext call. If needed, you can get_user_input first.")
 
 @tool
 def get_user_input(prompt: str, preset_answers: List[str] = None) -> str:
@@ -582,15 +668,12 @@ def create_subcontext(context_type: str, task: str, model: str = "auto", budget:
     Returns:
         Confirmation message with the auto-generated name
     """
-    import context
-    from utils import color_print
-
     # Validate context type - reject special (underscore-prefixed) context types
     if context_type.startswith('_'):
         raise ValueError(f"Cannot create subcontext of type '{context_type}'. Types starting with '_' are reserved for special contexts.")
 
     # Create subcontext (it will auto-generate unique name and register itself)
-    subcontext = context.Context(
+    subcontext = Context(
         context_type=context_type,
         model=model,
         initial_message=task
@@ -607,9 +690,15 @@ def create_subcontext(context_type: str, task: str, model: str = "auto", budget:
 
 
 @tool
-def run_oneshot_per_file(path_regex: str, task: str, file_limit: int = 5, model: str = "auto") -> str:
+def run_oneshot_per_file(
+    task: str,
+    include: Optional[Union[str, List[str]]] = "**",
+    exclude: Optional[Union[str, List[str]]] = ".*",
+    file_limit: int = 5,
+    model: str = "auto"
+) -> str:
     """
-    Run a one-shot file_processor on each file matching path_regex.
+    Run a one-shot file_processor on each file matching include/exclude glob patterns.
 
     Creates one file_processor instance per file. Each instance:
     - Receives the file contents and task
@@ -620,47 +709,32 @@ def run_oneshot_per_file(path_regex: str, task: str, file_limit: int = 5, model:
     multiple files individually, while keeping context sizes small.
 
     Args:
-        path_regex: Regex pattern to match files (e.g., "\\.py$" for Python files)
         task: Task description for the file_processor (applied to each file)
+        include: Glob pattern(s) to include (default: "**" for all files)
+        exclude: Glob pattern(s) to exclude (default: ".*" for hidden files)
         file_limit: Maximum files to process (default: 5, prevents accidental bulk operations)
         model: Model to use ("auto" for default, or specific model like "qwen/qwen3-coder-30b-a3b-instruct")
 
     Returns:
-        Summary of processing all files
+        An object keyed by path names with values being {completed: bool, result: str, cost: number} objects.
     """
-    import context
-    from utils import color_print
-    from pathlib import Path
-
-    # Get list of files matching the regex
-    file_list_result = list_files(path_regex=path_regex, max_files=file_limit)
+    # Get list of files matching the patterns
+    file_list_result = list_files(include=include, exclude=exclude, max_files=file_limit)
     files = file_list_result['files']
 
-    # Filter to only actual files (not directories)
-    files = [f for f in files if f.get('type') != 'directory']
+    if len(files) < file_list_result['total_count']:
+        return f"Error: Too many files match the pattern. Limit is {file_limit}. Please narrow the pattern or increase limit."
 
     if not files:
-        return f"No files found matching pattern '{path_regex}'"
-
-    if len(files) > file_limit:
-        files = files[:file_limit]
-
-    color_print(
-        '  ',
-        ('ansigreen', f'Processing {len(files)} files with file_processor...'),
-    )
+        return f"No files found matching patterns"
 
     # Process each file
-    results = []
-    total_cost = 0
+    results = {}
 
     for i, file_info in enumerate(files, 1):
         file_path = file_info['path']
 
-        color_print(
-            '  ',
-            ('ansicyan', f'[{i}/{len(files)}] Processing: {file_path}'),
-        )
+        color_print('  ', ('ansicyan', f'[{i}/{len(files)}] Processing: {file_path}'))
 
         # Read file contents
         file_result = read_files([file_path])
@@ -671,38 +745,17 @@ def run_oneshot_per_file(path_regex: str, task: str, file_limit: int = 5, model:
 
         file_contents = file_result[0]['data']
 
-        # Create unique name for this file processor
-        unique_name = f"file_processor{i}"
-
         # Create file_processor context (special type, doesn't auto-register)
-        context = context.Context(
-            context_type='_file_processor',
-            model=model,
-        )
-        # Manually set the context_id since it's a special context
-        context.context_id = unique_name
-
-        # Add task and file contents
-        initial_message = f"{task}\n\nFile: {file_path}\n\nContents:\n{file_contents}"
-        context.add_message('user', initial_message)
+        initial_message = f"{task}\n\nFile: {file_path}\n\nContents:\n\n{file_contents}"
+        context = Context(context_type='_file_processor', model=model, initial_message=initial_message)
 
         # Run context (will execute once and complete)
-        run_result = context.run(budget=None)
-
-        total_cost += run_result['cost']
+        run_result = context.run()
 
         # Collect result
-        if run_result['completed']:
-            results.append(f"{file_path}: {run_result['tool_result']}")
-        else:
-            results.append(f"{file_path}: ERROR - {run_result['summary']}")
+        results[file_path] = run_result
 
-    # Build aggregate summary
-    summary = f"Processed {len(files)} files with file_processor.\n"
-    summary += f"Total cost: {total_cost}μ$\n\n"
-    summary += "Results:\n" + "\n".join(f"- {r}" for r in results)
-
-    return summary
+    return results
 
 
 @tool
@@ -722,7 +775,6 @@ def continue_subcontext(unique_name: str, guidance: str = "", budget: int = 2000
     Returns:
         Confirmation message
     """
-    from utils import color_print
 
     if unique_name not in maca.subcontexts:
         raise ValueError(f"Unknown subcontext: {unique_name}")
@@ -731,7 +783,7 @@ def continue_subcontext(unique_name: str, guidance: str = "", budget: int = 2000
 
     # Add guidance if provided
     if guidance:
-        subcontext.add_message('user', guidance)
+        subcontext.add_message({"role": "user", "content": guidance})
 
     color_print(
         '  ',
@@ -744,7 +796,7 @@ def continue_subcontext(unique_name: str, guidance: str = "", budget: int = 2000
 
 
 @tool
-def main_complete(result: str) -> bool:
+def main_complete(result: str, commit_msg: str | None) -> bool:
     """
     Signal that the ENTIRE user task is complete and you're ready to end the session.
 
@@ -758,9 +810,50 @@ def main_complete(result: str) -> bool:
     - No further work is needed
 
     Args:
-        result: Summary of everything that was accomplished in the entire session
+        result: Answer to the user's question, or a short summary of what was accomplished
+        commit_msg: Optional git commit message summarizing all the changes made (if any).
+           This should address only the final result, not intermediate steps. If no changes
+           were made, this should be `null`.
     """
-    return ReadyResult(result)
+
+    color_print('\n', ('ansigreen', 'Task completed!'), f'\n{result}\n')
+
+    print(result)
+
+    # Ask for approval
+    response = radiolist_dialog(
+        title='Task Complete',
+        text='Are you satisfied with the result?',
+        values=[
+            ('yes', 'Yes, merge into main'),
+            ('no', 'No, I want changes'),
+            ('cancel', 'Cancel (keep worktree for manual review)')
+        ]
+    ).run()
+
+    if response == 'yes':
+        color_print(('ansicyan', 'Merging changes...'))
+
+        # Merge
+        success, message = git_ops.merge_to_main(maca.repo_root, maca.worktree_path, maca.branch_name, commit_msg or result)
+
+        if success:
+            # Cleanup
+            git_ops.cleanup_session(maca.repo_root, maca.worktree_path, maca.branch_name)
+            color_print(('ansigreen', '✓ Merged and cleaned up'))
+        else:
+            color_print(('ansired', f'Merge failed: {message}'))
+            print("You may need to resolve conflicts manually or spawn a merge context.")
+
+        return ReadyResult(result)
+    
+    elif response == 'no':
+        feedback = pt_prompt("What changes do you want?\n> ", multiline=True, history=maca.history)
+        maca.main_context.add_message({"role": "user", "content": feedback})
+        return 'User rejected result and provided feedback.'
+    else:
+        print("Keeping worktree for manual review.")
+        return ReadyResult(result)
 
 
 @tool
