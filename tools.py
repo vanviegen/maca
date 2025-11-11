@@ -12,7 +12,6 @@ from prompt_toolkit.shortcuts import radiolist_dialog
 from pathlib import Path
 from typing import get_type_hints, get_origin, get_args, Any, Dict, List, Union, Optional
 
-from maca import maca
 from utils import color_print
 from docker_ops import run_in_container
 import git_ops
@@ -20,6 +19,12 @@ import json
 import time
 import urllib.request
 import os
+
+# Global context for tool execution - set by execute_tool
+_worktree_path = None
+_repo_root = None
+_history = None
+_maca = None
 
 
 def check_path(path: str) -> str:
@@ -40,12 +45,12 @@ def check_path(path: str) -> str:
         resolved_path = Path(path).resolve()
     except (OSError, RuntimeError) as e:
         raise ValueError(f"Cannot resolve path '{path}': {e}")
-    
+
     # Check if the resolved path is within the current directory
     try:
-        resolved_path.relative_to(maca.worktree_path)
+        resolved_path.relative_to(_worktree_path)
     except ValueError:
-        raise ValueError(f"Path '{path}' (resolves to '{resolved_path}') is outside the worktree directory '{maca.worktree_path}'")
+        raise ValueError(f"Path '{path}' (resolves to '{resolved_path}') is outside the worktree directory '{_worktree_path}'")
 
     return resolved_path
 
@@ -66,7 +71,7 @@ def get_matching_files(
     Returns:
         List of Path objects for matching files (not directories)
     """
-    worktree = Path(maca.worktree_path)
+    worktree = Path(_worktree_path)
 
     # Normalize include patterns
     if include is None:
@@ -282,8 +287,16 @@ def get_tool_schemas(tool_names: List[str], add_rationale: bool = True) -> List[
     return schemas
 
 
-def execute_tool(tool_name: str, arguments: Dict) -> Any:
+def execute_tool(tool_name: str, arguments: Dict, worktree_path, repo_root, history, maca) -> Any:
     """Execute a tool with the given arguments."""
+    global _worktree_path, _repo_root, _history, _maca
+
+    # Set global context for tools to use
+    _worktree_path = worktree_path
+    _repo_root = repo_root
+    _history = history
+    _maca = maca
+
     if tool_name not in _TOOLS:
         raise ValueError(f"Unknown tool: {tool_name}")
 
@@ -395,7 +408,7 @@ def list_files(
         If total_count > max_files, 'files' contains random sampling, which can be
         helpful for getting an impression of a directory structure with many files.
     """
-    worktree = Path(maca.worktree_path)
+    worktree = Path(_worktree_path)
 
     def get_file_info(path: Path) -> Dict[str, Any]:
         """Get detailed info about a file."""
@@ -517,7 +530,7 @@ def search(
     Returns:
         List of matches with file_path, line_number, and context lines
     """
-    worktree = Path(maca.worktree_path)
+    worktree = Path(_worktree_path)
     results = []
     content_pattern = re.compile(regex)
 
@@ -573,6 +586,8 @@ def shell(command: str, docker_image: str = "debian:stable", docker_runs: List[s
 
     return run_in_container(
         command=command,
+        worktree_path=_worktree_path,
+        repo_root=_repo_root,
         docker_image=docker_image,
         docker_runs=docker_runs,
         head=head,
@@ -605,11 +620,11 @@ def get_user_input(prompt: str, preset_answers: List[str] = None) -> str:
         ).run()
 
         if result == '__custom__':
-            return pt_prompt(f"{prompt}\n> ", history=maca.history)
+            return pt_prompt(f"{prompt}\n> ", history=_history)
         return result
     else:
         # Simple text input
-        return pt_prompt(f"{prompt}\n> ", history=maca.history)
+        return pt_prompt(f"{prompt}\n> ", history=_history)
 
 
 
@@ -791,11 +806,11 @@ def complete(result: str, commit_msg: str | None) -> bool:
         color_print(('ansicyan', 'Merging changes...'))
 
         # Merge
-        success, message = git_ops.merge_to_main(maca.repo_root, maca.worktree_path, maca.branch_name, commit_msg or result)
+        success, message = git_ops.merge_to_main(_repo_root, _worktree_path, _maca.branch_name, commit_msg or result)
 
         if success:
             # Cleanup
-            git_ops.cleanup_session(maca.repo_root, maca.worktree_path, maca.branch_name)
+            git_ops.cleanup_session(_repo_root, _worktree_path, _maca.branch_name)
             color_print(('ansigreen', '✓ Merged and cleaned up'))
         else:
             color_print(('ansired', f'Merge failed: {message}'))
@@ -804,8 +819,8 @@ def complete(result: str, commit_msg: str | None) -> bool:
         return ReadyResult(result)
 
     elif response == 'no':
-        feedback = pt_prompt("What changes do you want?\n> ", multiline=True, history=maca.history)
-        maca.context.add_message({"role": "user", "content": feedback})
+        feedback = pt_prompt("What changes do you want?\n> ", multiline=True, history=_history)
+        _maca.add_message({"role": "user", "content": feedback})
         return 'User rejected result and provided feedback.'
     else:
         print("Keeping worktree for manual review.")

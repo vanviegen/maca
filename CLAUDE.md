@@ -36,20 +36,22 @@ MACA provides a single AI agent that accomplishes coding tasks through tool call
 - On merge: squash commits, preserve original chain in `maca/<descriptive-name>` branch
 - `.scratch/` directory for temporary files (git-ignored, never committed)
 
+**MACA Class** (`maca.py`)
+- Single `MACA` class orchestrates all functionality
+- Loads system prompt from `prompt.md`
+- Prompt file has metadata headers (default_model, tools) separated by blank line
+- Default model is `openai/gpt-5-mini` unless overridden by prompt file or at instantiation
+- Tracks and reports git HEAD changes between invocations
+- OpenRouter API used for all LLM calls
+- Manages conversation state and tool execution loop
+
 **Tool System** (`tools.py`)
 - Reflection-based schema generation from Python functions
 - Single `_TOOLS` registry for all tools
 - `@tool` decorator registers tools (no arguments needed)
 - Tools listed in prompt.md header determine which tools are available
 - All file paths are relative to worktree
-
-**Context Management** (`context.py`)
-- Single `Context` class for the coding assistant
-- Loads system prompt from `prompt.md`
-- Prompt file has metadata headers (default_model, tools) separated by blank line
-- Default model is `openai/gpt-5-mini` unless overridden by prompt file or at instantiation
-- Tracks and reports git HEAD changes between invocations
-- OpenRouter API used for all LLM calls
+- Tools receive context (worktree path, repo root, history) via global variables set by execute_tool
 
 **Session Logging** (`logger.py`)
 - Human-readable logs in `.maca/<session_id>/main.log`
@@ -84,8 +86,7 @@ MACA provides a single AI agent that accomplishes coding tasks through tool call
 ### Important Files
 
 **Core Python Modules**
-- `maca.py` - Main orchestration loop and MACA class
-- `context.py` - Context class and LLM interaction
+- `maca.py` - Main MACA class with orchestration loop and LLM interaction
 - `tools.py` - Tool system with reflection-based schemas
 - `git_ops.py` - Git worktree and branch management
 - `logger.py` - Human-readable session logs
@@ -103,8 +104,8 @@ System prompt content here...
 ```
 
 **Entry Points**
-- `maca` - Shell wrapper that creates venv and runs `maca.py`
-- `maca.py` - Python entry point with argparse
+- `maca` - Shell wrapper that creates venv and runs `run.py`
+- `run.py` - Python entry point with argparse that instantiates MACA class
 
 ## Working with MACA
 
