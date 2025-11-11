@@ -4,27 +4,21 @@
 This module uses tree-sitter to parse source files and generate a hierarchical
 code map showing classes, functions, methods, and their relationships.
 
-Supported languages: Python, JavaScript, TypeScript, Go, Rust, Java, C, C++, Ruby
+Supported: 165+ languages via tree-sitter-language-pack
 """
 
 import sys
 from pathlib import Path
-from typing import Dict, List, Set, Optional, Tuple
+from typing import Dict, List, Set, Optional
 from dataclasses import dataclass, field
-from tree_sitter import Parser, Language, Node
 
-# Language imports - will be loaded dynamically
-LANGUAGE_MODULES = {
-    'python': 'tree_sitter_python',
-    'javascript': 'tree_sitter_javascript',
-    'typescript': 'tree_sitter_typescript',
-    'go': 'tree_sitter_go',
-    'rust': 'tree_sitter_rust',
-    'java': 'tree_sitter_java',
-    'c': 'tree_sitter_c',
-    'cpp': 'tree_sitter_cpp',
-    'ruby': 'tree_sitter_ruby',
-}
+try:
+    from tree_sitter_language_pack import get_parser
+    from tree_sitter import Node
+except ImportError:
+    print("Error: tree-sitter-language-pack not installed", file=sys.stderr)
+    print("Install with: pip install tree-sitter-language-pack", file=sys.stderr)
+    sys.exit(1)
 
 
 @dataclass
@@ -44,108 +38,159 @@ class Definition:
 class LanguageConfig:
     """Configuration for parsing a specific language."""
 
-    def __init__(self, name: str, extensions: List[str], node_types: Dict[str, List[str]]):
+    def __init__(self, name: str, extensions: List[str], node_types: Dict[str, List[str]], self_params: List[str] = None):
         """
         Initialize language configuration.
 
         Args:
-            name: Language name
+            name: Language name (as used by tree-sitter-language-pack)
             extensions: File extensions for this language
             node_types: Mapping of definition types to tree-sitter node types
+            self_params: Parameters to exclude (like 'self', 'this')
         """
         self.name = name
         self.extensions = extensions
         self.node_types = node_types
-        self.self_params = []  # Parameters to exclude (like 'self', 'this')
+        self.self_params = self_params or []
 
 
-# Language configurations
+# Comprehensive language configurations
 LANGUAGE_CONFIGS = {
+    # Common languages
     'python': LanguageConfig(
         name='python',
-        extensions=['.py'],
-        node_types={
-            'class': ['class_definition'],
-            'function': ['function_definition'],
-        }
+        extensions=['.py', '.pyw'],
+        node_types={'class': ['class_definition'], 'function': ['function_definition']},
+        self_params=['self', 'cls']
     ),
     'javascript': LanguageConfig(
         name='javascript',
-        extensions=['.js', '.jsx', '.mjs'],
-        node_types={
-            'class': ['class_declaration'],
-            'function': ['function_declaration', 'method_definition', 'arrow_function'],
-        }
+        extensions=['.js', '.jsx', '.mjs', '.cjs'],
+        node_types={'class': ['class_declaration'], 'function': ['function_declaration', 'method_definition', 'arrow_function']},
+        self_params=['this']
     ),
     'typescript': LanguageConfig(
         name='typescript',
         extensions=['.ts', '.tsx'],
-        node_types={
-            'class': ['class_declaration'],
-            'interface': ['interface_declaration'],
-            'function': ['function_declaration', 'method_definition', 'arrow_function'],
-        }
+        node_types={'class': ['class_declaration'], 'interface': ['interface_declaration'], 'function': ['function_declaration', 'method_definition', 'arrow_function']},
+        self_params=['this']
     ),
     'go': LanguageConfig(
         name='go',
         extensions=['.go'],
-        node_types={
-            'struct': ['type_declaration'],  # Go uses type declarations
-            'function': ['function_declaration', 'method_declaration'],
-        }
+        node_types={'struct': ['type_declaration'], 'function': ['function_declaration', 'method_declaration']},
     ),
     'rust': LanguageConfig(
         name='rust',
         extensions=['.rs'],
-        node_types={
-            'struct': ['struct_item'],
-            'enum': ['enum_item'],
-            'trait': ['trait_item'],
-            'function': ['function_item'],
-        }
+        node_types={'struct': ['struct_item'], 'enum': ['enum_item'], 'trait': ['trait_item'], 'function': ['function_item']},
     ),
     'java': LanguageConfig(
         name='java',
         extensions=['.java'],
-        node_types={
-            'class': ['class_declaration'],
-            'interface': ['interface_declaration'],
-            'function': ['method_declaration'],
-        }
+        node_types={'class': ['class_declaration'], 'interface': ['interface_declaration'], 'function': ['method_declaration']},
+        self_params=['this']
     ),
     'c': LanguageConfig(
         name='c',
         extensions=['.c', '.h'],
-        node_types={
-            'struct': ['struct_specifier'],
-            'function': ['function_definition'],
-        }
+        node_types={'struct': ['struct_specifier'], 'function': ['function_definition']},
     ),
     'cpp': LanguageConfig(
         name='cpp',
-        extensions=['.cpp', '.hpp', '.cc', '.hh', '.cxx', '.hxx'],
-        node_types={
-            'class': ['class_specifier'],
-            'struct': ['struct_specifier'],
-            'function': ['function_definition'],
-        }
+        extensions=['.cpp', '.hpp', '.cc', '.hh', '.cxx', '.hxx', '.c++', '.h++'],
+        node_types={'class': ['class_specifier'], 'struct': ['struct_specifier'], 'function': ['function_definition']},
+        self_params=['this']
     ),
     'ruby': LanguageConfig(
         name='ruby',
-        extensions=['.rb'],
-        node_types={
-            'class': ['class'],
-            'module': ['module'],
-            'function': ['method'],
-        }
+        extensions=['.rb', '.rake'],
+        node_types={'class': ['class'], 'module': ['module'], 'function': ['method']},
+        self_params=['self']
+    ),
+    'php': LanguageConfig(
+        name='php',
+        extensions=['.php'],
+        node_types={'class': ['class_declaration'], 'interface': ['interface_declaration'], 'function': ['function_definition', 'method_declaration']},
+        self_params=['this', '$this']
+    ),
+    'csharp': LanguageConfig(
+        name='c_sharp',
+        extensions=['.cs'],
+        node_types={'class': ['class_declaration'], 'interface': ['interface_declaration'], 'struct': ['struct_declaration'], 'function': ['method_declaration']},
+        self_params=['this']
+    ),
+    'swift': LanguageConfig(
+        name='swift',
+        extensions=['.swift'],
+        node_types={'class': ['class_declaration'], 'struct': ['struct_declaration'], 'protocol': ['protocol_declaration'], 'function': ['function_declaration']},
+        self_params=['self']
+    ),
+    'kotlin': LanguageConfig(
+        name='kotlin',
+        extensions=['.kt', '.kts'],
+        node_types={'class': ['class_declaration'], 'interface': ['interface_declaration'], 'function': ['function_declaration']},
+        self_params=['this']
+    ),
+    'scala': LanguageConfig(
+        name='scala',
+        extensions=['.scala'],
+        node_types={'class': ['class_definition'], 'trait': ['trait_definition'], 'function': ['function_definition']},
+        self_params=['this']
+    ),
+    'dart': LanguageConfig(
+        name='dart',
+        extensions=['.dart'],
+        node_types={'class': ['class_definition'], 'function': ['function_signature', 'method_signature']},
+        self_params=['this']
+    ),
+    'elixir': LanguageConfig(
+        name='elixir',
+        extensions=['.ex', '.exs'],
+        node_types={'module': ['defmodule'], 'function': ['def', 'defp']},
+    ),
+    'haskell': LanguageConfig(
+        name='haskell',
+        extensions=['.hs', '.lhs'],
+        node_types={'function': ['function_declaration', 'signature']},
+    ),
+    'lua': LanguageConfig(
+        name='lua',
+        extensions=['.lua'],
+        node_types={'function': ['function_declaration', 'function_definition']},
+        self_params=['self']
+    ),
+    'perl': LanguageConfig(
+        name='perl',
+        extensions=['.pl', '.pm'],
+        node_types={'function': ['subroutine_declaration_statement']},
+    ),
+    'r': LanguageConfig(
+        name='r',
+        extensions=['.r', '.R'],
+        node_types={'function': ['function_definition']},
+    ),
+    'julia': LanguageConfig(
+        name='julia',
+        extensions=['.jl'],
+        node_types={'function': ['function_definition']},
+    ),
+    'ocaml': LanguageConfig(
+        name='ocaml',
+        extensions=['.ml', '.mli'],
+        node_types={'module': ['module_definition'], 'function': ['value_definition']},
+    ),
+    'zig': LanguageConfig(
+        name='zig',
+        extensions=['.zig'],
+        node_types={'struct': ['struct_declaration'], 'function': ['function_declaration']},
+    ),
+    'bash': LanguageConfig(
+        name='bash',
+        extensions=['.sh', '.bash'],
+        node_types={'function': ['function_definition']},
     ),
 }
-
-# Set self parameters for languages
-LANGUAGE_CONFIGS['python'].self_params = ['self', 'cls']
-LANGUAGE_CONFIGS['javascript'].self_params = ['this']
-LANGUAGE_CONFIGS['typescript'].self_params = ['this']
-LANGUAGE_CONFIGS['ruby'].self_params = ['self']
 
 
 class CodeMapGenerator:
@@ -155,34 +200,17 @@ class CodeMapGenerator:
         """Initialize the generator."""
         self.definitions: Dict[str, Definition] = {}
         self.id_counter = 1
-        self.parsers: Dict[str, Parser] = {}
-        self.loaded_languages: Set[str] = set()
+        self.parsers: Dict[str, any] = {}
 
-    def _load_language(self, lang_name: str) -> Optional[Parser]:
+    def _load_language(self, lang_name: str) -> Optional[any]:
         """Load a tree-sitter language parser."""
         if lang_name in self.parsers:
             return self.parsers[lang_name]
 
-        if lang_name not in LANGUAGE_MODULES:
-            return None
-
         try:
-            module_name = LANGUAGE_MODULES[lang_name]
-            module = __import__(module_name)
-
-            # Special handling for TypeScript which has two languages
-            if lang_name == 'typescript':
-                language = Language(module.language_typescript())
-            else:
-                language = Language(module.language())
-
-            parser = Parser(language)
+            parser = get_parser(lang_name)
             self.parsers[lang_name] = parser
-            self.loaded_languages.add(lang_name)
             return parser
-        except ImportError:
-            print(f"Warning: {module_name} not installed, skipping {lang_name} files", file=sys.stderr)
-            return None
         except Exception as e:
             print(f"Warning: Failed to load {lang_name}: {e}", file=sys.stderr)
             return None
@@ -226,7 +254,7 @@ class CodeMapGenerator:
         # Find the parameters node
         params_node = None
         for child in node.children:
-            if child.type in ['parameters', 'parameter_list', 'formal_parameters']:
+            if child.type in ['parameters', 'parameter_list', 'formal_parameters', 'parameter_declarations']:
                 params_node = child
                 break
 
@@ -292,7 +320,7 @@ class CodeMapGenerator:
         is_container = False
         container_type = None
         for def_type, node_types in lang_config.node_types.items():
-            if def_type in ['class', 'struct', 'interface', 'enum', 'trait', 'module']:
+            if def_type in ['class', 'struct', 'interface', 'enum', 'trait', 'module', 'protocol']:
                 if node.type in node_types:
                     is_container = True
                     container_type = def_type
@@ -415,7 +443,7 @@ class CodeMapGenerator:
             # Skip hidden directories and common exclusions
             if any(part.startswith('.') for part in file_path.parts):
                 continue
-            if any(part in ['node_modules', '__pycache__', 'target', 'build', 'dist'] for part in file_path.parts):
+            if any(part in ['node_modules', '__pycache__', 'target', 'build', 'dist', 'vendor'] for part in file_path.parts):
                 continue
 
             lang_config = self._detect_language(file_path)
@@ -452,7 +480,7 @@ class CodeMapGenerator:
             definitions = by_file[file_path]
 
             # Separate containers (classes, structs, etc.) and top-level functions
-            containers = [d for d in definitions if d.type in ['class', 'struct', 'interface', 'enum', 'trait', 'module']]
+            containers = [d for d in definitions if d.type in ['class', 'struct', 'interface', 'enum', 'trait', 'module', 'protocol']]
             functions = [d for d in definitions if d.type == 'function']
 
             # Sort by line number
