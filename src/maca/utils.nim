@@ -1,6 +1,6 @@
 ## Utility functions for MACA
 
-import terminal, strutils
+import terminal
 
 type
   PrintPart* = object

@@ -1,2 +1,5 @@
 .aai
 __pycache__
+maca
+*.out
+nimcache/

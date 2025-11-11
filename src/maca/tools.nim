@@ -1,7 +1,7 @@
 ## Tool system with schema management and execution
 
-import std/[json, tables, os, strutils, sequtils, re, random, strformat]
-import git_ops, docker_ops
+import std/[json, tables, os, strutils, sequtils, re, random, strformat, algorithm]
+import docker_ops
 
 type
   ToolInfo = object
@@ -86,20 +86,23 @@ proc matchesGlob(path: string, pattern: string): bool =
   except:
     return false
 
-proc getMatchingFiles(worktreePath: string, include: seq[string], exclude: seq[string]): seq[string] =
+proc getMatchingFiles(worktreePath: string, includePatterns: seq[string], excludePatterns: seq[string]): seq[string] =
   ## Get list of files matching include/exclude glob patterns
   result = @[]
 
   # Walk directory and collect matching files
-  for file in walkDirRec(worktreePath, relative = true):
+  for file in walkDirRec(worktreePath):
+    # Convert to relative path
+    let relPath = file.relativePath(worktreePath)
+
     # Skip .maca and .scratch directories
-    if file.startsWith(".maca") or file.startsWith(".scratch"):
+    if relPath.startsWith(".maca") or relPath.startsWith(".scratch"):
       continue
 
     # Check include patterns
     var included = false
-    for pattern in include:
-      if matchesGlob(file, pattern):
+    for pattern in includePatterns:
+      if matchesGlob(relPath, pattern):
         included = true
         break
 
@@ -108,15 +111,14 @@ proc getMatchingFiles(worktreePath: string, include: seq[string], exclude: seq[s
 
     # Check exclude patterns
     var excluded = false
-    for pattern in exclude:
-      if matchesGlob(file, pattern):
+    for pattern in excludePatterns:
+      if matchesGlob(relPath, pattern):
         excluded = true
         break
 
     if not excluded:
-      let fullPath = worktreePath / file
-      if fileExists(fullPath):
-        result.add(file)
+      if fileExists(file):
+        result.add(relPath)
 
 # Tool implementations
 proc readFiles(args: JsonNode, ctx: ToolContext): JsonNode =
@@ -194,7 +196,8 @@ proc listFiles(args: JsonNode, ctx: ToolContext): JsonNode =
   # Random sample if too many files
   if matchingFiles.len > maxFiles:
     randomize()
-    matchingFiles = matchingFiles.sample(maxFiles)
+    shuffle(matchingFiles)
+    matchingFiles = matchingFiles[0 ..< maxFiles]
 
   # Build file info
   var filesInfo = newJArray()

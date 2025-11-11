@@ -1,7 +1,7 @@
 ## Multi-Agent Coding Assistant - Main entry point
 
-import std/[os, strutils, tables]
-import maca/[git_ops, context, tools, utils, logger]
+import std/[os, strutils, tables, json]
+import maca/[git_ops, context, tools, utils]
 
 type
   MACA* = ref object

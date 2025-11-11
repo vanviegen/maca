@@ -1,6 +1,6 @@
 ## Context classes for managing different types of LLM interactions
 
-import std/[json, httpclient, os, strutils, times, tables, strformat]
+import std/[json, httpclient, os, strutils, times, tables, strformat, sequtils]
 import logger, git_ops, utils
 import tools  # Import tools module
 

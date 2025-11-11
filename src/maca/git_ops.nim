@@ -14,7 +14,7 @@ proc runGit*(args: varargs[string], cwd = "", check = true): tuple[output: strin
   let cmd = "git " & args.join(" ")
   let workDir = if cwd == "": getCurrentDir() else: cwd
 
-  let (output, exitCode) = execCmdEx(cmd, workDir = workDir)
+  let (output, exitCode) = execCmdEx(cmd, workingDir = workDir)
 
   if check and exitCode != 0:
     raise newException(GitError, "Git command failed: " & cmd & "\n" & output)
@@ -23,34 +23,34 @@ proc runGit*(args: varargs[string], cwd = "", check = true): tuple[output: strin
 
 proc isGitRepo*(path = "."): bool =
   ## Check if the given path is inside a git repository
-  let (_, exitCode) = runGit("rev-parse", "--git-dir", cwd = path, check = false)
+  let (_, exitCode) = runGit(["rev-parse", "--git-dir"], cwd = path, check = false)
   return exitCode == 0
 
 proc initGitRepo*(path = ".") =
   ## Initialize a new git repository
-  discard runGit("init", cwd = path)
+  discard runGit(["init"], cwd = path)
 
   # Create an initial commit to have a main branch
   let readmePath = path / "README.md"
   if not fileExists(readmePath):
     writeFile(readmePath, "# Project\n\nInitialized by maca.\n")
 
-  discard runGit("add", "README.md", cwd = path)
-  discard runGit("commit", "-m", "\"Initial commit\"", cwd = path)
+  discard runGit(["add", "README.md"], cwd = path)
+  discard runGit(["commit", "-m", "\"Initial commit\""], cwd = path)
 
 proc getRepoRoot*(path = "."): string =
   ## Get the root directory of the git repository
-  let (output, _) = runGit("rev-parse", "--show-toplevel", cwd = path)
+  let (output, _) = runGit(["rev-parse", "--show-toplevel"], cwd = path)
   return output
 
 proc getCurrentBranch*(cwd = "."): string =
   ## Get the name of the current branch
-  let (output, _) = runGit("rev-parse", "--abbrev-ref", "HEAD", cwd = cwd)
+  let (output, _) = runGit(["rev-parse", "--abbrev-ref", "HEAD"], cwd = cwd)
   return output
 
 proc getHeadCommit*(cwd = "."): string =
   ## Get the current HEAD commit hash
-  let (output, _) = runGit("rev-parse", "HEAD", cwd = cwd)
+  let (output, _) = runGit(["rev-parse", "HEAD"], cwd = cwd)
   return output
 
 proc getCommitsBetween*(oldCommit, newCommit: string, cwd = "."): seq[CommitInfo] =
@@ -58,7 +58,7 @@ proc getCommitsBetween*(oldCommit, newCommit: string, cwd = "."): seq[CommitInfo
   ##
   ## Returns seq of CommitInfo with 'hash' and 'message' (first line only)
 
-  let (output, exitCode) = runGit("log", "--format=%H %s", oldCommit & ".." & newCommit, cwd = cwd, check = false)
+  let (output, exitCode) = runGit(["log", "--format=%H %s", oldCommit & ".." & newCommit], cwd = cwd, check = false)
 
   if exitCode != 0 or output == "":
     return @[]
@@ -76,7 +76,7 @@ proc getCommitsBetween*(oldCommit, newCommit: string, cwd = "."): seq[CommitInfo
 proc getChangedFilesBetween*(oldCommit, newCommit: string, cwd = "."): seq[string] =
   ## Get list of files changed between oldCommit and newCommit
 
-  let (output, exitCode) = runGit("diff", "--name-only", oldCommit, newCommit, cwd = cwd, check = false)
+  let (output, exitCode) = runGit(["diff", "--name-only", oldCommit, newCommit], cwd = cwd, check = false)
 
   if exitCode != 0 or output == "":
     return @[]
@@ -116,13 +116,13 @@ proc createSessionWorktree*(repoRoot: string, sessionId: int): tuple[worktreePat
   let currentBranch = getCurrentBranch(cwd = repoRoot)
 
   # Clean up stale worktrees and branches
-  discard runGit("worktree", "prune", cwd = repoRoot)
+  discard runGit(["worktree", "prune"], cwd = repoRoot)
 
   # Create new branch
-  discard runGit("branch", "-f", branchName, currentBranch, cwd = repoRoot)
+  discard runGit(["branch", "-f", branchName, currentBranch], cwd = repoRoot)
 
   # Create worktree
-  discard runGit("worktree", "add", worktreePath, branchName, cwd = repoRoot)
+  discard runGit(["worktree", "add", worktreePath, branchName], cwd = repoRoot)
 
   # Create .scratch directory for temporary analysis files
   let scratchDir = worktreePath / ".scratch"
@@ -134,21 +134,21 @@ proc commitChanges*(worktreePath: string, message: string): bool =
   ## Commit all changes in the worktree with the given message, excluding .scratch and .maca
 
   # Add all changes (including untracked files), but exclude .scratch and .maca
-  discard runGit("add", "-A", ":!.scratch", ":!.maca", cwd = worktreePath)
+  discard runGit(["add", "-A", ":!.scratch", ":!.maca"], cwd = worktreePath)
 
   # Check if there are changes to commit
-  let (_, exitCode) = runGit("diff", "--cached", "--quiet", cwd = worktreePath, check = false)
+  let (_, exitCode) = runGit(["diff", "--cached", "--quiet"], cwd = worktreePath, check = false)
   if exitCode == 0:
     # No changes to commit
     return false
 
   # Commit
-  discard runGit("commit", "-m", "\"" & message.replace("\"", "\\\"") & "\"", cwd = worktreePath)
+  discard runGit(["commit", "-m", "\"" & message.replace("\"", "\\\"") & "\""], cwd = worktreePath)
   return true
 
 proc getDiffStats*(worktreePath: string): string =
   ## Get the diff statistics for uncommitted changes
-  let (output, _) = runGit("diff", "--numstat", "HEAD", cwd = worktreePath, check = false)
+  let (output, _) = runGit(["diff", "--numstat", "HEAD"], cwd = worktreePath, check = false)
   return output
 
 proc generateDescriptiveBranchName*(commitMessage, repoRoot: string): string =
@@ -184,7 +184,7 @@ proc generateDescriptiveBranchName*(commitMessage, repoRoot: string): string =
   var counter = 2
   while true:
     let fullBranch = "maca/" & name
-    let (_, exitCode) = runGit("rev-parse", "--verify", fullBranch, cwd = repoRoot, check = false)
+    let (_, exitCode) = runGit(["rev-parse", "--verify", fullBranch], cwd = repoRoot, check = false)
     if exitCode != 0:
       # Branch doesn't exist, we can use it
       break
@@ -198,17 +198,14 @@ proc mergeToMain*(repoRoot, worktreePath, branchName, commitMessage: string): tu
   ## Merge the session branch into main using squash + rebase + ff strategy
   let mainBranch = getCurrentBranch(cwd = repoRoot)
 
-  # Save original branch
-  let originalBranch = getCurrentBranch(cwd = repoRoot)
-
   # Switch to the session branch in the main repo
-  discard runGit("checkout", branchName, cwd = repoRoot)
+  discard runGit(["checkout", branchName], cwd = repoRoot)
 
   # Save the current HEAD commit hash (before squashing)
-  let (originalHead, _) = runGit("rev-parse", "HEAD", cwd = repoRoot)
+  let (originalHead, _) = runGit(["rev-parse", "HEAD"], cwd = repoRoot)
 
   # Get the merge base
-  let (baseCommit, _) = runGit("merge-base", mainBranch, branchName, cwd = repoRoot)
+  let (baseCommit, _) = runGit(["merge-base", mainBranch, branchName], cwd = repoRoot)
 
   # Generate descriptive branch name for preserving history
   let descriptiveName = generateDescriptiveBranchName(commitMessage, repoRoot)
@@ -220,28 +217,28 @@ proc mergeToMain*(repoRoot, worktreePath, branchName, commitMessage: string): tu
   enhancedMessage &= "\nThe original chain of MACA commits is kept in the maca/" & descriptiveName & " branch."
 
   # Soft reset to base
-  discard runGit("reset", "--soft", baseCommit, cwd = repoRoot)
+  discard runGit(["reset", "--soft", baseCommit], cwd = repoRoot)
 
   # Commit everything as one commit with enhanced message
-  discard runGit("commit", "-m", "\"" & enhancedMessage.replace("\"", "\\\"") & "\"", cwd = repoRoot, check = false)
+  discard runGit(["commit", "-m", "\"" & enhancedMessage.replace("\"", "\\\"") & "\""], cwd = repoRoot, check = false)
 
   # Go back to main branch
-  discard runGit("checkout", mainBranch, cwd = repoRoot)
+  discard runGit(["checkout", mainBranch], cwd = repoRoot)
 
   # Try to rebase the session branch onto main
-  let (_, rebaseExitCode) = runGit("rebase", mainBranch, branchName, cwd = repoRoot, check = false)
+  let (_, rebaseExitCode) = runGit(["rebase", mainBranch, branchName], cwd = repoRoot, check = false)
 
   if rebaseExitCode != 0:
     # Rebase failed, likely due to conflicts
     # Abort the rebase
-    discard runGit("rebase", "--abort", cwd = repoRoot, check = false)
+    discard runGit(["rebase", "--abort"], cwd = repoRoot, check = false)
     return (false, "Merge conflicts detected")
 
   # Fast-forward merge
-  discard runGit("merge", "--ff-only", branchName, cwd = repoRoot)
+  discard runGit(["merge", "--ff-only", branchName], cwd = repoRoot)
 
   # Create the descriptive branch pointing at original HEAD
-  discard runGit("branch", "maca/" & descriptiveName, originalHead, cwd = repoRoot)
+  discard runGit(["branch", "maca/" & descriptiveName, originalHead], cwd = repoRoot)
 
   return (true, "Merged successfully")
 
@@ -249,7 +246,7 @@ proc cleanupSession*(repoRoot, worktreePath, branchName: string) =
   ## Clean up the worktree and branch after merge
 
   # Remove worktree
-  discard runGit("worktree", "remove", worktreePath, cwd = repoRoot, check = false)
+  discard runGit(["worktree", "remove", worktreePath], cwd = repoRoot, check = false)
 
   # Delete branch
-  discard runGit("branch", "-D", branchName, cwd = repoRoot, check = false)
+  discard runGit(["branch", "-D", branchName], cwd = repoRoot, check = false)
