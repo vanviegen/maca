@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from prompt_toolkit import prompt as pt_prompt
-from prompt_toolkit.shortcuts import radiolist_dialog
+from prompt_toolkit.shortcuts import choice
 from prompt_toolkit.history import FileHistory
 
 
@@ -31,14 +31,13 @@ class MACA:
         if not git_ops.is_git_repo(self.repo_path):
             color_print(('ansired', 'Not in a git repository.'))
 
-            response = radiolist_dialog(
-                title='Git Repository Required',
-                text='MACA requires a git repository. Initialize one now?',
-                values=[
+            response = choice(
+                message='MACA requires a git repository. Initialize one now?',
+                options=[
                     ('yes', 'Yes, initialize git repository'),
                     ('no', 'No, exit')
                 ]
-            ).run()
+            )
 
             if response != 'yes':
                 print("Exiting.")

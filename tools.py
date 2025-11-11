@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Tool system with reflection-based schema generation."""
 
 from dataclasses import dataclass
@@ -8,7 +7,7 @@ import json
 import random
 from fnmatch import fnmatch
 from prompt_toolkit import prompt as pt_prompt
-from prompt_toolkit.shortcuts import radiolist_dialog
+from prompt_toolkit.shortcuts import choice
 from pathlib import Path
 from typing import get_type_hints, get_origin, get_args, Any, Dict, List, Union, Optional
 
@@ -546,6 +545,8 @@ def update_files(updates: List[Dict[str, str]]) -> None:
             full_path.write_text(content)
         else:
             raise ValueError(f"Invalid update specification: {update}")
+        
+    return "OK"
 
 
 @tool
@@ -685,15 +686,14 @@ def get_user_input(prompt: str, preset_answers: List[str] = None) -> str:
         The user's input
     """
     if preset_answers:
-        # Show radio list dialog
+        # Show choice selection
         choices = [(answer, answer) for answer in preset_answers]
         choices.append(('__custom__', 'Other (custom input)'))
 
-        result = radiolist_dialog(
-            title='Input Required',
-            text=prompt,
-            values=choices
-        ).run()
+        result = choice(
+            message=prompt,
+            options=choices
+        )
 
         if result == '__custom__':
             return pt_prompt(f"{prompt}\n> ", history=maca.history)
@@ -885,9 +885,7 @@ def main_complete(result: str, commit_msg: str | None) -> bool:
            were made, this should be `null`.
     """
 
-    color_print('\n', ('ansigreen', 'Task completed!'), f'\n{result}\n')
-
-    print(result)
+    color_print('\n', ('ansigreen', 'Task completed!'), f'\n\n{result}\n')
 
     # Ask for approval
     response = radiolist_dialog(

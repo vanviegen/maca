@@ -63,21 +63,22 @@ class Context:
         self.tool_names = []
         self._load_system_prompt()
         self.tool_schemas = tools.get_tool_schemas(self.tool_names)
+        self.logger.log(tag='tools', **{tool['function']['name']: tool['function'] for tool in self.tool_schemas})
+
+        # Mark the messages up til this point (tools + system prompt) as cacheable (for Anthropic)
+        self._messages[-1]["cache_control"] = {"type": "ephemeral"}
 
         # Set model (use provided or default from prompt)
-        if model == "auto":
-            self.model = self.default_model
-        else:
-            self.model = model
-
-        # Load AGENTS.md if it exists
-        self._load_agents_md()
+        self.model = self.default_model if model == "auto" else model
 
         # Add unique name info
         self.add_message({
             'role': 'system',
             'content': f"Your unique context identifier is: `{self.context_id}`. The worktree path is: `{maca.worktree_path}`."
         })
+
+        # Load AGENTS.md if it exists
+        self._load_agents_md()
 
         # Initialize HEAD tracking if we have a worktree
         self.last_head_commit = git_ops.get_head_commit(cwd=maca.worktree_path)
@@ -151,12 +152,12 @@ class Context:
             content = agents_path.read_text()
             self.agents_md_content = content
             self.add_message({
-                'role': 'system',
+                'role': 'user',
                 'content': f"# Project Context (AGENTS.md)\n\n{content}"
             })
         else:
             self.add_message({
-                'role': 'system',
+                'role': 'user',
                 'content': f"This project has no AGENTS.md yet."
             })
 
@@ -197,7 +198,7 @@ class Context:
 
         # Append diff to keep caches active
         self.add_message({
-            'role': 'system',
+            'role': 'user',
             'content': f"# AGENTS.md Updated\n\nThe following changes were made to AGENTS.md:\n\n```diff\n{diff_text}\n```"
         })
         return True
@@ -255,6 +256,9 @@ class Context:
             'X-Title': 'MACA - Multi-Agent Coding Assistant'
         }
 
+        # Enable caching for Anthropic and similar models
+        self._message[-1]["cache_control"] = {"type": "ephemeral"}
+
         data = {
             'model': self.model,
             'messages': self._messages,
@@ -277,6 +281,9 @@ class Context:
                 error_body = e.read().decode('utf-8')
                 raise ContextError(f"LLM API error: {error_body}")
             raise ContextError(f"LLM API error: {str(e)}")
+        finally:
+            del self._message[-1]["cache_control"]
+
 
         # Extract response
         choice = result['choices'][0]
