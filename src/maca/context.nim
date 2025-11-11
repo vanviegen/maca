@@ -1,7 +1,8 @@
 ## Context classes for managing different types of LLM interactions
 
-import std/[json, httpclient, os, strutils, times, tables]
-import logger, git_ops, tools, utils
+import std/[json, httpclient, os, strutils, times, tables, strformat]
+import logger, git_ops, utils
+import tools  # Import tools module
 
 type
   ContextError* = object of CatchableError
@@ -95,6 +96,63 @@ proc loadAgentsMd(ctx: Context) =
       "content": "# Project Context (AGENTS.md)\n\n" & content
     })
 
+proc diffAgentsMd(ctx: Context) =
+  ## Check if AGENTS.md has been updated and append diff to context
+  if ctx.worktreePath == "":
+    return
+
+  let agentsPath = ctx.worktreePath / "AGENTS.md"
+  if not fileExists(agentsPath):
+    return
+
+  let newContent = readFile(agentsPath)
+
+  # Check if content has changed
+  if newContent == ctx.agentsMdContent:
+    return
+
+  # For simplicity, just add a system message about the update
+  # In a full implementation, you could compute an actual diff
+  ctx.agentsMdContent = newContent
+  ctx.messages.add(%*{
+    "role": "system",
+    "content": "# AGENTS.md Updated\n\nAGENTS.md has been updated with new content."
+  })
+
+proc checkHeadChanges(ctx: Context) =
+  ## Check if HEAD has changed since last invocation
+  if ctx.worktreePath == "" or ctx.lastHeadCommit == "":
+    return
+
+  let currentHead = getHeadCommit(cwd = ctx.worktreePath)
+
+  if currentHead != ctx.lastHeadCommit:
+    # HEAD has changed, gather info
+    let commits = getCommitsBetween(ctx.lastHeadCommit, currentHead, cwd = ctx.worktreePath)
+    let changedFiles = getChangedFilesBetween(ctx.lastHeadCommit, currentHead, cwd = ctx.worktreePath)
+
+    if commits.len > 0 or changedFiles.len > 0:
+      # Build system message
+      var messageParts = @["# Repository Updates\n\nThe following changes have been made since you were last invoked:\n"]
+
+      if commits.len > 0:
+        messageParts.add("\n## New Commits\n")
+        for commit in commits:
+          messageParts.add(&"- `{commit.hash}` {commit.message}")
+
+      if changedFiles.len > 0:
+        messageParts.add("\n\n## Changed Files\n")
+        for filepath in changedFiles:
+          messageParts.add(&"- {filepath}")
+
+      ctx.messages.add(%*{
+        "role": "system",
+        "content": messageParts.join("\n")
+      })
+
+    # Update tracking
+    ctx.lastHeadCommit = currentHead
+
 proc newContext*(
   contextType: string,
   repoRoot: string,
@@ -149,7 +207,7 @@ proc newContext*(
   result.loadSystemPrompt(promptsDir)
 
   # Get tool schemas
-  result.toolSchemas = getToolSchemas(result.toolNames, addRationale = true)
+  result.toolSchemas = getToolSchemas(result.toolNames, addRationale = (contextType != "_main"))
 
   # Set model
   if model == "auto":
@@ -260,8 +318,11 @@ proc run*(ctx: Context, budget = 0): tuple[summary: string, completed: bool, cos
   while not completed:
     colorPrintLn(cyan(indent & "Context '" & ctx.contextId & "' thinking..."))
 
-    # TODO: Check for AGENTS.md updates
-    # TODO: Check for HEAD changes
+    # Check for AGENTS.md updates
+    ctx.diffAgentsMd()
+
+    # Check for HEAD changes
+    ctx.checkHeadChanges()
 
     # Call LLM with retry logic
     var llmResult: tuple[message: JsonNode, cost: int]
@@ -295,18 +356,94 @@ proc run*(ctx: Context, budget = 0): tuple[summary: string, completed: bool, cos
     let toolName = toolCall["function"]["name"].getStr()
     let toolArgs = parseJson(toolCall["function"]["arguments"].getStr())
 
+    # Extract rationale if present
+    var rationale = ""
+    if toolArgs.hasKey("rationale"):
+      rationale = toolArgs["rationale"].getStr()
+
     # Log tool call
     ctx.logger.log([("tag", %"tool_call"), ("tool", %toolName), ("args", toolArgs)])
 
     # Print tool info
-    colorPrintLn(green(indent & "→"), plain(" Tool: "), yellow(toolName & "(" & $toolArgs & ")"))
+    colorPrint(green(indent & "→"), plain(" Tool: "), yellow(toolName))
+    if rationale != "":
+      colorPrintLn(plain(""))
+      colorPrintLn(plain(indent & "  Rationale: " & rationale))
+    else:
+      colorPrintLn(plain(""))
 
     # Execute tool
-    # TODO: Implement tool execution with proper error handling
-    # TODO: Check for ReadyResult
-    # TODO: Commit git changes if any
-    # TODO: Check budget
+    let startTime = epochTime()
+    var toolResult: JsonNode
+    var toolError = false
 
-    completed = true  # Placeholder
+    try:
+      # Create tool context
+      let toolCtx = ToolContext(
+        worktreePath: ctx.worktreePath,
+        repoRoot: ctx.repoRoot,
+        sessionId: ctx.sessionId
+      )
+
+      toolResult = executeTool(toolName, toolArgs, toolCtx)
+
+    except Exception as e:
+      toolError = true
+      toolResult = %*{"error": e.msg}
+      colorPrintLn(red(indent & "Tool error: " & e.msg))
+
+    let toolDuration = epochTime() - startTime
+
+    # Check if this is a ready result
+    var isReady = false
+    if toolResult.hasKey("ready") and toolResult["ready"].getBool():
+      isReady = true
+      completed = true
+
+    ctx.logger.log([
+      ("tag", %"tool_result"),
+      ("tool", %toolName),
+      ("duration", %toolDuration),
+      ("result", toolResult),
+      ("completed", %completed)
+    ])
+
+    # Add tool result to messages
+    ctx.messages.add(%*{
+      "role": "tool",
+      "tool_call_id": toolCall["id"],
+      "content": $toolResult
+    })
+
+    # Check for git changes and commit if needed
+    if not toolError and ctx.worktreePath != "":
+      let diffStats = getDiffStats(ctx.worktreePath)
+      if diffStats != "":
+        # Commit changes
+        let commitMsg = if rationale != "": &"{toolName}: {rationale}" else: toolName
+        discard commitChanges(ctx.worktreePath, commitMsg)
+        ctx.logger.log([("tag", %"commit"), ("message", %commitMsg), ("diff_stats", %diffStats)])
+        colorPrintLn(green(indent & "✓ Committed changes"))
+
+    # Build summary for this iteration
+    var abbrArgs = $toolArgs
+    if abbrArgs.len > 120:
+      abbrArgs = abbrArgs[0..79] & "..."
+    let iterationSummary = &"Called {toolName}({abbrArgs}) because: {rationale}"
+    summaryParts.add(iterationSummary)
+
+    if completed:
+      colorPrintLn(green(indent & &"✓ Context {ctx.contextId} completed. Cost: {totalCost}μ$"))
+      ctx.logger.log([("tag", %"complete")])
+      if toolResult.hasKey("message"):
+        summaryParts.add(toolResult["message"].getStr())
+      break
+
+    # Check budget (only for subcontexts)
+    if budget > 0 and totalCost > budget:
+      let budgetMsg = &"Context '{ctx.contextId}' budget exceeded (spent {totalCost}μ$ of {budget}μ$)"
+      colorPrintLn(yellow(indent & budgetMsg))
+      summaryParts.add(budgetMsg)
+      break
 
   result = (summaryParts.join("\n"), completed, totalCost)
