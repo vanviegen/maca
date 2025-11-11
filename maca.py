@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Multi-Agent Coding Assistant - Main entry point."""
 
+import json
 import sys
 from pathlib import Path
 from typing import Dict, Optional
@@ -81,15 +82,12 @@ class MACA:
 
         # Auto-call list_files for top-level directory to give context about project structure
         try:
-            top_files_result = tools.execute_tool('list_files', {'path_regex': r'^[^/\\]*$'})
+            top_files_result = tools.execute_tool('list_files', {})
             # Add as a system message so main context knows what files are in the top directory
-            top_files_msg = f"Top-level directory contains {top_files_result['total_count']} files"
-            if top_files_result['files']:
-                top_files_msg += f":\n" + "\n".join(f"- {f}" for f in top_files_result['files'])
+            top_files_msg = f"Result for list_files tool with default arguments: {json.dumps(top_files_result)}"
             self.main_context.add_message({'role': 'system', 'content': top_files_msg})
         except Exception as e:
-            # Don't fail if this doesn't work
-            pass
+            color_print(('ansired', f"Warning: Failed to list top-level files: {e}"))
 
         # Main loop
         while True:

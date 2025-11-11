@@ -154,6 +154,11 @@ class Context:
                 'role': 'system',
                 'content': f"# Project Context (AGENTS.md)\n\n{content}"
             })
+        else:
+            self.add_message({
+                'role': 'system',
+                'content': f"This project has no AGENTS.md yet."
+            })
 
     def _diff_agents_md(self):
         """
@@ -170,6 +175,10 @@ class Context:
         # Check if content has changed
         if new_content == self.agents_md_content:
             return False
+        
+        if not self.agents_md_content:
+            self._load_agents_md()
+            return True
         
         old_lines = self.agents_md_content.splitlines(keepends=True) if self.agents_md_content else []
         new_lines = new_content.splitlines(keepends=True)

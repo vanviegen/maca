@@ -434,14 +434,14 @@ def list_files(
         max_files: Maximum number of files to return (default: 50)
 
     Returns:
-        Dict with 'total_count' (int) and 'files' (list of file info objects).
+        Dict with 'files' (list of file info objects) and optional 'unlisted_files_count' if more files matched than max_files.
         Each file object contains:
         - path: relative path string
         - bytes: file size in bytes
         - lines: number of lines (for text files, omitted for binary/large files)
         - type: "executable" (omitted for regular files)
 
-        If total_count > max_files, 'files' contains random sampling, which can be
+        If 'unlisted_files_count' > 0, 'files' contains random sampling, which can be
         helpful for getting an impression of a directory structure with many files.
     """
     # Default exclude_files to ['.gitignore'] if not specified
@@ -493,10 +493,12 @@ def list_files(
     # Sort by path
     matches.sort(key=lambda x: x["path"])
 
-    return {
-        'total_count': total_count,
+    result = {
         'files': matches
     }
+    if total_count > max_files:
+        result['unlisted_files_count'] = total_count - max_files
+    return result
 
 
 @tool
@@ -789,7 +791,7 @@ def run_oneshot_per_file(
     file_list_result = list_files(include=include, exclude=exclude, exclude_files=exclude_files, max_files=file_limit)
     files = file_list_result['files']
 
-    if len(files) < file_list_result['total_count']:
+    if 'unlisted_files_count' in file_list_result:
         return f"Error: Too many files match the pattern. Limit is {file_limit}. Please narrow the pattern or increase limit."
 
     if not files:
