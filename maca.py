@@ -78,7 +78,7 @@ class MACA:
 
         # Auto-call list_files for top-level directory to give context about project structure
         try:
-            top_files_result = tools.execute_tool('list_files', {'include': '*'})
+            top_files_result, _ = tools.execute_tool('list_files', {'include': '*'})
             # Add as a system message so context knows what files are in the top directory
             top_files_msg = f"Top-level directory contains {top_files_result['total_count']} files"
             if top_files_result['files']:

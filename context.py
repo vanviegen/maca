@@ -253,23 +253,126 @@ class Context:
             # Execute tool
             tool_start = time.time()
             try:
-                tool_result = tools.execute_tool(tool_name, tool_args)
+                immediate_result, context_summary = tools.execute_tool(tool_name, tool_args)
                 tool_duration = time.time() - tool_start
             except Exception as err:
-                tool_result = {"error": str(err)}
+                immediate_result = {"error": str(err)}
+                context_summary = f"{tool_name}: error"
                 tool_duration = time.time() - tool_start
 
-            if isinstance(tool_result, tools.ReadyResult):
-                tool_result = tool_result.result
+            # Check if this is a completion signal
+            if isinstance(immediate_result, tools.ReadyResult):
+                immediate_result = immediate_result.result
                 completed = True
 
-            self.logger.log(tag='tool_result', tool=tool_name, duration=tool_duration, result=tool_result, completed=completed)
+            self.logger.log(tag='tool_result', tool=tool_name, duration=tool_duration, result=immediate_result, completed=completed)
 
-            self.add_message({
-                'type': 'function_call_output',
-                'call_id': tool_call['id'],
-                'output': tool_result if isinstance(tool_result, str) else json.dumps(tool_result)
-            })
+            # Convert immediate result to string for LLM
+            immediate_output = immediate_result if isinstance(immediate_result, str) else json.dumps(immediate_result)
+
+            # Check if output is long (>500 chars) - needs summarization
+            if not completed and len(immediate_output) > 500:
+                # Add ephemeral cache control marker before the long message
+                self.add_message({
+                    'role': 'user',
+                    'content': '',
+                    'cache_control': {'type': 'ephemeral'}
+                })
+
+                # Add the full immediate result (temporary, one-time view)
+                self.add_message({
+                    'type': 'function_call_output',
+                    'call_id': tool_call['id'],
+                    'output': immediate_output
+                })
+
+                color_print(('ansiyellow', f'→ Long output ({len(immediate_output)} chars), requesting summary...'))
+
+                # Make LLM call that REQUIRES summarize_and_update_files
+                summary_schemas = tools.get_tool_schemas(['summarize_and_update_files'], add_rationale=False)
+
+                headers = {
+                    'Content-Type': 'application/json',
+                    'Authorization': f'Bearer {self.api_key}',
+                    'HTTP-Referer': 'https://github.com/vanviegen/maca',
+                    'X-Title': 'MACA - Coding Assistant'
+                }
+
+                data = {
+                    'model': self.model,
+                    'messages': self._messages,
+                    'tools': summary_schemas,
+                    'usage': {"include": True},
+                    'tool_choice': {'type': 'function', 'function': {'name': 'summarize_and_update_files'}},
+                }
+
+                try:
+                    req = urllib.request.Request(
+                        "https://openrouter.ai/api/v1/chat/completions",
+                        data=json.dumps(data).encode('utf-8'),
+                        headers=headers
+                    )
+                    with urllib.request.urlopen(req) as response:
+                        summary_result = json.loads(response.read().decode('utf-8'))
+
+                    # Extract summary tool call
+                    choice = summary_result['choices'][0]
+                    summary_message = choice['message']
+                    usage = summary_result.get('usage', {})
+                    summary_cost = int(usage.get('cost', 0) * 1_000_000)
+                    self.cumulative_cost += summary_cost
+
+                    self.logger.log(tag='llm_call', model=self.model, cost=summary_cost,
+                                  prompt_tokens=usage['prompt_tokens'], completion_tokens=usage['completion_tokens'])
+
+                    # Add assistant message
+                    self.add_message(summary_message)
+
+                    # Execute the summarize_and_update_files tool
+                    summary_tool_calls = summary_message.get('tool_calls', [])
+                    if summary_tool_calls:
+                        summary_tool_call = summary_tool_calls[0]
+                        summary_tool_args = json.loads(summary_tool_call['function']['arguments'])
+
+                        # Execute summarize_and_update_files
+                        _, final_summary = tools.execute_tool('summarize_and_update_files', summary_tool_args)
+
+                        # Remove the last 3 messages (cache control, long output, summary assistant message)
+                        self._messages = self._messages[:-3]
+
+                        # Add the final summary to permanent context
+                        self.add_message({
+                            'type': 'function_call_output',
+                            'call_id': tool_call['id'],
+                            'output': final_summary
+                        })
+
+                        color_print(('ansigreen', f'✓ Summarized to: {final_summary}'))
+                    else:
+                        # Fallback if no tool call
+                        self._messages = self._messages[:-2]
+                        self.add_message({
+                            'type': 'function_call_output',
+                            'call_id': tool_call['id'],
+                            'output': context_summary
+                        })
+
+                except Exception as e:
+                    color_print(('ansired', f'Error during summarization: {e}'))
+                    # Fallback to context summary
+                    self._messages = self._messages[:-2]
+                    self.add_message({
+                        'type': 'function_call_output',
+                        'call_id': tool_call['id'],
+                        'output': context_summary
+                    })
+            else:
+                # Short output or completion - use context summary
+                self.add_message({
+                    'type': 'function_call_output',
+                    'call_id': tool_call['id'],
+                    'output': context_summary
+                })
 
             # Check for git changes and commit if needed
             diff_stats = git_ops.get_diff_stats(maca.worktree_path)

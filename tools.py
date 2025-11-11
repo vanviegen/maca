@@ -283,7 +283,14 @@ def get_tool_schemas(tool_names: List[str], add_rationale: bool = True) -> List[
 
 
 def execute_tool(tool_name: str, arguments: Dict) -> Any:
-    """Execute a tool with the given arguments."""
+    """
+    Execute a tool with the given arguments.
+
+    Returns:
+        Tuple of (immediate_result, context_summary) where:
+        - immediate_result: Full data for next LLM call
+        - context_summary: Brief summary for long-term context
+    """
     if tool_name not in _TOOLS:
         raise ValueError(f"Unknown tool: {tool_name}")
 
@@ -293,7 +300,14 @@ def execute_tool(tool_name: str, arguments: Dict) -> Any:
     # Remove rationale from arguments before calling (it's just for logging)
     exec_args = {k: v for k, v in arguments.items() if k != 'rationale'}
 
-    return func(**exec_args)
+    result = func(**exec_args)
+
+    # Tools should return tuples, but handle both cases for compatibility
+    if isinstance(result, tuple) and len(result) == 2:
+        return result
+    else:
+        # Legacy tool that doesn't return a tuple - return as-is with generic summary
+        return (result, f"{tool_name}: executed")
 
 @dataclass
 class ReadyResult:
@@ -304,7 +318,7 @@ class ReadyResult:
 # ==============================================================================
 
 @tool
-def read_files(file_paths: List[str], start_line: int = 1, max_lines: int = 250) -> List[Dict[str, Any]]:
+def read_files(file_paths: List[str], start_line: int = 1, max_lines: int = 250) -> tuple[List[Dict[str, Any]], str]:
     """
     Read one or more files, optionally with line range limits.
 
@@ -316,9 +330,12 @@ def read_files(file_paths: List[str], start_line: int = 1, max_lines: int = 250)
         max_lines: Maximum number of lines to read per file (default: 250)
 
     Returns:
-        List of dicts with file_path, data, and remaining_lines for each file
+        Immediate: List of dicts with file_path, data, and remaining_lines for each file
+        Long-term context: Brief summary (e.g., "read_files: foo.py (250 lines), bar.py (100 lines)")
     """
     results = []
+    summary_parts = []
+
     for file_path in file_paths:
         full_path = check_path(file_path)
 
@@ -329,6 +346,7 @@ def read_files(file_paths: List[str], start_line: int = 1, max_lines: int = 250)
                 'data': '',
                 'remaining_lines': 0
             })
+            summary_parts.append(f"{file_path} (not found)")
             continue
 
         try:
@@ -348,6 +366,9 @@ def read_files(file_paths: List[str], start_line: int = 1, max_lines: int = 250)
                 'remaining_lines': remaining,
                 'total_lines': total_lines
             })
+
+            lines_read = end_line - (start_line - 1)
+            summary_parts.append(f"{file_path} ({lines_read}/{total_lines} lines)")
         except Exception as e:
             results.append({
                 'file_path': file_path,
@@ -355,8 +376,10 @@ def read_files(file_paths: List[str], start_line: int = 1, max_lines: int = 250)
                 'data': '',
                 'remaining_lines': 0
             })
+            summary_parts.append(f"{file_path} (error)")
 
-    return results
+    summary = "read_files: " + ", ".join(summary_parts)
+    return (results, summary)
 
 
 @tool
@@ -364,7 +387,7 @@ def list_files(
     include: Union[str, List[str]] = "**",
     exclude: Optional[Union[str, List[str]]] = ".*",
     max_files: int = 50
-) -> Dict[str, Any]:
+) -> tuple[Dict[str, Any], str]:
     """
     List files in the worktree matching include/exclude glob patterns.
 
@@ -385,15 +408,8 @@ def list_files(
         max_files: Maximum number of files to return (default: 50)
 
     Returns:
-        Dict with 'total_count' (int) and 'files' (list of file info objects).
-        Each file object contains:
-        - path: relative path string
-        - bytes: file size in bytes
-        - lines: number of lines (for text files, omitted for binary/large files)
-        - type: "executable" (omitted for regular files)
-
-        If total_count > max_files, 'files' contains random sampling, which can be
-        helpful for getting an impression of a directory structure with many files.
+        Immediate: Dict with 'total_count' and 'files' list
+        Long-term context: Brief summary (e.g., "list_files: found 15 files")
     """
     worktree = Path(maca.worktree_path)
 
@@ -441,14 +457,23 @@ def list_files(
     # Sort by path
     matches.sort(key=lambda x: x["path"])
 
-    return {
+    result = {
         'total_count': total_count,
         'files': matches
     }
 
+    # Build summary
+    pattern_str = include if isinstance(include, str) else f"{len(include)} patterns"
+    if total_count > max_files:
+        summary = f"list_files: found {total_count} files (showing {max_files} random sample)"
+    else:
+        summary = f"list_files: found {total_count} files matching {pattern_str}"
+
+    return (result, summary)
+
 
 @tool
-def update_files(updates: List[Dict[str, str]]) -> None:
+def update_files(updates: List[Dict[str, str]]) -> tuple[None, str]:
     """
     Update one or more files with new content.
 
@@ -458,9 +483,20 @@ def update_files(updates: List[Dict[str, str]]) -> None:
 
     Args:
         updates: List of update specifications
+
+    Returns:
+        Immediate: None
+        Long-term context: Lists files modified/created (e.g., "update_files: modified foo.py; created bar.py")
     """
+    modified_files = []
+    created_files = []
+
     for update in updates:
-        full_path = check_path(update['file_path'])
+        file_path = update['file_path']
+        full_path = check_path(file_path)
+
+        # Track if file exists before update
+        existed_before = full_path.exists()
 
         # Ensure parent directory exists
         full_path.parent.mkdir(parents=True, exist_ok=True)
@@ -468,6 +504,10 @@ def update_files(updates: List[Dict[str, str]]) -> None:
         if 'data' in update:
             # Full file write
             full_path.write_text(update['data'])
+            if existed_before:
+                modified_files.append(file_path)
+            else:
+                created_files.append(file_path)
         elif 'old_data' in update and 'new_data' in update:
             # Search and replace
             if not full_path.exists():
@@ -490,8 +530,20 @@ def update_files(updates: List[Dict[str, str]]) -> None:
                 content = content.replace(old_data, new_data, 1)
 
             full_path.write_text(content)
+            modified_files.append(file_path)
         else:
             raise ValueError(f"Invalid update specification: {update}")
+
+    # Build summary
+    summary_parts = []
+    if modified_files:
+        summary_parts.append(f"modified {', '.join(modified_files)}")
+    if created_files:
+        summary_parts.append(f"created {', '.join(created_files)}")
+
+    summary = "update_files: " + "; ".join(summary_parts) if summary_parts else "update_files: no changes"
+
+    return (None, summary)
 
 
 @tool
@@ -502,7 +554,7 @@ def search(
     max_results: int = 10,
     lines_before: int = 2,
     lines_after: int = 2
-) -> List[Dict[str, Any]]:
+) -> tuple[List[Dict[str, Any]], str]:
     """
     Search for a regex pattern in file contents, filtering files by glob patterns.
 
@@ -515,11 +567,13 @@ def search(
         lines_after: Number of context lines after each match
 
     Returns:
-        List of matches with file_path, line_number, and context lines
+        Immediate: List of matches with file_path, line_number, and context lines
+        Long-term context: Brief summary (e.g., "search: found 5 matches in 3 files")
     """
     worktree = Path(maca.worktree_path)
     results = []
     content_pattern = re.compile(regex)
+    files_with_matches = set()
 
     # Get matching files using helper
     matching_files = get_matching_files(include=include, exclude=exclude)
@@ -542,18 +596,21 @@ def search(
                         'line_number': i + 1,
                         'lines': context
                     })
+                    files_with_matches.add(rel_path_str)
 
                     if len(results) >= max_results:
-                        return results
+                        summary = f"search: found {len(results)}+ matches in {len(files_with_matches)}+ files (limit reached)"
+                        return (results, summary)
         except Exception:
             # Skip files that can't be read
             continue
 
-    return results
+    summary = f"search: found {len(results)} matches in {len(files_with_matches)} files"
+    return (results, summary)
 
 
 @tool
-def shell(command: str, docker_image: str = "debian:stable", docker_runs: List[str] = None, head: int = 50, tail: int = 50) -> Dict[str, Any]:
+def shell(command: str, docker_image: str = "debian:stable", docker_runs: List[str] = None, head: int = 50, tail: int = 50) -> tuple[Dict[str, Any], str]:
     """
     Execute a shell command in a Docker container.
 
@@ -565,13 +622,14 @@ def shell(command: str, docker_image: str = "debian:stable", docker_runs: List[s
         tail: Number of lines to keep from end of output
 
     Returns:
-        Dict with stdout, stderr, and exit_code
+        Immediate: Dict with stdout, stderr, and exit_code
+        Long-term context: Command string (truncated to 128 chars)
     """
 
     if docker_runs is None:
         docker_runs = []
 
-    return run_in_container(
+    result = run_in_container(
         command=command,
         docker_image=docker_image,
         docker_runs=docker_runs,
@@ -579,10 +637,19 @@ def shell(command: str, docker_image: str = "debian:stable", docker_runs: List[s
         tail=tail
     )
 
+    # Truncate command for summary
+    cmd_summary = command[:128]
+    if len(command) > 128:
+        cmd_summary += "..."
+
+    summary = f"shell: {cmd_summary}"
+
+    return (result, summary)
+
 
 
 @tool
-def get_user_input(prompt: str, preset_answers: List[str] = None) -> str:
+def get_user_input(prompt: str, preset_answers: List[str] = None) -> tuple[str, str]:
     """
     Get input from the user interactively.
 
@@ -591,7 +658,8 @@ def get_user_input(prompt: str, preset_answers: List[str] = None) -> str:
         preset_answers: Optional list of preset answer choices
 
     Returns:
-        The user's input
+        Immediate: The user's input
+        Long-term context: "get_user_input: {answer}"
     """
     if preset_answers:
         # Show radio list dialog
@@ -605,11 +673,20 @@ def get_user_input(prompt: str, preset_answers: List[str] = None) -> str:
         ).run()
 
         if result == '__custom__':
-            return pt_prompt(f"{prompt}\n> ", history=maca.history)
-        return result
+            answer = pt_prompt(f"{prompt}\n> ", history=maca.history)
+        else:
+            answer = result
     else:
         # Simple text input
-        return pt_prompt(f"{prompt}\n> ", history=maca.history)
+        answer = pt_prompt(f"{prompt}\n> ", history=maca.history)
+
+    # Build summary - truncate long answers
+    answer_summary = answer[:100]
+    if len(answer) > 100:
+        answer_summary += "..."
+    summary = f"get_user_input: {answer_summary}"
+
+    return (answer, summary)
 
 
 
@@ -643,22 +720,26 @@ def run_oneshot_per_file(
         tool_name: Tool to make available (default: update_files)
 
     Returns:
-        Dict keyed by file path with values being {success: bool, result: str, cost: int}
+        Immediate: Dict keyed by file path with values being {success: bool, result: str, cost: int}
+        Long-term context: Summary of files processed (e.g., "run_oneshot_per_file: processed 5 files")
     """
     # Get list of files matching the patterns
-    file_list_result = list_files(include=include, exclude=exclude, max_files=file_limit)
+    file_list_result, _ = list_files(include=include, exclude=exclude, max_files=file_limit)
     files = file_list_result['files']
 
+    error_result = None
     if len(files) < file_list_result['total_count']:
-        return {"error": f"Too many files match the pattern. Limit is {file_limit}. Please narrow the pattern or increase limit."}
-
-    if not files:
-        return {"error": "No files found matching patterns"}
+        error_result = {"error": f"Too many files match the pattern. Limit is {file_limit}. Please narrow the pattern or increase limit."}
+    elif not files:
+        error_result = {"error": "No files found matching patterns"}
 
     # Get API key
     api_key = os.environ.get('OPENROUTER_API_KEY')
     if not api_key:
-        return {"error": "OPENROUTER_API_KEY not set"}
+        error_result = {"error": "OPENROUTER_API_KEY not set"}
+
+    if error_result:
+        return (error_result, f"run_oneshot_per_file: error")
 
     # Get tool schema for the allowed tool
     tool_schemas = get_tool_schemas([tool_name], add_rationale=False)
@@ -672,7 +753,7 @@ def run_oneshot_per_file(
         color_print('  ', ('ansicyan', f'[{i}/{len(files)}] Processing: {file_path}'))
 
         # Read file contents
-        file_result = read_files([file_path])
+        file_result, _ = read_files([file_path])
         if file_result[0].get('error'):
             results[file_path] = {
                 'success': False,
@@ -735,7 +816,7 @@ def run_oneshot_per_file(
             tool_args = json.loads(tool_call['function']['arguments'])
 
             # Execute the tool
-            tool_result = execute_tool(called_tool_name, tool_args)
+            tool_result, _ = execute_tool(called_tool_name, tool_args)
 
             results[file_path] = {
                 'success': True,
@@ -751,9 +832,42 @@ def run_oneshot_per_file(
                 'cost': 0
             }
 
-    return results
+    # Build summary
+    success_count = sum(1 for r in results.values() if r['success'])
+    total_count = len(results)
+    summary = f"run_oneshot_per_file: processed {total_count} files ({success_count} successful)"
+
+    return (results, summary)
 
 
+
+
+@tool
+def summarize_and_update_files(summary: str, updates: List[Dict[str, str]] = None) -> tuple[None, str]:
+    """
+    Summarize the information just received and optionally update files.
+
+    **CRITICAL**: This tool is called immediately after receiving long data (>500 chars) from other tools.
+    You MUST use this opportunity to:
+    - Make ALL file modifications needed based on the data you just received
+    - Write analysis/detailed output to .scratch/ files if needed for later reference
+    - Provide a focused summary of what's needed to continue the conversation
+
+    The summary should focus on what's relevant for continuing the task, not a general overview.
+
+    Args:
+        summary: Concise summary of the data received and actions taken (what's needed to continue)
+        updates: Optional list of file update specifications (same format as update_files)
+
+    Returns:
+        Immediate: None
+        Long-term context: The summary you provided
+    """
+    # Perform file updates if provided
+    if updates:
+        update_files(updates)
+
+    return (None, f"summarize_and_update_files: {summary}")
 
 
 @tool
