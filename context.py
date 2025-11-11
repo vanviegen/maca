@@ -76,7 +76,7 @@ class Context:
         # Add unique name info
         self.add_message({
             'role': 'system',
-            'content': f"Your unique context identifier is: **{self.context_id}**"
+            'content': f"Your unique context identifier is: `{self.context_id}`. The worktree path is: `{maca.worktree_path}`."
         })
 
         # Initialize HEAD tracking if we have a worktree
@@ -287,8 +287,9 @@ class Context:
         cost = int(usage.get('cost', 0) * 1_000_000)  # Convert dollars to microdollars
         self.cumulative_cost += cost
 
-        self.logger.log(tag='llm_call', model=self.model, cost=cost, prompt_tokens=usage['prompt_tokens'], completion_tokens=usage['completion_tokens'], duration=time.time() - start_time)
-        self.logger.log(tag='full_response', **result) # debugging only
+        duration = int((time.time() - start_time) * 1000)  # in ms
+        self.logger.log(tag='llm_call', model=self.model, cost=cost, prompt_tokens=usage['prompt_tokens'], completion_tokens=usage['completion_tokens'], duration=duration)
+        # self.logger.log(tag='full_response', **result) # debugging only
 
         # Add assistant message to history
         self.add_message(message)
@@ -317,13 +318,13 @@ class Context:
             - cost: int (total cost in microdollars for this run)
         """
         total_cost = 0
-        completed = False
+        run_complete = False
         summary_parts = []
         is_subcontext = (self.context_type != '_main')
         indent = '  ' if is_subcontext else ''
 
         # Loop until completion or budget exceeded
-        while not completed:
+        while not run_complete:
             # Print thinking message
             color_print(('ansicyan', f"{indent}Context '{self.context_id}' thinking..."))
 
@@ -371,15 +372,16 @@ class Context:
             tool_start = time.time()
             try:
                 result = tools.execute_tool(tool_name, tool_args)
-                tool_duration = time.time() - tool_start
             except Exception as err:
                 result = {"error": str(err)}
+            finally:
+                tool_duration = int((time.time() - tool_start) * 1000)  # in ms
 
             if isinstance(result, tools.ReadyResult):
                 result = result.result
-                completed = True
+                run_complete = True
 
-            self.logger.log(tag='tool_call', tool=tool_name, args=tool_args, duration=tool_duration, result=result, completed=completed)
+            self.logger.log(tag='tool_call', tool=tool_name, args=tool_args, duration=tool_duration, run_complete=run_complete) # result=result
 
             self.add_message({
                 'role': 'tool',
@@ -403,7 +405,7 @@ class Context:
             iteration_summary = f"Called {tool_name}({abbr_args}) because: {rationale}"
             summary_parts.append(iteration_summary)
 
-            if completed:
+            if run_complete:
                 color_print(indent, ('ansigreen', f'✓ Context {self.context_id} completed. Cost: {total_cost}μ$'))
                 self.logger.log(tag='complete')
                 summary_parts.append(result)

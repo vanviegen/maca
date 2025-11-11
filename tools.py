@@ -615,7 +615,7 @@ def search(
 @tool
 def shell(command: str, docker_image: str = "debian:stable", docker_runs: List[str] = None, head: int = 50, tail: int = 50) -> Dict[str, Any]:
     """
-    Execute a shell command in a Docker container.
+    Execute a shell command in a Docker container. The cwd will be the worktree path.
 
     Args:
         command: Shell command to execute
@@ -704,7 +704,7 @@ def get_user_input(prompt: str, preset_answers: List[str] = None) -> str:
 
 
 @tool
-def create_subcontext(context_type: str, task: str, model: str = "auto", budget: int = 20000) -> str:
+def create_subcontext(context_type: str, task: str, model: str = "auto", budget: int = 100000) -> str:
     """
     Create a new subcontext to work on a specific task.
     The subcontext will be automatically named (e.g., research1, implementation2, etc.)
@@ -726,7 +726,7 @@ def create_subcontext(context_type: str, task: str, model: str = "auto", budget:
         context_type: Type of context (code_analysis, research, implementation, review, merge)
         task: Description of the task for this subcontext
         model: Model to use ("auto" for default, or specific model name like "qwen/qwen3-coder-30b-a3b-instruct")
-        budget: Maximum cost in microdollars (μ$) before returning control (default: 20000μ$ = $0.02)
+        budget: Maximum cost in microdollars (μ$) before returning control (default: 100000μ$ = $0.10)
 
     Returns:
         Confirmation message with the auto-generated name
