@@ -40,16 +40,20 @@ MACA provides a single AI agent that accomplishes coding tasks through tool call
 - Reflection-based schema generation from Python functions
 - Single `_TOOLS` registry for all tools
 - `@tool` decorator registers tools (no arguments needed)
-- Tools listed in prompt.md header determine which tools are available
+- All tools are always available to the context
+- Tools return tuples: (immediate_result, context_summary)
 - All file paths are relative to worktree
 
 **Context Management** (`context.py`)
 - Single `Context` class for the coding assistant
-- Loads system prompt from `prompt.md`
-- Prompt file has metadata headers (default_model, tools) separated by blank line
-- Default model is `openai/gpt-5-mini` unless overridden by prompt file or at instantiation
+- Loads system prompt from `prompt.md` (plain markdown, no headers)
+- Model specified via -m command line argument (default: anthropic/claude-sonnet-4.5)
 - Tracks and reports git HEAD changes between invocations
 - OpenRouter API used for all LLM calls
+- Automatic context size management:
+  - When tool output >500 chars: shown once with ephemeral cache, then replaced with summary
+  - Uses Anthropic ephemeral cache control markers
+  - `process_tool_call_from_message()` method handles tool execution and result processing
 
 **Session Logging** (`logger.py`)
 - Human-readable logs in `.maca/<session_id>/main.log`
@@ -75,11 +79,17 @@ MACA provides a single AI agent that accomplishes coding tasks through tool call
 - Tools support include/exclude parameters for flexible file filtering
 - Minimize tool calls for efficiency
 
-**run_oneshot_per_file**
-- Apply a task to multiple files individually using LLM calls
-- Each file gets a separate LLM call with custom system prompt
-- Useful for mechanical changes across multiple files
-- Each LLM call has access to one tool (typically `update_files`)
+**process_files**
+- Primary tool for reading and processing files
+- Two modes:
+  - **single_batch=True** (default): Load all files at once, return contents to main loop
+  - **single_batch=False**: Process each file individually with separate LLM calls
+- Useful for both coordinated changes (batch) and mechanical changes (per-file)
+- In per-file mode, each LLM call has access to all tools
+
+**update_files**
+- Supports optional `summary` parameter for custom context summaries
+- When provided, summary is stored in long-term context instead of full tool output
 
 ### Important Files
 
@@ -92,15 +102,7 @@ MACA provides a single AI agent that accomplishes coding tasks through tool call
 - `docker_ops.py` - Container execution for shell commands
 
 **System Prompt**
-- `prompt.md` - System prompt with metadata headers
-
-The prompt file starts with metadata headers:
-```markdown
-default_model: anthropic/claude-sonnet-4.5
-tools: get_user_input, complete, read_files, list_files, update_files, search, shell, run_oneshot_per_file
-
-System prompt content here...
-```
+- `prompt.md` - Plain markdown system prompt (no headers)
 
 **Entry Points**
 - `maca` - Shell wrapper that creates venv and runs `maca.py`
@@ -132,14 +134,14 @@ System prompt content here...
 1. Define function in `tools.py` with proper type hints
 2. Add comprehensive docstring (generates schema description)
 3. Decorate with `@tool` (no arguments)
-4. Schema auto-generated via reflection
-5. Add tool name to `tools:` header in `prompt.md`
+4. Return tuple: (immediate_result, context_summary)
+5. Schema auto-generated via reflection
+6. Tool is automatically available to all contexts
 
 ### Modifying the Prompt
-- `prompt.md` must start with metadata headers (`default_model:`, `tools:`) followed by blank line
+- `prompt.md` is plain markdown (no headers)
 - Changes to `prompt.md` affect new sessions
 - Keep prompts focused and actionable
-- When changing tools available, update the `tools:` header
 
 ### Git Operations
 - Always use functions from `git_ops.py`

@@ -74,7 +74,7 @@ class MACA:
         self.create_session()
 
         # Initialize context
-        self.context = context.Context(model=model or 'auto')
+        self.context = context.Context(model=model or 'anthropic/claude-sonnet-4.5')
 
         # Auto-call list_files for top-level directory to give context about project structure
         try:

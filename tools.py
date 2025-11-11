@@ -259,7 +259,7 @@ def generate_tool_schema(func, add_rationale: bool = False) -> Dict:
     }
 
 
-def get_tool_schemas(tool_names: List[str], add_rationale: bool = True) -> List[Dict]:
+def get_tool_schemas(tool_names: List[str], add_rationale: bool = False) -> List[Dict]:
     """
     Get tool schemas for the specified tool names.
 
@@ -280,6 +280,19 @@ def get_tool_schemas(tool_names: List[str], add_rationale: bool = True) -> List[
         schemas.append(schema)
 
     return schemas
+
+
+def get_all_tool_schemas(add_rationale: bool = False) -> List[Dict]:
+    """
+    Get schemas for all registered tools.
+
+    Args:
+        add_rationale: Whether to add rationale parameter to all tools
+
+    Returns:
+        List of all tool schemas
+    """
+    return get_tool_schemas(list(_TOOLS.keys()), add_rationale=add_rationale)
 
 
 def execute_tool(tool_name: str, arguments: Dict) -> Any:
@@ -317,24 +330,18 @@ class ReadyResult:
 # TOOLS
 # ==============================================================================
 
-@tool
-def read_files(file_paths: List[str], start_line: int = 1, max_lines: int = 250) -> tuple[List[Dict[str, Any]], str]:
+def _read_files_helper(file_paths: List[str], max_lines: int = None) -> List[Dict[str, Any]]:
     """
-    Read one or more files, optionally with line range limits.
-
-    IMPORTANT: Read ALL relevant files in a SINGLE call for efficiency. Avoid multiple tool calls.
+    Helper function to read files. Not exposed as a tool.
 
     Args:
         file_paths: List of file paths to read
-        start_line: Line number to start reading from (1-indexed)
-        max_lines: Maximum number of lines to read per file (default: 250)
+        max_lines: Maximum number of lines to read per file (None = all lines)
 
     Returns:
-        Immediate: List of dicts with file_path, data, and remaining_lines for each file
-        Long-term context: Brief summary (e.g., "read_files: foo.py (250 lines), bar.py (100 lines)")
+        List of dicts with file_path, data, and metadata for each file
     """
     results = []
-    summary_parts = []
 
     for file_path in file_paths:
         full_path = check_path(file_path)
@@ -343,10 +350,8 @@ def read_files(file_paths: List[str], start_line: int = 1, max_lines: int = 250)
             results.append({
                 'file_path': file_path,
                 'error': 'File not found',
-                'data': '',
-                'remaining_lines': 0
+                'data': ''
             })
-            summary_parts.append(f"{file_path} (not found)")
             continue
 
         try:
@@ -354,32 +359,29 @@ def read_files(file_paths: List[str], start_line: int = 1, max_lines: int = 250)
                 lines = f.readlines()
 
             total_lines = len(lines)
-            end_line = min(start_line - 1 + max_lines, total_lines)
-            selected_lines = lines[start_line - 1:end_line]
 
-            data = ''.join(selected_lines)
-            remaining = max(0, total_lines - end_line)
+            if max_lines is not None:
+                selected_lines = lines[:max_lines]
+                data = ''.join(selected_lines)
+                remaining = max(0, total_lines - max_lines)
+            else:
+                data = ''.join(lines)
+                remaining = 0
 
             results.append({
                 'file_path': file_path,
                 'data': data,
-                'remaining_lines': remaining,
-                'total_lines': total_lines
+                'total_lines': total_lines,
+                'remaining_lines': remaining
             })
-
-            lines_read = end_line - (start_line - 1)
-            summary_parts.append(f"{file_path} ({lines_read}/{total_lines} lines)")
         except Exception as e:
             results.append({
                 'file_path': file_path,
                 'error': str(e),
-                'data': '',
-                'remaining_lines': 0
+                'data': ''
             })
-            summary_parts.append(f"{file_path} (error)")
 
-    summary = "read_files: " + ", ".join(summary_parts)
-    return (results, summary)
+    return results
 
 
 @tool
@@ -473,7 +475,7 @@ def list_files(
 
 
 @tool
-def update_files(updates: List[Dict[str, str]]) -> tuple[None, str]:
+def update_files(updates: List[Dict[str, str]], summary: Optional[str] = None) -> tuple[None, str]:
     """
     Update one or more files with new content.
 
@@ -483,10 +485,11 @@ def update_files(updates: List[Dict[str, str]]) -> tuple[None, str]:
 
     Args:
         updates: List of update specifications
+        summary: Optional custom summary for long-term context. If not provided, a default summary is generated.
 
     Returns:
         Immediate: None
-        Long-term context: Lists files modified/created (e.g., "update_files: modified foo.py; created bar.py")
+        Long-term context: Custom summary or default listing files modified/created
     """
     modified_files = []
     created_files = []
@@ -534,16 +537,18 @@ def update_files(updates: List[Dict[str, str]]) -> tuple[None, str]:
         else:
             raise ValueError(f"Invalid update specification: {update}")
 
-    # Build summary
-    summary_parts = []
-    if modified_files:
-        summary_parts.append(f"modified {', '.join(modified_files)}")
-    if created_files:
-        summary_parts.append(f"created {', '.join(created_files)}")
+    # Use custom summary if provided, otherwise generate default
+    if summary:
+        final_summary = f"update_files: {summary}"
+    else:
+        summary_parts = []
+        if modified_files:
+            summary_parts.append(f"modified {', '.join(modified_files)}")
+        if created_files:
+            summary_parts.append(f"created {', '.join(created_files)}")
+        final_summary = "update_files: " + "; ".join(summary_parts) if summary_parts else "update_files: no changes"
 
-    summary = "update_files: " + "; ".join(summary_parts) if summary_parts else "update_files: no changes"
-
-    return (None, summary)
+    return (None, final_summary)
 
 
 @tool
@@ -692,36 +697,43 @@ def get_user_input(prompt: str, preset_answers: List[str] = None) -> tuple[str, 
 
 
 @tool
-def run_oneshot_per_file(
-    system_prompt: str,
+def process_files(
+    instructions: str,
     include: Optional[Union[str, List[str]]] = "**",
     exclude: Optional[Union[str, List[str]]] = ".*",
     file_limit: int = 5,
-    model: str = "anthropic/claude-sonnet-4.5",
-    tool_name: str = "update_files"
+    single_batch: bool = True,
+    model: str = "anthropic/claude-sonnet-4.5"
 ) -> Dict[str, Any]:
     """
-    Apply a task to multiple files individually using LLM calls.
+    Read and process files with instructions.
 
-    For each matching file, makes a single LLM call with:
-    - Your provided system prompt
-    - The file name and contents
-    - Access to one tool (default: update_files)
+    **Single Batch Mode** (single_batch=True, default):
+    - Loads all matching files into context at once
+    - Returns file contents to you in the immediate response
+    - You then make tool calls (typically update_files or complete) in the main loop
+    - Long file contents are automatically replaced with summary after you've seen them
 
-    Useful for applying mechanical changes across multiple files where each file
-    can be processed independently.
+    **Per-File Mode** (single_batch=False):
+    - Each file is processed individually with separate LLM calls
+    - Good for mechanical changes where files are independent
 
     Args:
-        system_prompt: System prompt/instructions for processing each file
+        instructions: Instructions for processing the file(s)
         include: Glob pattern(s) to include (default: "**" for all files)
         exclude: Glob pattern(s) to exclude (default: ".*" for hidden files)
         file_limit: Maximum files to process (default: 5, prevents accidental bulk operations)
-        model: Model to use (default: anthropic/claude-sonnet-4.5)
-        tool_name: Tool to make available (default: update_files)
+        single_batch: If True, load all files at once; if False, process each file separately
+        model: Model to use for per-file mode (default: anthropic/claude-sonnet-4.5)
 
     Returns:
-        Immediate: Dict keyed by file path with values being {success: bool, result: str, cost: int}
-        Long-term context: Summary of files processed (e.g., "run_oneshot_per_file: processed 5 files")
+        Single batch mode:
+            Immediate: All file contents formatted as "File: path\n\ncontents\n\n---\n\n"
+            Long-term context: Summary like "process_files: loaded 3 files"
+
+        Per-file mode:
+            Immediate: Dict keyed by file path with {success: bool, result: str, cost: int}
+            Long-term context: Summary like "process_files: processed 5 files (4 successful)"
     """
     # Get list of files matching the patterns
     file_list_result, _ = list_files(include=include, exclude=exclude, max_files=file_limit)
@@ -733,141 +745,136 @@ def run_oneshot_per_file(
     elif not files:
         error_result = {"error": "No files found matching patterns"}
 
-    # Get API key
-    api_key = os.environ.get('OPENROUTER_API_KEY')
-    if not api_key:
-        error_result = {"error": "OPENROUTER_API_KEY not set"}
-
     if error_result:
-        return (error_result, f"run_oneshot_per_file: error")
+        return (error_result, f"process_files: error")
 
-    # Get tool schema for the allowed tool
-    tool_schemas = get_tool_schemas([tool_name], add_rationale=False)
+    if single_batch:
+        # Single batch mode: load all files and return contents
+        color_print('  ', ('ansicyan', f'Loading {len(files)} files in batch mode...'))
 
-    # Process each file
-    results = {}
+        # Read all files
+        file_contents_list = []
+        for file_info in files:
+            file_path = file_info['path']
+            file_result = _read_files_helper([file_path])
+            if file_result[0].get('error'):
+                file_contents_list.append(f"File: {file_path}\n\nError: {file_result[0]['error']}")
+            else:
+                file_contents_list.append(f"File: {file_path}\n\n{file_result[0]['data']}")
 
-    for i, file_info in enumerate(files, 1):
-        file_path = file_info['path']
+        # Build the immediate result with instructions and all file contents
+        immediate_result = f"{instructions}\n\n{'='*60}\n\n" + "\n\n---\n\n".join(file_contents_list)
+        summary = f"process_files: loaded {len(files)} files"
 
-        color_print('  ', ('ansicyan', f'[{i}/{len(files)}] Processing: {file_path}'))
+        color_print('  ', ('ansigreen', f'✓ Loaded {len(files)} files'))
 
-        # Read file contents
-        file_result, _ = read_files([file_path])
-        if file_result[0].get('error'):
-            results[file_path] = {
-                'success': False,
-                'result': f"Error reading file: {file_result[0]['error']}",
-                'cost': 0
-            }
-            continue
+        return (immediate_result, summary)
 
-        file_contents = file_result[0]['data']
+    else:
+        # Per-file mode: process each file individually
+        api_key = os.environ.get('OPENROUTER_API_KEY')
+        if not api_key:
+            return ({"error": "OPENROUTER_API_KEY not set"}, "process_files: error")
 
-        # Build messages
-        messages = [
-            {'role': 'system', 'content': system_prompt},
-            {'role': 'user', 'content': f"File: {file_path}\n\n{file_contents}"}
-        ]
+        # Get all tool schemas (not limited to single tool)
+        tool_schemas = get_all_tool_schemas(add_rationale=False)
 
-        # Call LLM
-        headers = {
-            'Content-Type': 'application/json',
-            'Authorization': f'Bearer {api_key}',
-            'HTTP-Referer': 'https://github.com/vanviegen/maca',
-            'X-Title': 'MACA - Coding Assistant'
-        }
+        # Process each file
+        results = {}
 
-        data = {
-            'model': model,
-            'messages': messages,
-            'tools': tool_schemas,
-            'usage': {"include": True},
-            'tool_choice': 'required',
-        }
+        for i, file_info in enumerate(files, 1):
+            file_path = file_info['path']
 
-        try:
-            req = urllib.request.Request(
-                "https://openrouter.ai/api/v1/chat/completions",
-                data=json.dumps(data).encode('utf-8'),
-                headers=headers
-            )
-            with urllib.request.urlopen(req) as response:
-                result = json.loads(response.read().decode('utf-8'))
+            color_print('  ', ('ansicyan', f'[{i}/{len(files)}] Processing: {file_path}'))
 
-            # Extract response
-            choice = result['choices'][0]
-            message = choice['message']
-            usage = result.get('usage', {})
-            cost = int(usage.get('cost', 0) * 1_000_000)  # Convert to microdollars
-
-            # Extract and execute tool call
-            tool_calls = message.get('tool_calls', [])
-            if not tool_calls:
+            # Read file contents
+            file_result = _read_files_helper([file_path])
+            if file_result[0].get('error'):
                 results[file_path] = {
                     'success': False,
-                    'result': 'No tool call made by LLM',
-                    'cost': cost
+                    'result': f"Error reading file: {file_result[0]['error']}",
+                    'cost': 0
                 }
                 continue
 
-            tool_call = tool_calls[0]
-            called_tool_name = tool_call['function']['name']
-            tool_args = json.loads(tool_call['function']['arguments'])
+            file_contents = file_result[0]['data']
 
-            # Execute the tool
-            tool_result, _ = execute_tool(called_tool_name, tool_args)
+            # Build messages
+            messages = [
+                {'role': 'system', 'content': instructions},
+                {'role': 'user', 'content': f"File: {file_path}\n\n{file_contents}"}
+            ]
 
-            results[file_path] = {
-                'success': True,
-                'result': str(tool_result),
-                'cost': cost,
-                'tool_called': called_tool_name
+            # Call LLM
+            headers = {
+                'Content-Type': 'application/json',
+                'Authorization': f'Bearer {api_key}',
+                'HTTP-Referer': 'https://github.com/vanviegen/maca',
+                'X-Title': 'MACA - Coding Assistant'
             }
 
-        except Exception as e:
-            results[file_path] = {
-                'success': False,
-                'result': f'Error: {str(e)}',
-                'cost': 0
+            data = {
+                'model': model,
+                'messages': messages,
+                'tools': tool_schemas,
+                'usage': {"include": True},
+                'tool_choice': 'required',
             }
 
-    # Build summary
-    success_count = sum(1 for r in results.values() if r['success'])
-    total_count = len(results)
-    summary = f"run_oneshot_per_file: processed {total_count} files ({success_count} successful)"
+            try:
+                req = urllib.request.Request(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    data=json.dumps(data).encode('utf-8'),
+                    headers=headers
+                )
+                with urllib.request.urlopen(req) as response:
+                    result = json.loads(response.read().decode('utf-8'))
 
-    return (results, summary)
+                # Extract response
+                choice = result['choices'][0]
+                message = choice['message']
+                usage = result.get('usage', {})
+                cost = int(usage.get('cost', 0) * 1_000_000)  # Convert to microdollars
+
+                # Extract and execute tool call
+                tool_calls = message.get('tool_calls', [])
+                if not tool_calls:
+                    results[file_path] = {
+                        'success': False,
+                        'result': 'No tool call made by LLM',
+                        'cost': cost
+                    }
+                    continue
+
+                tool_call = tool_calls[0]
+                called_tool_name = tool_call['function']['name']
+                tool_args = json.loads(tool_call['function']['arguments'])
+
+                # Execute the tool
+                tool_result, _ = execute_tool(called_tool_name, tool_args)
+
+                results[file_path] = {
+                    'success': True,
+                    'result': str(tool_result),
+                    'cost': cost,
+                    'tool_called': called_tool_name
+                }
+
+            except Exception as e:
+                results[file_path] = {
+                    'success': False,
+                    'result': f'Error: {str(e)}',
+                    'cost': 0
+                }
+
+        # Build summary
+        success_count = sum(1 for r in results.values() if r['success'])
+        total_count = len(results)
+        summary = f"process_files: processed {total_count} files ({success_count} successful)"
+
+        return (results, summary)
 
 
-
-
-@tool
-def summarize_and_update_files(summary: str, updates: List[Dict[str, str]] = None) -> tuple[None, str]:
-    """
-    Summarize the information just received and optionally update files.
-
-    **CRITICAL**: This tool is called immediately after receiving long data (>500 chars) from other tools.
-    You MUST use this opportunity to:
-    - Make ALL file modifications needed based on the data you just received
-    - Write analysis/detailed output to .scratch/ files if needed for later reference
-    - Provide a focused summary of what's needed to continue the conversation
-
-    The summary should focus on what's relevant for continuing the task, not a general overview.
-
-    Args:
-        summary: Concise summary of the data received and actions taken (what's needed to continue)
-        updates: Optional list of file update specifications (same format as update_files)
-
-    Returns:
-        Immediate: None
-        Long-term context: The summary you provided
-    """
-    # Perform file updates if provided
-    if updates:
-        update_files(updates)
-
-    return (None, f"summarize_and_update_files: {summary}")
 
 
 @tool
