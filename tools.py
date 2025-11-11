@@ -12,7 +12,8 @@ from prompt_toolkit.shortcuts import radiolist_dialog
 from pathlib import Path
 from typing import get_type_hints, get_origin, get_args, Any, Dict, List, Union, Optional
 
-from maca import maca
+import maca
+import context
 from utils import color_print
 from docker_ops import run_in_container
 import git_ops
@@ -805,7 +806,7 @@ def complete(result: str, commit_msg: str | None) -> bool:
 
     elif response == 'no':
         feedback = pt_prompt("What changes do you want?\n> ", multiline=True, history=maca.history)
-        maca.context.add_message({"role": "user", "content": feedback})
+        context.add_message({"role": "user", "content": feedback})
         return 'User rejected result and provided feedback.'
     else:
         print("Keeping worktree for manual review.")

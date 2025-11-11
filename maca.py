@@ -3,109 +3,114 @@
 
 import sys
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Optional
 
 from prompt_toolkit import prompt as pt_prompt
 from prompt_toolkit.shortcuts import radiolist_dialog
 from prompt_toolkit.history import FileHistory
 
-
-class MACA:
-    """Main orchestration class for the coding assistant."""
-
-    def __init__(self):
-        self.initial_prompt = None
-        self.repo_path = None
-        self.repo_root = None
-        self.session_id = None
-        self.worktree_path = None
-        self.branch_name = None
-        self.context = None
-
-    def ensure_git_repo(self):
-        """Ensure we're in a git repository, or offer to initialize one."""
-        if not git_ops.is_git_repo(self.repo_path):
-            color_print(('ansired', 'Not in a git repository.'))
-
-            response = radiolist_dialog(
-                title='Git Repository Required',
-                text='MACA requires a git repository. Initialize one now?',
-                values=[
-                    ('yes', 'Yes, initialize git repository'),
-                    ('no', 'No, exit')
-                ]
-            ).run()
-
-            if response != 'yes':
-                print("Exiting.")
-                sys.exit(0)
-
-            git_ops.init_git_repo(self.repo_path)
-            color_print(('ansigreen', 'Git repository initialized.'))
-
-        return git_ops.get_repo_root(self.repo_path)
-
-    def create_session(self):
-        """Create a new session with worktree and branch."""
-        # Find next session ID
-        self.session_id = git_ops.find_next_session_id(self.repo_root)
-
-        # Create worktree and branch
-        self.worktree_path, self.branch_name = git_ops.create_session_worktree(self.repo_root, self.session_id)
-
-        color_print(
-            ('ansigreen', f'Session {self.session_id} created'),
-            ' (branch: ', ('ansicyan', self.branch_name),
-            ', worktree: ', ('ansicyan', str(self.worktree_path.relative_to(self.repo_root))), ')',
-        )
-
-    def run(self, directory: str, task: str | None, model: str | None):
-        self.initial_prompt = task
-        
-        self.repo_path = Path(directory).resolve()
-        self.repo_root = self.ensure_git_repo()
-
-        # Setup shared input history
-        history_file = self.repo_root / '.maca' / 'history'
-        history_file.parent.mkdir(exist_ok=True)
-        self.history = FileHistory(str(history_file))
-
-        # Create session
-        self.create_session()
-
-        # Initialize context
-        self.context = context.Context(model=model or 'auto')
-
-        # Auto-call list_files for top-level directory to give context about project structure
-        try:
-            top_files_result = tools.execute_tool('list_files', {'include': '*'})
-            # Add as a system message so context knows what files are in the top directory
-            top_files_msg = f"Top-level directory contains {top_files_result['total_count']} files"
-            if top_files_result['files']:
-                files_list = [f['path'] for f in top_files_result['files']]
-                top_files_msg += f":\n" + "\n".join(f"- {f}" for f in files_list)
-            self.context.add_message({'role': 'system', 'content': top_files_msg})
-        except Exception as e:
-            # Don't fail if this doesn't work
-            pass
-
-        # Main loop
-        while True:
-            # Get initial prompt if this is a new task
-            prompt = self.initial_prompt
-            if prompt:
-                self.initial_prompt = None  # Only use command line arg for first iteration
-            else:
-                color_print(('ansiyellow', 'Enter your task (press Alt+Enter or Esc+Enter to submit):'))
-                prompt = pt_prompt("> ", multiline=True, history=self.history).strip()
-
-            if prompt:
-                self.context.add_message({"role": "user", "content": prompt})
-                self.context.run()
-
-maca = MACA()
-
 import git_ops
 import context
 import tools
 from utils import color_print
+
+
+# Module-level state
+initial_prompt = None
+repo_path = None
+repo_root = None
+session_id = None
+worktree_path = None
+branch_name = None
+history = None
+
+
+def ensure_git_repo():
+    """Ensure we're in a git repository, or offer to initialize one."""
+    global repo_root
+
+    if not git_ops.is_git_repo(repo_path):
+        color_print(('ansired', 'Not in a git repository.'))
+
+        response = radiolist_dialog(
+            title='Git Repository Required',
+            text='MACA requires a git repository. Initialize one now?',
+            values=[
+                ('yes', 'Yes, initialize git repository'),
+                ('no', 'No, exit')
+            ]
+        ).run()
+
+        if response != 'yes':
+            print("Exiting.")
+            sys.exit(0)
+
+        git_ops.init_git_repo(repo_path)
+        color_print(('ansigreen', 'Git repository initialized.'))
+
+    repo_root = git_ops.get_repo_root(repo_path)
+
+
+def create_session():
+    """Create a new session with worktree and branch."""
+    global session_id, worktree_path, branch_name
+
+    # Find next session ID
+    session_id = git_ops.find_next_session_id(repo_root)
+
+    # Create worktree and branch
+    worktree_path, branch_name = git_ops.create_session_worktree(repo_root, session_id)
+
+    color_print(
+        ('ansigreen', f'Session {session_id} created'),
+        ' (branch: ', ('ansicyan', branch_name),
+        ', worktree: ', ('ansicyan', str(worktree_path.relative_to(repo_root))), ')',
+    )
+
+
+def run(directory: str, task: str | None, model: str | None):
+    """Run the main MACA loop."""
+    global initial_prompt, repo_path, history
+
+    initial_prompt = task
+
+    repo_path = Path(directory).resolve()
+    ensure_git_repo()
+
+    # Setup shared input history
+    history_file = repo_root / '.maca' / 'history'
+    history_file.parent.mkdir(exist_ok=True)
+    history = FileHistory(str(history_file))
+
+    # Create session
+    create_session()
+
+    # Initialize context
+    context.initialize(model=model or 'auto')
+
+    # Auto-call list_files for top-level directory to give context about project structure
+    try:
+        top_files_result = tools.execute_tool('list_files', {'include': '*'})
+        # Add as a system message so context knows what files are in the top directory
+        top_files_msg = f"Top-level directory contains {top_files_result['total_count']} files"
+        if top_files_result['files']:
+            files_list = [f['path'] for f in top_files_result['files']]
+            top_files_msg += f":\n" + "\n".join(f"- {f}" for f in files_list)
+        context.add_message({'role': 'system', 'content': top_files_msg})
+    except Exception as e:
+        # Don't fail if this doesn't work
+        pass
+
+    # Main loop
+    while True:
+        # Get initial prompt if this is a new task
+        prompt = initial_prompt
+        if prompt:
+            initial_prompt = None  # Only use command line arg for first iteration
+        else:
+            color_print(('ansiyellow', 'Enter your task (press Alt+Enter or Esc+Enter to submit):'))
+            prompt = pt_prompt("> ", multiline=True, history=history).strip()
+
+        if prompt:
+            context.add_message({"role": "user", "content": prompt})
+            context.run()

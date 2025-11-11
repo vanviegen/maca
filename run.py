@@ -1,4 +1,4 @@
-from maca import maca
+import maca
 import argparse
 
 parser = argparse.ArgumentParser(

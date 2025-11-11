@@ -8,7 +8,7 @@ import hashlib
 from pathlib import Path
 from typing import List, Dict, Optional
 
-from maca import maca
+import maca
 
 
 class ContainerError(Exception):
