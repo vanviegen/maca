@@ -8,11 +8,11 @@ import json
 import random
 from fnmatch import fnmatch
 from prompt_toolkit import prompt as pt_prompt
-from prompt_toolkit.shortcuts import radiolist_dialog
+from prompt_toolkit.shortcuts import choice
 from pathlib import Path
 from typing import get_type_hints, get_origin, get_args, Any, Dict, List, Union, Optional
 
-from utils import color_print
+from utils import cprint, C_GOOD, C_BAD, C_NORMAL, C_IMPORTANT, C_INFO
 from docker_ops import run_in_container
 import git_ops
 import json
@@ -29,14 +29,15 @@ def check_path(path: str, worktree_path: Path) -> str:
         path: The path to check (relative or absolute)
 
     Returns:
-        The original path if valid
+        The resolved absolute path if valid
 
     Raises:
         ValueError: If the path is outside the current directory or symlinks outside
     """
     # Convert the input path to absolute and resolve all symlinks
+    # Relative paths are resolved relative to the worktree, not CWD
     try:
-        resolved_path = Path(path).resolve()
+        resolved_path = (Path(worktree_path) / path).resolve()
     except (OSError, RuntimeError) as e:
         raise ValueError(f"Cannot resolve path '{path}': {e}")
     
@@ -52,7 +53,8 @@ def check_path(path: str, worktree_path: Path) -> str:
 def get_matching_files(
     worktree_path: Path,
     include: Optional[Union[str, List[str]]] = "**",
-    exclude: Optional[Union[str, List[str]]] = ".*"
+    exclude: Optional[Union[str, List[str]]] = ".*",
+    exclude_files: Optional[Union[str, List[str]]] = None
 ) -> List[Path]:
     """
     Get list of files matching include/exclude glob patterns.
@@ -63,10 +65,14 @@ def get_matching_files(
                  Defaults to "**" (all files).
         exclude: Glob pattern(s) to exclude. Can be None, a string, or list of strings.
                  Defaults to ".*" (hidden files/directories).
+        exclude_files: File(s) containing exclude patterns (e.g., ".gitignore"). Can be None, a string, or list of strings.
+                       Defaults to None. When ".gitignore" is included, gitignore semantics are applied.
 
     Returns:
         List of Path objects for matching files (not directories)
     """
+    from utils import parse_gitignore
+    
     worktree = Path(worktree_path)
 
     # Normalize include patterns
@@ -85,6 +91,20 @@ def get_matching_files(
     else:
         exclude_patterns = exclude
 
+    # Normalize exclude_files
+    if exclude_files is None:
+        exclude_file_list = []
+    elif isinstance(exclude_files, str):
+        exclude_file_list = [exclude_files]
+    else:
+        exclude_file_list = exclude_files
+
+    # Parse .gitignore if present in exclude_files
+    gitignore_matcher = None
+    if '.gitignore' in exclude_file_list:
+        gitignore_path = worktree / '.gitignore'
+        gitignore_matcher = parse_gitignore(gitignore_path)
+
     # Collect all matching files
     matching_files = set()
 
@@ -94,32 +114,34 @@ def get_matching_files(
                 matching_files.add(path)
 
     # Filter out excluded files
-    if exclude_patterns:
-        filtered_files = []
-        for file_path in matching_files:
-            rel_path_str = str(file_path.relative_to(worktree))
+    filtered_files = []
+    for file_path in matching_files:
+        rel_path_str = str(file_path.relative_to(worktree))
 
-            # Check if any exclude pattern matches
-            excluded = False
-            for exc_pattern in exclude_patterns:
-                # Check if pattern matches any part of the path
-                if fnmatch(rel_path_str, exc_pattern):
+        # Check gitignore first
+        if gitignore_matcher:
+            if gitignore_matcher.matches(rel_path_str, is_dir=False):
+                continue
+
+        # Check if any exclude pattern matches
+        excluded = False
+        for exc_pattern in exclude_patterns:
+            # Check if pattern matches any part of the path
+            if fnmatch(rel_path_str, exc_pattern):
+                excluded = True
+                break
+            # Also check individual path components
+            for part in Path(rel_path_str).parts:
+                if fnmatch(part, exc_pattern):
                     excluded = True
                     break
-                # Also check individual path components
-                for part in Path(rel_path_str).parts:
-                    if fnmatch(part, exc_pattern):
-                        excluded = True
-                        break
-                if excluded:
-                    break
+            if excluded:
+                break
 
-            if not excluded:
-                filtered_files.append(file_path)
+        if not excluded:
+            filtered_files.append(file_path)
 
-        return sorted(filtered_files)
-    else:
-        return sorted(matching_files)
+    return sorted(filtered_files)
 
 
 # Tool registry - single registry for all tools
@@ -401,100 +423,6 @@ def _read_files_helper(file_paths: List[str], worktree_path: Path, max_lines: in
 
 
 @tool
-def list_files(
-    include: Union[str, List[str]] = "**",
-    exclude: Optional[Union[str, List[str]]] = ".*",
-    max_files: int = 50,
-    worktree_path: Path = None,
-    repo_root: Path = None,
-    history = None,
-    maca = None
-) -> tuple[Dict[str, Any], str]:
-    """
-    List files in the worktree matching include/exclude glob patterns.
-
-    Returns a random sampling if more files match than max_files.
-    Use this to get an impression of what files exist matching a pattern.
-
-    Examples:
-    - include="**/*.py" - All Python files
-    - include=["**/*.py", "**/*.md"] - Python and Markdown files
-    - include="src/**/*.py" - Python files in src/
-    - include="**/*test*.py" - Python test files
-    - include="*" - Files in top directory only (no subdirectories)
-    - exclude=[".*", "**/__pycache__/**"] - Exclude hidden files and pycache
-
-    Args:
-        include: Glob pattern(s) to include (default: "**" for all files)
-        exclude: Glob pattern(s) to exclude (default: ".*" for hidden files)
-        max_files: Maximum number of files to return (default: 50)
-
-    Returns:
-        Immediate: Dict with 'total_count' and 'files' list
-        Long-term context: Brief summary (e.g., "list_files: found 15 files")
-    """
-    worktree = Path(worktree_path)
-
-    def get_file_info(path: Path) -> Dict[str, Any]:
-        """Get detailed info about a file."""
-        rel_path_str = str(path.relative_to(worktree))
-        info = {"path": rel_path_str}
-
-        try:
-            stat = path.lstat()
-
-            # Get file size
-            info["bytes"] = stat.st_size
-
-            # Check if executable
-            if stat.st_mode & 0o111:
-                info["type"] = "executable"
-
-            # Try to count lines for text files (skip large files)
-            if stat.st_size < 1024 * 1024:  # Only for files < 1MB
-                try:
-                    with open(path, 'r', encoding='utf-8', errors='strict') as f:
-                        info["lines"] = sum(1 for _ in f)
-                except:
-                    pass  # Binary or invalid encoding, skip line count
-
-        except Exception:
-            # If we can't stat the file, just return the path
-            pass
-
-        return info
-
-    # Get matching files using helper
-    matching_files = get_matching_files(worktree_path=worktree_path, include=include, exclude=exclude)
-
-    # Build file info for each match
-    matches = [get_file_info(path) for path in matching_files]
-
-    total_count = len(matches)
-
-    # If we have more matches than max_files, return random sampling
-    if total_count > max_files:
-        matches = random.sample(matches, max_files)
-
-    # Sort by path
-    matches.sort(key=lambda x: x["path"])
-
-    result = {
-        'total_count': total_count,
-        'files': matches
-    }
-
-    # Build summary
-    pattern_str = include if isinstance(include, str) else f"{len(include)} patterns"
-    if total_count > max_files:
-        summary = f"list_files: found {total_count} files (showing {max_files} random sample)"
-    else:
-        summary = f"list_files: found {total_count} files matching {pattern_str}"
-
-    return (result, summary)
-
-
-@tool
 def update_files(
     updates: List[Dict[str, str]],
     summary: Optional[str] = None,
@@ -502,7 +430,7 @@ def update_files(
     repo_root: Path = None,
     history = None,
     maca = None
-) -> tuple[None, str]:
+) -> tuple[str, str]:
     """
     Update one or more files with new content.
 
@@ -515,7 +443,7 @@ def update_files(
         summary: Optional custom summary for long-term context. If not provided, a default summary is generated.
 
     Returns:
-        Immediate: None
+        Immediate: "OK"
         Long-term context: Custom summary or default listing files modified/created
     """
     modified_files = []
@@ -575,7 +503,7 @@ def update_files(
             summary_parts.append(f"created {', '.join(created_files)}")
         final_summary = "update_files: " + "; ".join(summary_parts) if summary_parts else "update_files: no changes"
 
-    return (None, final_summary)
+    return ("OK", final_summary)
 
 
 @tool
@@ -583,6 +511,7 @@ def search(
     regex: str,
     include: Optional[Union[str, List[str]]] = "**",
     exclude: Optional[Union[str, List[str]]] = ".*",
+    exclude_files: Optional[Union[str, List[str]]] = None,
     max_results: int = 10,
     lines_before: int = 2,
     lines_after: int = 2,
@@ -598,6 +527,7 @@ def search(
         regex: Regular expression to search for in file contents
         include: Glob pattern(s) to include (default: "**" for all files)
         exclude: Glob pattern(s) to exclude (default: ".*" for hidden files)
+        exclude_files: File(s) containing exclude patterns (e.g., ".gitignore"). Defaults to None.
         max_results: Maximum number of matches to return
         lines_before: Number of context lines before each match
         lines_after: Number of context lines after each match
@@ -606,13 +536,22 @@ def search(
         Immediate: List of matches with file_path, line_number, and context lines
         Long-term context: Brief summary (e.g., "search: found 5 matches in 3 files")
     """
+    # Default exclude_files to ['.gitignore'] if not specified
+    if exclude_files is None:
+        exclude_files = ['.gitignore']
+    
     worktree = Path(worktree_path)
     results = []
     content_pattern = re.compile(regex)
     files_with_matches = set()
 
     # Get matching files using helper
-    matching_files = get_matching_files(worktree_path=worktree_path, include=include, exclude=exclude)
+    matching_files = get_matching_files(
+        worktree_path=worktree_path, 
+        include=include, 
+        exclude=exclude,
+        exclude_files=exclude_files
+    )
 
     for file_path in matching_files:
         rel_path_str = str(file_path.relative_to(worktree))
@@ -658,7 +597,7 @@ def shell(
     maca = None
 ) -> tuple[Dict[str, Any], str]:
     """
-    Execute a shell command in a Docker container.
+    Execute a shell command in a Docker container. The cwd will be the worktree path.
 
     Args:
         command: Shell command to execute
@@ -696,52 +635,64 @@ def shell(
 
 
 
+@dataclass
+class Question:
+    """A single question with optional preset answers."""
+    prompt: str
+    preset_answers: Optional[List[str]] = None
+
+
 @tool
-def get_user_input(
-    prompt: str,
-    preset_answers: List[str] = None,
+def ask_user_questions(
+    questions: List[Dict[str, Any]],
     worktree_path: Path = None,
     repo_root: Path = None,
     history = None,
     maca = None
 ) -> tuple[str, str]:
     """
-    Get input from the user interactively.
+    Ask the user one or more questions interactively.
+
+    Each question can optionally provide preset answer choices. The LLM is highly encouraged
+    to provide likely answers when possible to make it easier for the user.
 
     Args:
-        prompt: The prompt to display to the user
-        preset_answers: Optional list of preset answer choices
+        questions: List of question objects, each with:
+            - prompt: The question to ask the user
+            - preset_answers: Optional list of likely answer choices
 
     Returns:
-        Immediate: The user's input
-        Long-term context: "get_user_input: {answer}"
+        Immediate: A formatted string containing all answers, clearly separated
+        Long-term context: Same as immediate (answers are typically short)
     """
-    if preset_answers:
-        # Show radio list dialog
-        choices = [(answer, answer) for answer in preset_answers]
-        choices.append(('__custom__', 'Other (custom input)'))
+    answers = []
+    
+    for i, q in enumerate(questions, 1):
+        prompt_text = q.get('prompt', '')
+        preset_answers = q.get('preset_answers')
+        
+        if preset_answers:
+            # Show choice selection
+            choices = [(answer, answer) for answer in preset_answers]
+            choices.append(('__custom__', 'Other (custom input)'))
 
-        result = radiolist_dialog(
-            title='Input Required',
-            text=prompt,
-            values=choices
-        ).run()
+            result = choice(
+                message=f"Question {i}/{len(questions)}: {prompt_text}",
+                options=choices
+            )
 
-        if result == '__custom__':
-            answer = pt_prompt(f"{prompt}\n> ", history=history)
+            if result == '__custom__':
+                answer = pt_prompt(f"> ", history=history)
+            else:
+                answer = result
         else:
-            answer = result
-    else:
-        # Simple text input
-        answer = pt_prompt(f"{prompt}\n> ", history=history)
-
-    # Build summary - truncate long answers
-    answer_summary = answer[:100]
-    if len(answer) > 100:
-        answer_summary += "..."
-    summary = f"get_user_input: {answer_summary}"
-
-    return (answer, summary)
+            # Simple text input
+            answer = pt_prompt(f"Question {i}/{len(questions)}: {prompt_text}\n> ", history=history)
+        
+        answers.append(f"Q{i}: {prompt_text}\nA{i}: {answer}")
+    
+    result = "\n\n".join(answers)
+    return (result, result)
 
 
 
@@ -749,10 +700,7 @@ def get_user_input(
 @tool
 def process_files(
     instructions: str,
-    include: Optional[Union[str, List[str]]] = "**",
-    exclude: Optional[Union[str, List[str]]] = ".*",
-    file_limit: int = 5,
-    single_batch: bool = True,
+    batches: List[List[Dict[str, Any]]],
     model: str = "anthropic/claude-sonnet-4.5",
     worktree_path: Path = None,
     repo_root: Path = None,
@@ -760,173 +708,173 @@ def process_files(
     maca = None
 ) -> Dict[str, Any]:
     """
-    Read and process files with instructions.
+    Read and process files with instructions using separate LLM calls.
 
-    **Single Batch Mode** (single_batch=True, default):
-    - Loads all matching files into context at once
-    - Returns file contents to you in the immediate response
-    - You then make tool calls (typically update_files or complete) in the main loop
-    - Long file contents are automatically replaced with summary after you've seen them
+    Each batch is processed with its own LLM call that has access to all tools. This ensures
+    file contents never remain in the main context - they're shown once with ephemeral cache,
+    then replaced with a summary.
 
-    **Per-File Mode** (single_batch=False):
-    - Each file is processed individually with separate LLM calls
-    - Good for mechanical changes where files are independent
+    **When to use single vs multiple batches:**
+    - **Single batch**: Use when files need coordinated changes or analysis together.
+      One LLM call processes all files and can make coordinated tool calls.
+    - **Multiple batches**: Use when making mechanical/repetitive changes to many files where each 
+      file (or small group) can be processed independently. Each batch gets its own LLM call.
+
+    **Batch structure:**
+    Each batch is a list of file specifications:
+    ```
+    {
+        "path": "relative/path/to/file.py",
+        "start_line": 10,  # Optional: first line to read (1-indexed)
+        "end_line": 50     # Optional: last line to read (inclusive)
+    }
+    ```
+
+    **Examples:**
+    ```python
+    # Single batch - process 3 related files together
+    batches=[
+        [
+            {"path": "main.py"},
+            {"path": "utils.py"},
+            {"path": "config.py"}
+        ]
+    ]
+
+    # Multiple batches - process each file independently
+    batches=[
+        [{"path": "file1.py"}],
+        [{"path": "file2.py"}],
+        [{"path": "file3.py"}]
+    ]
+
+    # Batch with line ranges
+    batches=[
+        [
+            {"path": "large_file.py", "start_line": 1, "end_line": 100},
+            {"path": "large_file.py", "start_line": 101, "end_line": 200}
+        ]
+    ]
+    ```
 
     Args:
         instructions: Instructions for processing the file(s)
-        include: Glob pattern(s) to include (default: "**" for all files)
-        exclude: Glob pattern(s) to exclude (default: ".*" for hidden files)
-        file_limit: Maximum files to process (default: 5, prevents accidental bulk operations)
-        single_batch: If True, load all files at once; if False, process each file separately
-        model: Model to use for per-file mode (default: anthropic/claude-sonnet-4.5)
+        batches: List of batches, where each batch is a list of file specs
+        model: Model to use for batch processing (default: anthropic/claude-sonnet-4.5)
 
     Returns:
-        Single batch mode:
-            Immediate: All file contents formatted as "File: path\n\ncontents\n\n---\n\n"
-            Long-term context: Summary like "process_files: loaded 3 files"
-
-        Per-file mode:
-            Immediate: Dict keyed by file path with {success: bool, result: str, cost: int}
-            Long-term context: Summary like "process_files: processed 5 files (4 successful)"
+        Immediate: Dict keyed by batch index with {success: bool, result: str, cost: int, tool_called: str}
+        Long-term context: Summary like "process_files: processed 5 batches (4 successful)"
     """
-    # Get list of files matching the patterns
-    file_list_result, _ = list_files(include=include, exclude=exclude, max_files=file_limit, worktree_path=worktree_path, repo_root=repo_root, history=history, maca=maca)
-    files = file_list_result['files']
+    if not batches:
+        error_result = {"error": "No batches specified"}
+        return (error_result, "process_files: error")
 
-    error_result = None
-    if len(files) < file_list_result['total_count']:
-        error_result = {"error": f"Too many files match the pattern. Limit is {file_limit}. Please narrow the pattern or increase limit."}
-    elif not files:
-        error_result = {"error": "No files found matching patterns"}
+    # All batches are processed with separate LLM calls
+    api_key = os.environ.get('OPENROUTER_API_KEY')
+    if not api_key:
+        return ({"error": "OPENROUTER_API_KEY not set"}, "process_files: error")
 
-    if error_result:
-        return (error_result, f"process_files: error")
+    # Get all tool schemas
+    tool_schemas = get_all_tool_schemas(add_rationale=False)
 
-    if single_batch:
-        # Single batch mode: load all files and return contents
-        color_print('  ', ('ansicyan', f'Loading {len(files)} files in batch mode...'))
+    # Process each batch
+    results = {}
 
-        # Read all files
-        file_contents_list = []
-        for file_info in files:
-            file_path = file_info['path']
-            file_result = _read_files_helper([file_path], worktree_path)
-            if file_result[0].get('error'):
-                file_contents_list.append(f"File: {file_path}\n\nError: {file_result[0]['error']}")
-            else:
-                file_contents_list.append(f"File: {file_path}\n\n{file_result[0]['data']}")
+    for batch_idx, batch in enumerate(batches):
+        cprint(C_INFO, f'  [{batch_idx + 1}/{len(batches)}] Processing batch of {len(batch)} files')
 
-        # Build the immediate result with instructions and all file contents
-        immediate_result = f"{instructions}\n\n{'='*60}\n\n" + "\n\n---\n\n".join(file_contents_list)
-        summary = f"process_files: loaded {len(files)} files"
+        # Read files in this batch
+        batch_contents = []
+        for file_spec in batch:
+            file_path = file_spec['path']
+            start_line = file_spec.get('start_line')
+            end_line = file_spec.get('end_line')
 
-        color_print('  ', ('ansigreen', f'✓ Loaded {len(files)} files'))
+            full_path = check_path(file_path, worktree_path)
+            
+            if not full_path.exists():
+                batch_contents.append(f"File: {file_path}\n\nError: File not found")
+                continue
 
-        return (immediate_result, summary)
+            try:
+                with open(full_path, 'r') as f:
+                    lines = f.readlines()
 
-    else:
-        # Per-file mode: process each file individually
-        api_key = os.environ.get('OPENROUTER_API_KEY')
-        if not api_key:
-            return ({"error": "OPENROUTER_API_KEY not set"}, "process_files: error")
+                # Handle line range
+                if start_line is not None or end_line is not None:
+                    start_idx = (start_line - 1) if start_line else 0
+                    end_idx = end_line if end_line else len(lines)
+                    selected_lines = lines[start_idx:end_idx]
+                    data = ''.join(selected_lines)
+                    batch_contents.append(
+                        f"File: {file_path} (lines {start_idx + 1}-{end_idx})\n\n{data}"
+                    )
+                else:
+                    data = ''.join(lines)
+                    batch_contents.append(f"File: {file_path}\n\n{data}")
+            except Exception as e:
+                batch_contents.append(f"File: {file_path}\n\nError: {str(e)}")
 
-        # Get all tool schemas (not limited to single tool)
-        tool_schemas = get_all_tool_schemas(add_rationale=False)
+        # Build messages for this batch
+        batch_content = "\n\n---\n\n".join(batch_contents)
+        messages = [
+            {'role': 'system', 'content': instructions},
+            {'role': 'user', 'content': batch_content}
+        ]
 
-        # Process each file
-        results = {}
+        # Call LLM using shared utility
+        from utils import call_llm
+        
+        try:
+            llm_result = call_llm(
+                api_key=api_key,
+                model=model,
+                messages=messages,
+                tool_schemas=tool_schemas,
+                logger=None  # No logger for process_files LLM calls
+            )
+            
+            message = llm_result['message']
+            cost = llm_result['cost']
 
-        for i, file_info in enumerate(files, 1):
-            file_path = file_info['path']
-
-            color_print('  ', ('ansicyan', f'[{i}/{len(files)}] Processing: {file_path}'))
-
-            # Read file contents
-            file_result = _read_files_helper([file_path], worktree_path)
-            if file_result[0].get('error'):
-                results[file_path] = {
+            # Extract and execute tool call
+            tool_calls = message.get('tool_calls', [])
+            if not tool_calls:
+                results[batch_idx] = {
                     'success': False,
-                    'result': f"Error reading file: {file_result[0]['error']}",
-                    'cost': 0
+                    'result': 'No tool call made by LLM',
+                    'cost': cost
                 }
                 continue
 
-            file_contents = file_result[0]['data']
+            tool_call = tool_calls[0]
+            called_tool_name = tool_call['function']['name']
+            tool_args = json.loads(tool_call['function']['arguments'])
 
-            # Build messages
-            messages = [
-                {'role': 'system', 'content': instructions},
-                {'role': 'user', 'content': f"File: {file_path}\n\n{file_contents}"}
-            ]
+            # Execute the tool
+            tool_result, _ = execute_tool(called_tool_name, tool_args, worktree_path, repo_root, history, maca)
 
-            # Call LLM
-            headers = {
-                'Content-Type': 'application/json',
-                'Authorization': f'Bearer {api_key}',
-                'HTTP-Referer': 'https://github.com/vanviegen/maca',
-                'X-Title': 'MACA - Coding Assistant'
+            results[batch_idx] = {
+                'success': True,
+                'result': str(tool_result),
+                'cost': cost,
+                'tool_called': called_tool_name
             }
 
-            data = {
-                'model': model,
-                'messages': messages,
-                'tools': tool_schemas,
-                'usage': {"include": True},
-                'tool_choice': 'required',
+        except Exception as e:
+            results[batch_idx] = {
+                'success': False,
+                'result': f'Error: {str(e)}',
+                'cost': 0
             }
 
-            try:
-                req = urllib.request.Request(
-                    "https://openrouter.ai/api/v1/chat/completions",
-                    data=json.dumps(data).encode('utf-8'),
-                    headers=headers
-                )
-                with urllib.request.urlopen(req) as response:
-                    result = json.loads(response.read().decode('utf-8'))
+    # Build summary
+    success_count = sum(1 for r in results.values() if r['success'])
+    total_count = len(results)
+    summary = f"process_files: processed {total_count} batches ({success_count} successful)"
 
-                # Extract response
-                choice = result['choices'][0]
-                message = choice['message']
-                usage = result.get('usage', {})
-                cost = int(usage.get('cost', 0) * 1_000_000)  # Convert to microdollars
-
-                # Extract and execute tool call
-                tool_calls = message.get('tool_calls', [])
-                if not tool_calls:
-                    results[file_path] = {
-                        'success': False,
-                        'result': 'No tool call made by LLM',
-                        'cost': cost
-                    }
-                    continue
-
-                tool_call = tool_calls[0]
-                called_tool_name = tool_call['function']['name']
-                tool_args = json.loads(tool_call['function']['arguments'])
-
-                # Execute the tool
-                tool_result, _ = execute_tool(called_tool_name, tool_args, worktree_path, repo_root, history, maca)
-
-                results[file_path] = {
-                    'success': True,
-                    'result': str(tool_result),
-                    'cost': cost,
-                    'tool_called': called_tool_name
-                }
-
-            except Exception as e:
-                results[file_path] = {
-                    'success': False,
-                    'result': f'Error: {str(e)}',
-                    'cost': 0
-                }
-
-        # Build summary
-        success_count = sum(1 for r in results.values() if r['success'])
-        total_count = len(results)
-        summary = f"process_files: processed {total_count} files ({success_count} successful)"
-
-        return (results, summary)
+    return (results, summary)
 
 
 
@@ -954,42 +902,48 @@ def complete(
            If no changes were made, this should be `null`.
     """
 
-    color_print('\n', ('ansigreen', 'Task completed!'), f'\n{result}\n')
+    cprint(C_GOOD, '\n✓ Task completed!\n\n', C_NORMAL, result, '\n')
 
     print(result)
 
     # Ask for approval
-    response = radiolist_dialog(
-        title='Task Complete',
-        text='Are you satisfied with the result?',
-        values=[
-            ('yes', 'Yes, merge into main'),
-            ('no', 'No, I want changes'),
-            ('cancel', 'Cancel (keep worktree for manual review)')
+    response = choice(
+        message=f'{worktree_path} -- How to proceed?',
+        options=[
+            ('merge', 'Merge into main'),
+            ('continue', 'Ask for further changes'),
+            ('cancel', 'Leave as-is for manual review'),
+            ('delete', 'Delete everything'),
         ]
-    ).run()
+    )
 
-    if response == 'yes':
-        color_print(('ansicyan', 'Merging changes...'))
+    if response == 'merge':
+        cprint(C_INFO, 'Merging changes...')
 
         # Merge
-        success, message = git_ops.merge_to_main(repo_root, worktree_path, maca.branch_name, commit_msg or result)
+        conflict = git_ops.merge_to_main(repo_root, worktree_path, maca.branch_name, commit_msg or result)
 
-        if success:
-            # Cleanup
-            git_ops.cleanup_session(repo_root, worktree_path, maca.branch_name)
-            color_print(('ansigreen', '✓ Merged and cleaned up'))
-        else:
-            color_print(('ansired', f'Merge failed: {message}'))
-            print("You may need to resolve conflicts manually.")
+        if conflict:
+            cprint(C_BAD, "⚠ Merge conflicts!")
+            return f"Merge conflict while rebasing. Please resolve merge conflicts by reading the affected files and using update_files to resolve the conflicts. Then use shell tool with `git add <filename>.. && git rebase --continue`, before calling complete again with the same arguments to try the merge again. Here is the rebase output:\n\n{conflict}"
+        
+        # Cleanup
+        git_ops.cleanup_session(repo_root, worktree_path, maca.branch_name)
+        cprint(C_GOOD, '✓ Merged and cleaned up')
 
         return ReadyResult(result)
 
-    elif response == 'no':
+    elif response == 'continue':
         feedback = pt_prompt("What changes do you want?\n> ", multiline=True, history=history)
         maca.add_message({"role": "user", "content": feedback})
         return 'User rejected result and provided feedback.'
-    else:
+    
+    elif response == 'delete':
+        git_ops.cleanup_session(repo_root, worktree_path, maca.branch_name)
+        cprint(C_BAD, '✓ Deleted worktree and branch')
+        return ReadyResult(result)
+    
+    else:  # cancel
         print("Keeping worktree for manual review.")
         return ReadyResult(result)
 

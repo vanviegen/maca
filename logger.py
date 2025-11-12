@@ -6,72 +6,75 @@ from datetime import datetime
 from pathlib import Path
 
 
-class Logger:
-    """Logs session events to per-context log files in human-readable format."""
+# Global logger state
+_log_file = None
+
+
+def init(repo_root: Path, session_id: int, context_id: str):
+    """
+    Initialize the session logger.
+
+    Args:
+        repo_root: Path to the repository root
+        session_id: The session ID number
+        context_id: The context ID (e.g., "main")
+    """
+    global _log_file
     
-    # Global sequence number across all log entries
-    seq = 0
+    session_dir = repo_root / '.maca' / str(session_id)
 
-    def __init__(self, repo_root: Path, session_id: int, context_id: str):
-        """
-        Initialize the session logger.
+    # Ensure session directory exists
+    session_dir.mkdir(parents=True, exist_ok=True)
 
-        Args:
-            repo_root: Path to the repository root
-            session_id: The session ID number
-        """
-        session_dir = repo_root / '.maca' / str(session_id)
+    _log_file = open(session_dir / f"{context_id}.log", 'a')
 
-        # Ensure session directory exists
-        session_dir.mkdir(parents=True, exist_ok=True)
 
-        self.file = open(session_dir / f"{context_id}.log", 'a')
+def _find_heredoc_delimiter(value: str) -> str:
+    """Find a delimiter that doesn't appear in the value."""
+    # Simple approach: use "EOD" unless it appears in the value
+    if f'\nEOD' not in value:
+        return "EOD"
+    
+    # Just return a random string - chances of collision are infinitesimal
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
 
-    def _find_heredoc_delimiter(self, value: str) -> str:
-        """Find a delimiter that doesn't appear in the value."""
-        # Simple approach: use "EOD" unless it appears in the value
-        if f'\nEOD' not in value:
-            return "EOD"
-        
-        # Just return a random string - chances of collision are infinitesimal
-        return ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
 
-    def log(self, **kwargs):
-        """
-        Log an entry to the appropriate context log file.
+def log(**kwargs):
+    """
+    Log an entry to the log file.
 
-        Args:
-            context_id: Optional context identifier (main or subcontext name)
-            **kwargs: Arbitrary key-value pairs to log
-        """
-        # Increment global sequence number
-        Logger.seq += 1
+    Args:
+        **kwargs: Arbitrary key-value pairs to log
+    """
+    if _log_file is None:
+        # Logger not initialized, skip logging
+        return
+    
+    # Format timestamp in human-readable format
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-        # Format timestamp in human-readable format
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    # Build the log entry
+    lines = []
+    lines.append(f'timestamp: {timestamp}')
+    
+    # Add all kwargs as key-value pairs
+    for key, value in kwargs.items():
+        # Handle non-string types by encoding as JSON
+        if not isinstance(value, str):
+            key += '!'
+            value = json.dumps(value)
+        else:
+            value = value.strip()
+            if '\n' in value or value.startswith('<<<'):
+                delimiter = _find_heredoc_delimiter(value)
+                value = f'<<<{delimiter}\n{value}\n{delimiter}'
+        lines.append(f'{key}: {value}')
 
-        # Build the log entry
-        lines = []
-        lines.append(f'timestamp: {timestamp}')
-        lines.append(f'seq!: {Logger.seq}')
-        
-        # Add all kwargs as key-value pairs
-        for key, value in kwargs.items():
-            # Handle non-string types by encoding as JSON
-            if not isinstance(value, str):
-                key += '!'
-                value = json.dumps(value)
-            else:
-                value = value.strip()
-                if '\n' in value or value.startswith('<<<'):
-                    delimiter = self._find_heredoc_delimiter(value)
-                    value = f'<<<{delimiter}\n{value}\n{delimiter}'
-            lines.append(f'{key}: {value}')
+    _log_file.write('\n'.join(lines) + '\n\n')
+    _log_file.flush()  # Ensure it's written immediately
 
-        self.file.write('\n'.join(lines) + '\n\n')
 
-    @staticmethod
-    def read_log(repo_root: Path, session_id: int, context_id: str) -> list:
+def read_log(repo_root: Path, session_id: int, context_id: str) -> list:
         log_path = repo_root / '.maca' / str(session_id) / f"{context_id}.log"
         if not log_path.exists():
             return False

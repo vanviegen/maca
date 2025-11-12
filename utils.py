@@ -1,30 +1,272 @@
 """Utility functions for MACA."""
 
+from dataclasses import dataclass
 from prompt_toolkit import print_formatted_text
 from prompt_toolkit.formatted_text import FormattedText
+from pathlib import Path
+from fnmatch import fnmatch
+from typing import List, Dict, Any, Optional
+import json
+import urllib.request
+import time
+from logger import log
 
 
-def color_print(*args):
+# Global cumulative cost tracking
+_cumulative_cost = 0
+
+
+@dataclass(frozen=True)
+class Color:
+    """Color constant for cprint."""
+    code: str
+
+
+# Color constants for log messages
+C_GOOD = Color('#2ecc71')      # Modern green (emerald)
+C_BAD = Color('#e74c3c')       # Modern red (alizarin)
+C_NORMAL = Color('')           # White/default
+C_IMPORTANT = Color('#f39c12') # Modern orange (orange)
+C_INFO = Color('#3498db')      # Modern blue (peter river)
+
+
+def cprint(*args):
     """
-    Print arguments with optional color formatting.
+    Print with color constants and text where color persists until changed.
     
     Args:
-        *args: Mixed arguments - strings are printed as-is, tuples of (color, text) 
-               are printed with the specified color.
+        *args: Mixed arguments - Color instances change the current color,
+               all other values are printed as text with the current color.
     
     Example:
-        color_print(('ansigreen', 'Hello '), 'world!')
-        # Prints "Hello world!" where "Hello " is green and "world!" is default color
+        cprint(C_BAD, "Error: ", C_IMPORTANT, msg, C_NORMAL, " attempt ", attempt)
+        # "Error: " in red, msg in orange, " attempt " and attempt in default color
     """
     formatted_parts = []
+    current_color = ''
     
     for arg in args:
-        if isinstance(arg, tuple) and len(arg) == 2:
-            # It's a (color, text) tuple
-            color, text = arg
-            formatted_parts.append((color, str(text)))
+        # Check if this is a Color instance
+        if isinstance(arg, Color):
+            # It's a color, update current color
+            current_color = arg.code
         else:
-            # It's a regular argument, convert to string with default formatting
-            formatted_parts.append(('', str(arg)))
+            # It's text, print with current color
+            formatted_parts.append((current_color, str(arg)))
     
     print_formatted_text(FormattedText(formatted_parts))
+
+
+class GitignoreMatcher:
+    """Matcher for gitignore-style patterns."""
+    
+    def __init__(self, patterns: List[str]):
+        """
+        Initialize with gitignore patterns.
+        
+        Args:
+            patterns: List of gitignore patterns
+        """
+        self.patterns = []
+        for pattern in patterns:
+            pattern = pattern.strip()
+            if not pattern or pattern.startswith('#'):
+                continue
+            
+            # Track if this is a negation pattern
+            negation = pattern.startswith('!')
+            if negation:
+                pattern = pattern[1:]
+            
+            # Track if this is a directory-only pattern
+            dir_only = pattern.endswith('/')
+            if dir_only:
+                pattern = pattern[:-1]
+            
+            self.patterns.append({
+                'pattern': pattern,
+                'negation': negation,
+                'dir_only': dir_only
+            })
+    
+    def matches(self, path: str, is_dir: bool = False) -> bool:
+        """
+        Check if a path matches any gitignore pattern.
+        
+        Args:
+            path: Path to check (relative to gitignore location)
+            is_dir: Whether the path is a directory
+            
+        Returns:
+            True if path should be ignored
+        """
+        # Process patterns in order, last match wins
+        ignored = False
+        
+        for p in self.patterns:
+            pattern = p['pattern']
+            
+            # Skip directory-only patterns for files
+            if p['dir_only'] and not is_dir:
+                continue
+            
+            # Match against the pattern
+            matched = False
+            
+            # If pattern contains '/', it's relative to the gitignore location
+            if '/' in pattern:
+                # Full path match
+                matched = fnmatch(path, pattern)
+            else:
+                # Match against any path component
+                matched = fnmatch(path, pattern) or fnmatch(path, f'**/{pattern}')
+                # Also check if any component matches
+                parts = Path(path).parts
+                for part in parts:
+                    if fnmatch(part, pattern):
+                        matched = True
+                        break
+            
+            if matched:
+                # If negation, unignore; otherwise ignore
+                ignored = not p['negation']
+        
+        return ignored
+
+
+def parse_gitignore(gitignore_path: Path) -> GitignoreMatcher:
+    """
+    Parse a .gitignore file and return a matcher.
+    
+    Args:
+        gitignore_path: Path to .gitignore file
+        
+    Returns:
+        GitignoreMatcher instance
+    """
+    if not gitignore_path.exists():
+        return GitignoreMatcher([])
+    
+    try:
+        patterns = gitignore_path.read_text().splitlines()
+        return GitignoreMatcher(patterns)
+    except Exception:
+        return GitignoreMatcher([])
+
+
+def call_llm(
+    api_key: str,
+    model: str,
+    messages: List[Dict[str, Any]],
+    tool_schemas: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """
+    Call the OpenRouter LLM API with retry logic.
+    
+    Args:
+        api_key: OpenRouter API key
+        model: Model identifier (e.g., "anthropic/claude-sonnet-4.5")
+        messages: List of message dicts with role and content
+        tool_schemas: List of tool schemas
+    
+    Returns:
+        Dict with:
+        - message: Assistant message dict
+        - cost: Cost in microdollars (integer)
+        - usage: Usage dict with token counts
+    
+    Raises:
+        Exception: If API call fails after 3 retries
+    """
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {api_key}',
+        'HTTP-Referer': 'https://github.com/vanviegen/maca',
+        'X-Title': 'MACA - Multi-Agent Coding Assistant'
+    }
+
+    data = {
+        'model': model,
+        'messages': messages,
+        'tools': tool_schemas,
+        'usage': {"include": True},
+        'tool_choice': 'required',
+    }
+    
+    # Retry up to 3 times
+    last_error = None
+    for retry in range(3):
+        start_time = time.time()
+
+        try:
+            req = urllib.request.Request(
+                "https://openrouter.ai/api/v1/chat/completions",
+                data=json.dumps(data).encode('utf-8'),
+                headers=headers
+            )
+            with urllib.request.urlopen(req) as response:
+                result = json.loads(response.read().decode('utf-8'))
+            
+            # Extract response
+            choice = result['choices'][0]
+            message = choice['message']
+
+            # Extract usage
+            usage = result.get('usage', {})
+            cost = int(usage.get('cost', 0) * 1_000_000)  # Convert dollars to microdollars
+            duration = time.time() - start_time
+
+            # Update global cumulative cost
+            global _cumulative_cost
+            _cumulative_cost += cost
+
+            # Log the call
+            log(tag='llm_call', model=model, cost=cost, prompt_tokens=usage['prompt_tokens'], completion_tokens=usage['completion_tokens'], duration=duration)
+
+            return {
+                'message': message,
+                'cost': cost,
+                'usage': usage
+            }
+            
+        except Exception as e:
+            last_error = e
+            if hasattr(e, 'read'):
+                error_body = e.read().decode('utf-8')
+            else:
+                error_body = str(e)
+            
+            if retry < 2:  # Don't log on the last retry
+                cprint(C_BAD, f"LLM error: {error_body}. Attempt {retry+1}/3.")
+                log(tag='error', error="LLM ERROR", retry=retry, message=str(error_body))
+    
+    # All retries failed
+    raise Exception(f"LLM call failed after 3 retries: {last_error}")
+
+
+def get_cumulative_cost() -> int:
+    """
+    Get the cumulative cost of all LLM calls in microdollars.
+    
+    Returns:
+        Cumulative cost in microdollars
+    """
+    return _cumulative_cost
+
+
+def compute_diff(old_text: str, new_text: str) -> Optional[str]:
+    """
+    Compute a simple unified diff between old and new text.
+    
+    Returns None if texts are identical.
+    """
+    if old_text == new_text:
+        return None
+    
+    import difflib
+    old_lines = old_text.splitlines(keepends=True)
+    new_lines = new_text.splitlines(keepends=True)
+    diff = difflib.unified_diff(old_lines, new_lines, lineterm='')
+    diff_text = ''.join(diff)
+    
+    return diff_text if diff_text else None

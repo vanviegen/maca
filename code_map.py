@@ -35,6 +35,14 @@ class Definition:
     uses: Set[str] = field(default_factory=set)
 
 
+@dataclass
+class FileInfo:
+    """Represents a file (code or non-code)."""
+    path: str
+    lines: Optional[int] = None  # For text files
+    bytes: Optional[int] = None  # For binary files or when line count unavailable
+
+
 class LanguageConfig:
     """Configuration for parsing a specific language."""
 
@@ -196,12 +204,78 @@ LANGUAGE_CONFIGS = {
 class CodeMapGenerator:
     """Generates code maps from source files in multiple languages."""
 
-    def __init__(self):
-        """Initialize the generator."""
+    def __init__(self, directory: Path):
+        """Initialize the generator with a directory."""
+        self.directory = directory
         self.definitions: Dict[str, Definition] = {}
+        self.file_infos: List[FileInfo] = []
         self.id_counter = 1
         self.parsers: Dict[str, any] = {}
 
+    def _is_binary_file(self, file_path: Path) -> bool:
+        """
+        Simple heuristic to detect if a file is binary.
+        
+        Checks for null bytes in the first 8KB.
+        """
+        try:
+            with open(file_path, 'rb') as f:
+                chunk = f.read(8192)
+                return b'\x00' in chunk
+        except Exception:
+            return True  # If we can't read it, assume binary
+
+    def _collect_all_files(self) -> None:
+        """
+        Collect all files in the directory, respecting .gitignore.
+        
+        Uses get_matching_files from tools module with .gitignore support.
+        """
+        # Import here to avoid circular dependency
+        import tools
+        
+        # Get all files, respecting .gitignore
+        all_files = tools.get_matching_files(
+            worktree_path=self.directory,
+            include="**",
+            exclude=None,
+            exclude_files=".gitignore"
+        )
+        
+        for file_path in all_files:
+            rel_path = file_path.relative_to(self.directory)
+            
+            # Check if binary
+            if self._is_binary_file(file_path):
+                # Binary file - store size in bytes
+                try:
+                    size = file_path.stat().st_size
+                    self.file_infos.append(FileInfo(
+                        path=str(rel_path),
+                        bytes=size
+                    ))
+                except Exception:
+                    pass
+            else:
+                # Text file - try to count lines
+                try:
+                    with open(file_path, 'r', encoding='utf-8', errors='strict') as f:
+                        line_count = sum(1 for _ in f)
+                    self.file_infos.append(FileInfo(
+                        path=str(rel_path),
+                        lines=line_count
+                    ))
+                except Exception:
+                    # If we can't read as text, treat as binary
+                    try:
+                        size = file_path.stat().st_size
+                        self.file_infos.append(FileInfo(
+                            path=str(rel_path),
+                            bytes=size
+                        ))
+                    except Exception:
+                        pass
+    
     def _load_language(self, lang_name: str) -> Optional[any]:
         """Load a tree-sitter language parser."""
         if lang_name in self.parsers:
@@ -417,35 +491,27 @@ class CodeMapGenerator:
                         resolved_uses.add(id_map[identifier])
                 definition.uses = resolved_uses
 
-    def generate_map(self, directory: str) -> str:
-        """Generate a code map for all supported files in the directory.
-
-        Args:
-            directory: Path to the directory to scan
+    def generate_map(self) -> str:
+        """Generate a code map for all files in the directory.
 
         Returns:
             String representation of the code map
         """
-        dir_path = Path(directory)
-        if not dir_path.exists():
-            raise ValueError(f"Directory does not exist: {directory}")
+        # Collect all files first
+        self._collect_all_files()
 
-        # Find all source files
+        # Find all source files that can be parsed
         source_files = []
-        for config in LANGUAGE_CONFIGS.values():
-            for ext in config.extensions:
-                source_files.extend(dir_path.rglob(f"*{ext}"))
+        for file_info in self.file_infos:
+            # Only try to parse text files with known extensions
+            if file_info.lines is not None:
+                file_path = self.directory / file_info.path
+                lang_config = self._detect_language(file_path)
+                if lang_config:
+                    source_files.append(file_path)
 
-        source_files = sorted(set(source_files))
-
-        # Parse all files
+        # Parse source files for code structures
         for file_path in source_files:
-            # Skip hidden directories and common exclusions
-            if any(part.startswith('.') for part in file_path.parts):
-                continue
-            if any(part in ['node_modules', '__pycache__', 'target', 'build', 'dist', 'vendor'] for part in file_path.parts):
-                continue
-
             lang_config = self._detect_language(file_path)
             if lang_config:
                 self._parse_file(file_path, lang_config)
@@ -454,10 +520,10 @@ class CodeMapGenerator:
         self._assign_ids_and_resolve_references()
 
         # Generate output
-        return self._format_output(dir_path)
+        return self._format_output()
 
-    def _format_output(self, base_path: Path) -> str:
-        """Format the definitions into a readable code map."""
+    def _format_output(self) -> str:
+        """Format the definitions and file info into a readable code map."""
         lines = []
 
         # Group definitions by file
@@ -467,45 +533,50 @@ class CodeMapGenerator:
                 by_file[definition.file_path] = []
             by_file[definition.file_path].append(definition)
 
+        # Create file path -> FileInfo mapping
+        file_info_map = {fi.path: fi for fi in self.file_infos}
+
         # Sort files
-        for file_path in sorted(by_file.keys()):
-            # Get relative path
-            try:
-                rel_path = Path(file_path).relative_to(base_path)
-            except ValueError:
-                rel_path = Path(file_path)
+        for file_info in sorted(self.file_infos, key=lambda f: f.path):
+            file_path_str = file_info.path
 
-            lines.append(str(rel_path))
+            # Show file with size info
+            if file_info.lines is not None:
+                lines.append(f"{file_path_str} [{file_info.lines} lines]")
+            else:
+                lines.append(f"{file_path_str} [{file_info.bytes} bytes]")
 
-            definitions = by_file[file_path]
+            # If this file has code definitions, show them
+            if file_path_str in by_file:
+                definitions = by_file[file_path_str]
 
-            # Separate containers (classes, structs, etc.) and top-level functions
-            containers = [d for d in definitions if d.type in ['class', 'struct', 'interface', 'enum', 'trait', 'module', 'protocol']]
-            functions = [d for d in definitions if d.type == 'function']
+                # Separate containers (classes, structs, etc.) and top-level functions
+                containers = [d for d in definitions if d.type in ['class', 'struct', 'interface', 'enum', 'trait', 'module', 'protocol']]
+                functions = [d for d in definitions if d.type == 'function']
 
-            # Sort by line number
-            containers.sort(key=lambda d: d.start_line)
-            functions.sort(key=lambda d: d.start_line)
+                # Sort by line number
+                containers.sort(key=lambda d: d.start_line)
+                functions.sort(key=lambda d: d.start_line)
 
-            # Output containers and their methods
-            for container in containers:
-                uses_str = f", uses {' '.join(sorted(container.uses))}" if container.uses else ""
-                lines.append(f"  {container.id} {container.type} {container.name} [lines {container.start_line}-{container.end_line}{uses_str}]")
+                # Output containers and their methods
+                for container in containers:
+                    uses_str = f", uses {' '.join(sorted(container.uses))}" if container.uses else ""
+                    lines.append(f"  {container.id} {container.type} {container.name} [lines {container.start_line}-{container.end_line}{uses_str}]")
 
-                # Find methods for this container
-                methods = [d for d in definitions if d.type == 'method' and d.parent == container.name]
-                methods.sort(key=lambda d: d.start_line)
+                    # Find methods for this container
+                    methods = [d for d in definitions if d.type == 'method' and d.parent == container.name]
+                    methods.sort(key=lambda d: d.start_line)
 
-                for method in methods:
-                    params_str = ", ".join(method.params) if method.params else ""
-                    uses_str = f", uses {' '.join(sorted(method.uses))}" if method.uses else ""
-                    lines.append(f"    {method.id} method {method.name}({params_str}) [lines {method.start_line}-{method.end_line}{uses_str}]")
+                    for method in methods:
+                        params_str = ", ".join(method.params) if method.params else ""
+                        uses_str = f", uses {' '.join(sorted(method.uses))}" if method.uses else ""
+                        lines.append(f"    {method.id} method {method.name}({params_str}) [lines {method.start_line}-{method.end_line}{uses_str}]")
 
-            # Output top-level functions
-            for func in functions:
-                params_str = ", ".join(func.params) if func.params else ""
-                uses_str = f", uses {' '.join(sorted(func.uses))}" if func.uses else ""
-                lines.append(f"  {func.id} function {func.name}({params_str}) [lines {func.start_line}-{func.end_line}{uses_str}]")
+                # Output top-level functions
+                for func in functions:
+                    params_str = ", ".join(func.params) if func.params else ""
+                    uses_str = f", uses {' '.join(sorted(func.uses))}" if func.uses else ""
+                    lines.append(f"  {func.id} function {func.name}({params_str}) [lines {func.start_line}-{func.end_line}{uses_str}]")
 
         return "\n".join(lines)
 
@@ -519,8 +590,12 @@ def generate_code_map(directory: str) -> str:
     Returns:
         String representation of the code map
     """
-    generator = CodeMapGenerator()
-    return generator.generate_map(directory)
+    dir_path = Path(directory)
+    if not dir_path.exists():
+        raise ValueError(f"Directory does not exist: {directory}")
+    
+    generator = CodeMapGenerator(dir_path)
+    return generator.generate_map()
 
 
 if __name__ == '__main__':

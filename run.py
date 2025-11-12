@@ -1,5 +1,7 @@
-from maca import MACA
+from maca import MACA, ContextError
 import argparse
+import os
+import sys
 
 parser = argparse.ArgumentParser(
     prog='maca',
@@ -12,6 +14,12 @@ parser.add_argument('-d', '--directory', default='.',
                     help='Project directory (default: current directory)')
 args = parser.parse_args()
 
+# Resolve API key at startup
+api_key = os.environ.get('OPENROUTER_API_KEY')
+if not api_key:
+    print("Error: OPENROUTER_API_KEY environment variable not set", file=sys.stderr)
+    sys.exit(1)
+
 # Create MACA instance and run
-maca = MACA(args.directory, ' '.join(args.task) if args.task else None, args.model)
+maca = MACA(args.directory, ' '.join(args.task) if args.task else None, args.model, api_key)
 maca.run()
