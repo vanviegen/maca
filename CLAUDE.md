@@ -25,30 +25,40 @@ export OPENROUTER_API_KEY="your-key-here"
 
 ## High-Level Architecture
 
-### Single-Agent System
-MACA provides a single AI agent that accomplishes coding tasks through tool calls.
+### Single-Tool System
+MACA uses a single-tool architecture: the AI agent calls only one tool (`respond`) with various parameters for different actions.
 
 ### Key Components
 
 **Git Worktree Isolation** (`git_ops.py`)
 - Each session gets isolated worktree at `.maca/<session_id>/tree/`
-- Session branch: `maca-<session_id>`
+- Session branch: `maca/<session_id>`
 - On merge: squash commits, preserve original chain in `maca/<descriptive-name>` branch
 - `.scratch/` directory for temporary files (git-ignored, never committed)
 
 **Tool System** (`tools.py`)
+- Single `respond` tool with multiple parameters
 - Reflection-based schema generation from Python functions
-- Single `_TOOLS` registry for all tools
-- `@tool` decorator registers tools (no arguments needed)
-- All tools are always available to the context
-- Tools return tuples: (immediate_result, context_summary)
+- `@tool` decorator registers the tool
+- Tool returns tuple: (immediate_result, context_summary)
 - All file paths are relative to worktree
+
+**Single Tool: respond**
+```python
+respond(
+    think_out_loud: str,                    # Brief reasoning
+    result_text: str,                       # What to report back
+    file_updates: Optional[List[FileUpdate]],     # File modifications
+    processors: Optional[List[Processor]],         # Data gathering sub-contexts
+    user_questions: Optional[List[Question]],      # Ask user for input
+    complete: bool = False                  # Mark task as complete
+)
+```
 
 **Context Management** (`maca.py`)
 - Single `MACA` class for the coding assistant
 - Loads system prompt from `prompt.md` (plain markdown, no headers)
 - Model specified via -m command line argument (default: anthropic/claude-sonnet-4.5)
-- Tracks and reports git HEAD changes between invocations
 - OpenRouter API used for all LLM calls (via `call_llm` in utils.py)
 - Automatic context size management:
   - When tool output >500 chars: shown once with ephemeral cache, then replaced with summary
@@ -57,18 +67,18 @@ MACA provides a single AI agent that accomplishes coding tasks through tool call
 
 **State Tracking** (AGENTS.md and code_map)
 - AGENTS.md and project code_map loaded at initialization as system messages
-- After each tool call that creates a git commit, both are regenerated
+- After each respond call that creates a git commit, both are regenerated
 - If either changed, a diff is added as a system message
-- When 8 state update messages accumulate, history is rewritten: all diffs removed and replaced with new baselines
-- This balances token caching (changes are visible) with context efficiency (don't keep growing forever)
+- When state changes exceed 25% of original size, history is rewritten: all diffs removed and replaced with new baselines
+- This balances token caching (changes are visible) with context efficiency
 
 **Session Logging** (`logger.py`)
-- Human-readable logs in `.maca/<session_id>/main.log`
+- Human-readable logs in `.maca/<session_id>.log`
 - HEREDOC format for multiline values
 - Tracks: LLM calls, tool invocations, tokens, costs, git changes
 
 **Docker Execution** (`docker_ops.py`)
-- Shell commands run in Docker/Podman containers
+- Shell commands run in Docker/Podman containers via processors
 - Default: `debian:stable` with build-essential, git, python3
 - Worktree mounted into container for file access
 - Auto-detects docker/podman at runtime
@@ -88,31 +98,41 @@ MACA provides a single AI agent that accomplishes coding tasks through tool call
 - Never committed to git
 
 **Gitignore Support**
-- `get_matching_files()` and `search()` tools support `exclude_files` parameter
+- File operations support `exclude_files` parameter in processors
 - Defaults to `['.gitignore']` to respect gitignore patterns
 - Uses `GitignoreMatcher` in utils.py for gitignore semantics (negation, directory patterns, etc.)
 
-**Tool Call Efficiency**
-- Batch operations: use `process_files` with batches parameter
-- Use glob patterns with exclude_files for flexible file filtering
-- Minimize tool calls for efficiency
+**file_updates Parameter**
+- Create, modify, or delete files
+- Operations: `overwrite` (full file write), `update` (search/replace), `rename` (move/delete)
+- Each update requires a `summary` field for context tracking
+- Operations execute in order: overwrite, update, rename
 
-**process_files**
-- Primary tool for reading and processing files
-- Takes `batches` parameter: `List[List[Dict[str, Any]]]`
-- Each dict specifies: `{path: str, start_line?: int, end_line?: int}`
-- Two modes based on batch count:
-  - **Single batch**: Load all files, return contents to main loop for coordinated changes
-  - **Multiple batches**: Process each batch with separate LLM call, each has access to all tools
-- Useful for both coordinated changes (single batch) and mechanical per-file changes (multiple batches)
+**processors Parameter**
+- Spawn sub-contexts for data gathering (reading files, shell commands, searches)
+- Each processor gets its own LLM call with specialized prompt (SUBPROMPT.md)
+- Model size selection: tiny, small, medium, large, huge
+- Processors can:
+  - Read files (`read_files`)
+  - Execute shell commands (`shell_commands`)
+  - Search file contents (`file_searches`)
+  - Make file updates (`file_updates` in processor's respond call)
+- Processors return `result_text` which is added to main context
+- File contents shown to processor only, never persist in main context
 
-**update_files**
-- Supports optional `summary` parameter for custom context summaries
-- When provided, summary is stored in long-term context instead of full tool output
+**user_questions Parameter**
+- Ask user for input when clarification needed
+- Support preset answers for better UX
+- Multiple questions can be asked in one call
+
+**complete Parameter**
+- Set to `true` when task is fully complete
+- Triggers user review and merge workflow
+- User can merge, continue, cancel, or delete
 
 **LLM Call Logic** (`utils.py`)
 - `call_llm()` function handles all LLM API interactions
-- Used by both `maca.py` main loop and `process_files` tool
+- Used by both `maca.py` main loop and processor execution
 - Handles: API call, error handling, logging, usage tracking
 - Returns dict with message, cost, and usage
 
@@ -120,15 +140,16 @@ MACA provides a single AI agent that accomplishes coding tasks through tool call
 
 **Core Python Modules**
 - `maca.py` - Main orchestration loop and MACA class
-- `tools.py` - Tool system with reflection-based schemas
+- `tools.py` - Single respond tool with helper functions
 - `git_ops.py` - Git worktree and branch management
 - `logger.py` - Human-readable session logs
 - `docker_ops.py` - Container execution for shell commands
 - `utils.py` - Utilities: cprint, gitignore parsing, LLM call logic, Color dataclass
 - `code_map.py` - Code structure extraction and file listing
 
-**System Prompt**
-- `prompt.md` - Plain markdown system prompt (no headers)
+**System Prompts**
+- `prompt.md` - Main system prompt for the assistant
+- `SUBPROMPT.md` - Specialized prompt for processors
 
 **Entry Points**
 - `maca` - Shell wrapper that creates venv and runs `maca.py`
@@ -138,37 +159,47 @@ MACA provides a single AI agent that accomplishes coding tasks through tool call
 
 ### Understanding the Flow
 1. User provides task
-2. Assistant executes tools to accomplish the task
-3. Each tool call creates a git commit
-4. After commits, AGENTS.md and code_map diffs are tracked (if changed)
-5. When complete, assistant calls `complete()` → user approves → squash merge to main
+2. Assistant calls `respond` tool with appropriate parameters
+3. If `file_updates` provided, files are modified
+4. If `processors` provided, sub-contexts gather data and return results
+5. If `user_questions` provided, user is prompted for input
+6. Git commit created if files were modified
+7. After commits, AGENTS.md and code_map diffs are tracked (if changed)
+8. When complete, assistant sets `complete=true` → user approves → squash merge to main
 
 ### Key Design Principles
+- **Single Tool**: All actions through one `respond` tool with different parameters
 - **Isolation**: Each session in separate worktree/branch
-- **Efficiency**: Batch operations, minimize tool calls
-- **Traceability**: Git commits per tool, human-readable logs, state diffs
+- **Efficiency**: Batch operations in one respond call
+- **Traceability**: Git commits per respond call, human-readable logs, state diffs
 - **Safety**: Docker for command execution
 - **Autonomy**: Works independently with minimal back-and-forth
-- **Context Management**: State tracking with periodic history rewrites for efficiency
+- **Context Management**: Processors keep file contents out of main context
 
 ### Testing and Debugging
-- Session logs in `.maca/<session_id>/main.log`
-- Git history shows each tool's changes
+- Session logs in `.maca/<session_id>.log`
+- Git history shows each respond call's changes
 - `.scratch/` for temporary analysis/debugging files
 
 ## Code Modification Guidelines
 
-### Adding New Tools
-1. Define function in `tools.py` with proper type hints
-2. Add comprehensive docstring (generates schema description)
-3. Decorate with `@tool` (no arguments)
-4. Return tuple: (immediate_result, context_summary)
-5. Schema auto-generated via reflection
-6. Tool is automatically available to all contexts
+### Modifying the Tool
+- The `respond` tool is defined in `tools.py`
+- Parameters are defined as TypedDict classes
+- Helper functions handle specific operations (apply_file_updates, execute_processor, etc.)
+- Tool returns tuple: (immediate_result, context_summary)
+- Schema auto-generated via reflection
 
-### Modifying the Prompt
-- `prompt.md` is plain markdown (no headers)
-- Changes to `prompt.md` affect new sessions
+### Adding New Processor Capabilities
+1. Define new TypedDict for the data structure
+2. Add parameter to Processor TypedDict
+3. Implement execution logic in `execute_processor()`
+4. Update SUBPROMPT.md to document the capability
+
+### Modifying the Prompts
+- `prompt.md` is the main system prompt (plain markdown, no headers)
+- `SUBPROMPT.md` is the processor system prompt
+- Changes to prompts affect new sessions
 - Keep prompts focused and actionable
 
 ### Git Operations
@@ -176,3 +207,34 @@ MACA provides a single AI agent that accomplishes coding tasks through tool call
 - Never manually manipulate `.maca/` directory
 - Worktree paths returned by `create_session_worktree()`
 - All commits exclude `.scratch/` and `.maca/` directories
+
+### Type Definitions
+
+Key TypedDict classes in `tools.py`:
+
+- **FileUpdate**: Specify file operations (overwrite/update/rename)
+- **SearchReplaceOp**: Search/replace operation within a file
+- **Processor**: Processor specification with model, assignment, and operations
+- **FileRead**: Read file or file range
+- **ShellCommand**: Execute command in container
+- **FileSearch**: Search file contents with regex
+- **Question**: Ask user a question with optional preset answers
+
+## Architecture Benefits
+
+**Single-Tool Architecture:**
+- Cleaner, more intentional API
+- Single "think → action → result" pattern
+- Better control over context
+- Easier to reason about tool usage
+
+**Processors:**
+- Replace old `process_files` tool but more general
+- Support reading files, shell commands, and searches
+- Keep file contents out of main context
+- Model size selection for cost optimization
+
+**Integrated Operations:**
+- File updates, processors, and questions in one call
+- Batch related operations efficiently
+- Atomic commits per logical action

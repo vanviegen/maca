@@ -120,6 +120,7 @@ class MACA:
         })
 
     def update_state(self):
+        """Update state tracking for AGENTS.md and code_map."""
         agents_md_path = self.repo_root / 'AGENTS.md'
         state = {
             "AGENTS.md": agents_md_path.read_text() if agents_md_path.exists() else "--None yet--",
@@ -148,14 +149,13 @@ class MACA:
                 for idx in reversed(self.state_message_indices):
                     if idx < len(self._messages):
                         del self._messages[idx]
-                
+
                 # Clear the tracking list
                 self.state_message_indices.clear()
                 self.state_delta_size = 0
                 self.prev_state = None
 
         if not self.prev_state:
-
             for name, new in state.items():
                 self.add_message({
                     'role': 'user',
@@ -167,8 +167,12 @@ class MACA:
 
     def add_message(self, message: Dict):
         """Add a message dict to the context and the log."""
-        log(tag='message', **message)            
+        log(tag='message', **message)
         self._messages.append(message)
+
+    def _check_state_changes(self):
+        """Check if AGENTS.md or code_map changed and update state."""
+        self.update_state()
 
     def process_tool_call_from_message(self, message: Dict) -> tuple[bool, Optional[tuple]]:
         """
@@ -193,24 +197,28 @@ class MACA:
         tool_name = tool_call['function']['name']
         tool_args = json.loads(tool_call['function']['arguments'])
 
+        # Should always be 'respond' in new architecture
+        if tool_name != 'respond':
+            raise ContextError(f"Unexpected tool call: {tool_name} (expected 'respond')")
+
         # Log tool call
         log(tag='tool_call', tool=tool_name, args=str(tool_args))
 
         # Print tool info
-        cprint(C_GOOD, '→ ', C_IMPORTANT, f"{tool_name}({tool_args})")
+        think_out_loud = tool_args.get('think_out_loud', '')
+        cprint(C_GOOD, '→ ', C_IMPORTANT, f"respond: {think_out_loud}")
 
         # Execute tool
         tool_start = time.time()
         try:
-            immediate_result, context_summary = tools.execute_tool(
-                tool_name,
-                tool_args,
+            immediate_result, context_summary = tools.respond(
+                **tool_args,
                 maca=self
             )
             tool_duration = time.time() - tool_start
         except Exception as err:
             immediate_result = {"error": str(err)}
-            context_summary = f"{tool_name}: error"
+            context_summary = f"respond: error"
             tool_duration = time.time() - tool_start
 
         # Check if this is a completion signal
@@ -259,10 +267,10 @@ class MACA:
             })
 
         # Check for git changes and commit if needed
-        commit_msg = tool_name
+        commit_msg = "respond"
         if git_ops.commit_changes(self.worktree_path, commit_msg):
             cprint(C_GOOD, '✓ Committed changes')
-            
+
             # Check if AGENTS.md or code_map changed
             self._check_state_changes()
 
@@ -302,7 +310,7 @@ class MACA:
                 api_key=self.api_key,
                 model=self.model,
                 messages=self._messages,
-                tool_schemas=tools.TOOL_SCHEMAS.values(),
+                tool_schemas=list(tools.TOOL_SCHEMAS.values()),
             )
 
             # Add assistant message to history
@@ -352,3 +360,28 @@ class MACA:
                 self.update_state()
                 self.add_message({"role": "user", "content": prompt})
                 self.run_main_loop()
+
+
+if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser(description='MACA - Multi-Agent Coding Assistant')
+    parser.add_argument('task', nargs='?', help='Initial task description')
+    parser.add_argument('-m', '--model', help='Model to use (default: anthropic/claude-sonnet-4.5)')
+    parser.add_argument('-d', '--directory', default='.', help='Project directory (default: current)')
+    args = parser.parse_args()
+
+    # Get API key from environment
+    api_key = os.environ.get('OPENROUTER_API_KEY')
+    if not api_key:
+        cprint(C_BAD, 'Error: OPENROUTER_API_KEY environment variable not set')
+        sys.exit(1)
+
+    # Create and run MACA
+    maca = MACA(
+        directory=args.directory,
+        task=args.task,
+        model=args.model,
+        api_key=api_key
+    )
+    maca.run()
