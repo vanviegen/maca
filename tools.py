@@ -2,23 +2,28 @@
 """Tool system with reflection-based schema generation."""
 
 from dataclasses import dataclass
-import inspect
-import re
-import json
-import random
-from fnmatch import fnmatch
+from pathlib import Path
 from prompt_toolkit import prompt as pt_prompt
 from prompt_toolkit.shortcuts import choice
-from pathlib import Path
-from typing import get_type_hints, get_origin, get_args, Any, Dict, List, Union, Optional
-
-from utils import cprint, C_GOOD, C_BAD, C_NORMAL, C_IMPORTANT, C_INFO
-from docker_ops import run_in_container
-import git_ops
+from typing import get_type_hints, get_origin, get_args, Any, Dict, List, Union, Optional, TypedDict
+import inspect
 import json
-import time
-import urllib.request
-import os
+import json
+import re
+
+from utils import cprint, C_GOOD, C_BAD, C_NORMAL, C_IMPORTANT, C_INFO, get_matching_files, call_llm
+from docker_ops import run_in_container        
+import git_ops
+
+
+# Model size mappings for process_files
+MODELS = {
+    'tiny': 'qwen/qwen3-coder-30b-a3b-instruct',
+    'small': 'moonshotai/kimi-linear-48b-a3b-instruct',
+    'medium': 'x-ai/grok-code-fast-1',
+    'large': 'anthropic/claude-sonnet-4.5',
+    'huge': 'anthropic/claude-opus-4.1'
+}
 
 
 def check_path(path: str, worktree_path: Path) -> str:
@@ -50,102 +55,8 @@ def check_path(path: str, worktree_path: Path) -> str:
     return resolved_path
 
 
-def get_matching_files(
-    worktree_path: Path,
-    include: Optional[Union[str, List[str]]] = "**",
-    exclude: Optional[Union[str, List[str]]] = ".*",
-    exclude_files: Optional[Union[str, List[str]]] = None
-) -> List[Path]:
-    """
-    Get list of files matching include/exclude glob patterns.
-
-    Args:
-        worktree_path: Path to the worktree
-        include: Glob pattern(s) to include. Can be None, a string, or list of strings.
-                 Defaults to "**" (all files).
-        exclude: Glob pattern(s) to exclude. Can be None, a string, or list of strings.
-                 Defaults to ".*" (hidden files/directories).
-        exclude_files: File(s) containing exclude patterns (e.g., ".gitignore"). Can be None, a string, or list of strings.
-                       Defaults to None. When ".gitignore" is included, gitignore semantics are applied.
-
-    Returns:
-        List of Path objects for matching files (not directories)
-    """
-    from utils import parse_gitignore
-    
-    worktree = Path(worktree_path)
-
-    # Normalize include patterns
-    if include is None:
-        include_patterns = ["**"]
-    elif isinstance(include, str):
-        include_patterns = [include]
-    else:
-        include_patterns = include
-
-    # Normalize exclude patterns
-    if exclude is None:
-        exclude_patterns = []
-    elif isinstance(exclude, str):
-        exclude_patterns = [exclude]
-    else:
-        exclude_patterns = exclude
-
-    # Normalize exclude_files
-    if exclude_files is None:
-        exclude_file_list = []
-    elif isinstance(exclude_files, str):
-        exclude_file_list = [exclude_files]
-    else:
-        exclude_file_list = exclude_files
-
-    # Parse .gitignore if present in exclude_files
-    gitignore_matcher = None
-    if '.gitignore' in exclude_file_list:
-        gitignore_path = worktree / '.gitignore'
-        gitignore_matcher = parse_gitignore(gitignore_path)
-
-    # Collect all matching files
-    matching_files = set()
-
-    for pattern in include_patterns:
-        for path in worktree.glob(pattern):
-            if path.is_file():
-                matching_files.add(path)
-
-    # Filter out excluded files
-    filtered_files = []
-    for file_path in matching_files:
-        rel_path_str = str(file_path.relative_to(worktree))
-
-        # Check gitignore first
-        if gitignore_matcher:
-            if gitignore_matcher.matches(rel_path_str, is_dir=False):
-                continue
-
-        # Check if any exclude pattern matches
-        excluded = False
-        for exc_pattern in exclude_patterns:
-            # Check if pattern matches any part of the path
-            if fnmatch(rel_path_str, exc_pattern):
-                excluded = True
-                break
-            # Also check individual path components
-            for part in Path(rel_path_str).parts:
-                if fnmatch(part, exc_pattern):
-                    excluded = True
-                    break
-            if excluded:
-                break
-
-        if not excluded:
-            filtered_files.append(file_path)
-
-    return sorted(filtered_files)
-
-
 # Tool registry - single registry for all tools
-_TOOLS = {}
+TOOL_SCHEMAS = {}
 
 def tool(func):
     """
@@ -154,34 +65,67 @@ def tool(func):
     Tools are registered by name and schemas are generated on-demand
     based on the context that uses them.
     """
-    _TOOLS[func.__name__] = {
-        'function': func
-    }
-    return func
+    TOOL_SCHEMAS[func.__name__] = generate_tool_schema(func)
 
 
 def python_type_to_json_type(py_type) -> Dict:
     """Convert Python type hint to JSON schema type."""
     origin = get_origin(py_type)
 
-    # Handle Optional (Union with None)
+    # Handle TypedDict
+    if hasattr(py_type, '__annotations__'):
+        properties = {}
+        required_keys = []
+        
+        for field_name, field_type in get_type_hints(py_type).items():
+            properties[field_name] = python_type_to_json_type(field_type)
+            
+            # Field is required if it's not wrapped in Optional
+            field_origin = get_origin(field_type)
+            if field_origin is Union:
+                # Check if None is in the union args
+                if type(None) not in get_args(field_type):
+                    required_keys.append(field_name)
+            else:
+                # Not a Union, so it's required
+                required_keys.append(field_name)
+        
+        schema = {
+            'type': 'object',
+            'properties': properties,
+            'additionalProperties': False
+        }
+        if required_keys:
+            schema['required'] = required_keys
+        return schema
+
+    # Handle Union types
     if origin is Union:
         args = get_args(py_type)
-        # Filter out None
+        has_none = type(None) in args
         non_none_args = [arg for arg in args if arg is not type(None)]
-        if len(non_none_args) == 1:
-            # It's Optional[T], extract T
-            return python_type_to_json_type(non_none_args[0])
-        else:
-            # Complex Union, default to string
-            return {'type': 'string'}
+        
+        # Convert each union member to a schema
+        schemas = []
+        for arg in non_none_args:
+            schemas.append(python_type_to_json_type(arg))
+        
+        if has_none:
+            schemas.append({'type': 'null'})
+        
+        # If only one schema (plus maybe null), simplify
+        if len(schemas) == 1:
+            return schemas[0]
+        
+        # Multiple schemas - use anyOf
+        return {'anyOf': schemas}
 
     # Handle List
     if origin is list:
         args = get_args(py_type)
         if args:
-            item_type = python_type_to_json_type(args[0])
-            return {'type': 'array', 'items': item_type}
+            item_schema = python_type_to_json_type(args[0])
+            return {'type': 'array', 'items': item_schema}
         return {'type': 'array'}
 
     # Handle Dict
@@ -197,6 +141,8 @@ def python_type_to_json_type(py_type) -> Dict:
         return {'type': 'number'}
     elif py_type == bool:
         return {'type': 'boolean'}
+    elif py_type == type(None):
+        return {'type': 'null'}
     elif py_type == Any:
         return {}
     else:
@@ -204,7 +150,7 @@ def python_type_to_json_type(py_type) -> Dict:
         return {'type': 'string'}
 
 
-def generate_tool_schema(func, add_rationale: bool = False) -> Dict:
+def generate_tool_schema(func) -> Dict:
     """Generate OpenAI-compatible function schema from a Python function."""
     sig = inspect.signature(func)
     type_hints = get_type_hints(func)
@@ -244,7 +190,8 @@ def generate_tool_schema(func, add_rationale: bool = False) -> Dict:
     required = []
 
     for param_name, param in sig.parameters.items():
-        if param_name == 'self' or param_name == 'rationale':
+        # Skip internal parameters
+        if param_name in ('self', 'rationale', 'maca'):
             continue
 
         param_schema = python_type_to_json_type(type_hints.get(param_name, str))
@@ -259,13 +206,12 @@ def generate_tool_schema(func, add_rationale: bool = False) -> Dict:
         if param.default == inspect.Parameter.empty:
             required.append(param_name)
 
-    # Add automatic rationale parameter if requested
-    if add_rationale:
-        properties['rationale'] = {
-            'type': 'string',
-            'description': '**Very brief** (max 20 words) explanation of why this tool is being called and what you expect to accomplish'
-        }
-        required.append('rationale')
+    # Add automatic rationale parameter
+    properties['rationale'] = {
+        'type': 'string',
+        'description': '**Very brief** (max 20 words) explanation of why this tool is being called and what you expect to accomplish'
+    }
+    required.append('rationale')
 
     return {
         'type': 'function',
@@ -282,52 +228,13 @@ def generate_tool_schema(func, add_rationale: bool = False) -> Dict:
     }
 
 
-def get_tool_schemas(tool_names: List[str], add_rationale: bool = False) -> List[Dict]:
-    """
-    Get tool schemas for the specified tool names.
-
-    Args:
-        tool_names: List of tool names to generate schemas for
-        add_rationale: Whether to add rationale parameter to all tools
-
-    Returns:
-        List of tool schemas
-    """
-    schemas = []
-    for tool_name in tool_names:
-        if tool_name not in _TOOLS:
-            raise ValueError(f"Unknown tool: {tool_name}")
-
-        tool_info = _TOOLS[tool_name]
-        schema = generate_tool_schema(tool_info['function'], add_rationale=add_rationale)
-        schemas.append(schema)
-
-    return schemas
-
-
-def get_all_tool_schemas(add_rationale: bool = False) -> List[Dict]:
-    """
-    Get schemas for all registered tools.
-
-    Args:
-        add_rationale: Whether to add rationale parameter to all tools
-
-    Returns:
-        List of all tool schemas
-    """
-    return get_tool_schemas(list(_TOOLS.keys()), add_rationale=add_rationale)
-
-
-def execute_tool(tool_name: str, arguments: Dict, worktree_path: Path, repo_root: Path, history, maca) -> Any:
+def execute_tool(tool_name: str, arguments: Dict, maca) -> Any:
     """
     Execute a tool with the given arguments.
 
     Args:
         tool_name: Name of the tool to execute
         arguments: Tool arguments
-        worktree_path: Path to the worktree
-        repo_root: Path to the repository root
-        history: Prompt history for user input
         maca: MACA instance for accessing context
 
     Returns:
@@ -335,19 +242,16 @@ def execute_tool(tool_name: str, arguments: Dict, worktree_path: Path, repo_root
         - immediate_result: Full data for next LLM call
         - context_summary: Brief summary for long-term context
     """
-    if tool_name not in _TOOLS:
+    if tool_name not in TOOL_SCHEMAS:
         raise ValueError(f"Unknown tool: {tool_name}")
 
-    tool_info = _TOOLS[tool_name]
+    tool_info = TOOL_SCHEMAS[tool_name]
     func = tool_info['function']
 
     # Remove rationale from arguments before calling (it's just for logging)
     exec_args = {k: v for k, v in arguments.items() if k != 'rationale'}
 
-    # Add context parameters
-    exec_args['worktree_path'] = worktree_path
-    exec_args['repo_root'] = repo_root
-    exec_args['history'] = history
+    # Add maca instance
     exec_args['maca'] = maca
 
     result = func(**exec_args)
@@ -363,145 +267,195 @@ def execute_tool(tool_name: str, arguments: Dict, worktree_path: Path, repo_root
 class ReadyResult:
     result: Any
 
+
+
 # ==============================================================================
 # TOOLS
 # ==============================================================================
 
-def _read_files_helper(file_paths: List[str], worktree_path: Path, max_lines: int = None) -> List[Dict[str, Any]]:
-    """
-    Helper function to read files. Not exposed as a tool.
+# Type definitions for update_files
+class SearchReplaceOp(TypedDict, total=False):
+    """A single search/replace operation."""
+    search: str
+    replace: str
+    min_match: Optional[int]  # Optional, defaults to 1
+    max_match: Optional[int]  # Optional, defaults to 1
 
-    Args:
-        file_paths: List of file paths to read
-        worktree_path: Path to the worktree
-        max_lines: Maximum number of lines to read per file (None = all lines)
 
-    Returns:
-        List of dicts with file_path, data, and metadata for each file
-    """
-    results = []
+class FileUpdate(TypedDict, total=False):
+    """Specification for updating a single file."""
+    path: str
+    overwrite: Optional[str]  # Overwrite file with this content
+    update: Optional[List[SearchReplaceOp]]  # Apply search/replace operations
+    rename: Optional[str]  # Rename to this path (empty string means delete)
+    summary: str  # One-sentence description of changes
 
-    for file_path in file_paths:
-        full_path = check_path(file_path, worktree_path)
-
-        if not full_path.exists():
-            results.append({
-                'file_path': file_path,
-                'error': 'File not found',
-                'data': ''
-            })
-            continue
-
-        try:
-            with open(full_path, 'r') as f:
-                lines = f.readlines()
-
-            total_lines = len(lines)
-
-            if max_lines is not None:
-                selected_lines = lines[:max_lines]
-                data = ''.join(selected_lines)
-                remaining = max(0, total_lines - max_lines)
-            else:
-                data = ''.join(lines)
-                remaining = 0
-
-            results.append({
-                'file_path': file_path,
-                'data': data,
-                'total_lines': total_lines,
-                'remaining_lines': remaining
-            })
-        except Exception as e:
-            results.append({
-                'file_path': file_path,
-                'error': str(e),
-                'data': ''
-            })
-
-    return results
 
 
 @tool
 def update_files(
-    updates: List[Dict[str, str]],
-    summary: Optional[str] = None,
-    worktree_path: Path = None,
-    repo_root: Path = None,
-    history = None,
+    updates: List[FileUpdate],
     maca = None
 ) -> tuple[str, str]:
     """
-    Update one or more files with new content.
+    Update, create, or delete one or more files.
 
-    Each update can either:
-    1. Write entire file: {"file_path": "path/to/file", "data": "new content"}
-    2. Search and replace: {"file_path": "path/to/file", "old_data": "search", "new_data": "replacement", "allow_multiple": false}
+    Each update specifies a file path and optional operations to perform.
+    Operations are executed in order: overwrite, update, rename.
+    Multiple operations can be specified for a single file.
+
+    **Overwrite file (create or replace):**
+    ```python
+    {"path": "path/to/file", "overwrite": "new content", "summary": "Created config file"}
+    ```
+
+    **Delete file:**
+    ```python
+    {"path": "path/to/file", "rename": "", "summary": "Removed deprecated module"}
+    ```
+
+    **Rename/move file:**
+    ```python
+    {"path": "old/path", "rename": "new/path", "summary": "Moved file to new location"}
+    ```
+
+    **Search and replace operations:**
+    ```python
+    {
+        "path": "path/to/file",
+        "update": [
+            {
+                "search": "old text",
+                "replace": "new text",
+                "min_match": 1,  # Optional, default 1
+                "max_match": 1   # Optional, default 1
+            }
+        ],
+        "summary": "Updated function names to new convention"
+    }
+    ```
+
+    **Multiple operations:**
+    ```python
+    {
+        "path": "path/to/file",
+        "update": [{"search": "initial", "replace": "final"}],
+        "rename": "new/path",
+        "summary": "Created, updated, and moved file"
+    }
+    ```
+
+    **No operations (logging only):**
+    ```python
+    {"path": "path/to/file", "summary": "No legacy code found"}
+    ```
+
+    For search/replace operations:
+    - `min_match` and `max_match` default to 1 (exactly one match required)
+    - If match count is outside [min_match, max_match], an error is returned
+    - All operations in a file are validated before any are applied
 
     Args:
-        updates: List of update specifications
-        summary: Optional custom summary for long-term context. If not provided, a default summary is generated.
+        updates: List of file update specifications. Each update must include:
+            - path: File path (required)
+            - overwrite: Optional string to overwrite file contents
+            - update: Optional list of search/replace operations
+            - rename: Optional new path (empty string to delete)
+            - summary: One-sentence description of changes (required)
 
     Returns:
-        Immediate: "OK"
-        Long-term context: Custom summary or default listing files modified/created
+        Immediate: "OK" or error details if search/replace validations fail
+        Long-term context: Combines per-file summaries
     """
-    modified_files = []
-    created_files = []
+    file_summaries = []
+    errors = []
 
     for update in updates:
-        file_path = update['file_path']
-        full_path = check_path(file_path, worktree_path)
-
-        # Track if file exists before update
+        file_path = update['path']
+        overwrite = update.get('overwrite')
+        update_ops = update.get('update')
+        rename_to = update.get('rename')
+        file_summary = update['summary']
+        
+        full_path = check_path(file_path, maca.worktree_path)
         existed_before = full_path.exists()
 
-        # Ensure parent directory exists
-        full_path.parent.mkdir(parents=True, exist_ok=True)
+        # Execute operations in order: overwrite, update, rename
 
-        if 'data' in update:
-            # Full file write
-            full_path.write_text(update['data'])
-            if existed_before:
-                modified_files.append(file_path)
-            else:
-                created_files.append(file_path)
-        elif 'old_data' in update and 'new_data' in update:
-            # Search and replace
+        # 1. Overwrite operation
+        if overwrite is not None:
+            # Ensure parent directory exists
+            full_path.parent.mkdir(parents=True, exist_ok=True)
+            full_path.write_text(overwrite)
+
+        # 2. Update (search/replace) operations
+        if update_ops is not None:
             if not full_path.exists():
-                raise ValueError(f"Cannot search/replace in non-existent file: {file_path}")
+                errors.append(f"{file_path}: Cannot apply search/replace to non-existent file")
+                continue
 
             content = full_path.read_text()
-            old_data = update['old_data']
-            new_data = update['new_data']
-            allow_multiple = update.get('allow_multiple', False)
-
-            count = content.count(old_data)
-            if count == 0:
-                raise ValueError(f"Search string not found in {file_path}")
-            elif count > 1 and not allow_multiple:
-                raise ValueError(f"Search string appears {count} times in {file_path}, but allow_multiple=false")
-
-            if allow_multiple:
-                content = content.replace(old_data, new_data)
-            else:
-                content = content.replace(old_data, new_data, 1)
-
+            
+            # Validate all operations first
+            operation_errors = []
+            for i, op in enumerate(update_ops):
+                search_str = op['search']
+                min_match = op.get('min_match', 1)
+                max_match = op.get('max_match', 1)
+                
+                count = content.count(search_str)
+                
+                if count < min_match:
+                    operation_errors.append(
+                        f"  Operation {i+1}: Found {count} matches, expected at least {min_match}\n"
+                        f"    Search: {json.dumps(search_str)}"
+                    )
+                elif count > max_match:
+                    operation_errors.append(
+                        f"  Operation {i+1}: Found {count} matches, expected at most {max_match}\n"
+                        f"    Search: {json.dumps(search_str)}"
+                    )
+            
+            if operation_errors:
+                errors.append(f"{file_path}:\n" + "\n".join(operation_errors))
+                continue
+            
+            # Apply all operations
+            for op in update_ops:
+                search_str = op['search']
+                replace_str = op['replace']
+                content = content.replace(search_str, replace_str)
+            
             full_path.write_text(content)
-            modified_files.append(file_path)
-        else:
-            raise ValueError(f"Invalid update specification: {update}")
 
-    # Use custom summary if provided, otherwise generate default
-    if summary:
-        final_summary = f"update_files: {summary}"
-    else:
-        summary_parts = []
-        if modified_files:
-            summary_parts.append(f"modified {', '.join(modified_files)}")
-        if created_files:
-            summary_parts.append(f"created {', '.join(created_files)}")
-        final_summary = "update_files: " + "; ".join(summary_parts) if summary_parts else "update_files: no changes"
+        # 3. Rename operation (includes delete)
+        if rename_to is not None:
+            if rename_to == "":
+                # Delete file
+                if full_path.exists():
+                    full_path.unlink()
+                else:
+                    errors.append(f"{file_path}: Cannot delete non-existent file")
+                    continue
+            else:
+                # Rename/move file
+                if not full_path.exists():
+                    errors.append(f"{file_path}: Cannot rename non-existent file")
+                    continue
+                
+                new_path = check_path(rename_to, maca.worktree_path)
+                new_path.parent.mkdir(parents=True, exist_ok=True)
+                full_path.rename(new_path)
+
+        file_summaries.append(file_summary)
+
+    # If there were errors, return them
+    if errors:
+        error_msg = "Search/replace validation errors:\n\n" + "\n\n".join(errors)
+        return (error_msg, "update_files: validation errors")
+
+    # Build final summary from per-file summaries
+    final_summary = "update_files: " + "; ".join(file_summaries) if file_summaries else "update_files: no changes"
 
     return ("OK", final_summary)
 
@@ -515,9 +469,6 @@ def search(
     max_results: int = 10,
     lines_before: int = 2,
     lines_after: int = 2,
-    worktree_path: Path = None,
-    repo_root: Path = None,
-    history = None,
     maca = None
 ) -> tuple[List[Dict[str, Any]], str]:
     """
@@ -540,14 +491,14 @@ def search(
     if exclude_files is None:
         exclude_files = ['.gitignore']
     
-    worktree = Path(worktree_path)
+    worktree = Path(maca.worktree_path)
     results = []
     content_pattern = re.compile(regex)
     files_with_matches = set()
 
     # Get matching files using helper
     matching_files = get_matching_files(
-        worktree_path=worktree_path, 
+        worktree_path=maca.worktree_path, 
         include=include, 
         exclude=exclude,
         exclude_files=exclude_files
@@ -583,6 +534,19 @@ def search(
     summary = f"search: found {len(results)} matches in {len(files_with_matches)} files"
     return (results, summary)
 
+# IDEA:
+# Only a single tool call with these arguments:
+# - think_out_loud: str
+# - optional file_updates: List[FileUpdate]
+# - optional processors: {model: str, assignment: str, read_files: List[FileReads], shell_commands: List[ShellCommand], file_searches: List[Search]}[]
+# - optional user_questions
+# - result_text: str
+
+# The 'processors' replaces file processors. It gets its own context, with its own specialized prompt (SUBPROMPT.md).
+# The task can either be to..
+# - make certain modifications to files based on the data
+# - return a specific part of the data that was collected
+# - return the answer to a question, based on the data
 
 @tool
 def shell(
@@ -591,9 +555,6 @@ def shell(
     docker_runs: List[str] = None,
     head: int = 50,
     tail: int = 50,
-    worktree_path: Path = None,
-    repo_root: Path = None,
-    history = None,
     maca = None
 ) -> tuple[Dict[str, Any], str]:
     """
@@ -616,8 +577,8 @@ def shell(
 
     result = run_in_container(
         command=command,
-        worktree_path=worktree_path,
-        repo_root=repo_root,
+        worktree_path=maca.worktree_path,
+        repo_root=maca.repo_root,
         docker_image=docker_image,
         docker_runs=docker_runs,
         head=head,
@@ -645,9 +606,6 @@ class Question:
 @tool
 def ask_user_questions(
     questions: List[Dict[str, Any]],
-    worktree_path: Path = None,
-    repo_root: Path = None,
-    history = None,
     maca = None
 ) -> tuple[str, str]:
     """
@@ -682,12 +640,12 @@ def ask_user_questions(
             )
 
             if result == '__custom__':
-                answer = pt_prompt(f"> ", history=history)
+                answer = pt_prompt(f"> ", history=maca.history)
             else:
                 answer = result
         else:
             # Simple text input
-            answer = pt_prompt(f"Question {i}/{len(questions)}: {prompt_text}\n> ", history=history)
+            answer = pt_prompt(f"Question {i}/{len(questions)}: {prompt_text}\n> ", history=maca.history)
         
         answers.append(f"Q{i}: {prompt_text}\nA{i}: {answer}")
     
@@ -701,10 +659,7 @@ def ask_user_questions(
 def process_files(
     instructions: str,
     batches: List[List[Dict[str, Any]]],
-    model: str = "anthropic/claude-sonnet-4.5",
-    worktree_path: Path = None,
-    repo_root: Path = None,
-    history = None,
+    model: str = "large",
     maca = None
 ) -> Dict[str, Any]:
     """
@@ -714,14 +669,12 @@ def process_files(
     file contents never remain in the main context - they're shown once with ephemeral cache,
     then replaced with a summary.
 
-    **When to use single vs multiple batches:**
-    - **Single batch**: Use when files need coordinated changes or analysis together.
-      One LLM call processes all files and can make coordinated tool calls.
-    - **Multiple batches**: Use when making mechanical/repetitive changes to many files where each 
-      file (or small group) can be processed independently. Each batch gets its own LLM call.
+    **Batches:**
+    Each batch is a list of file specifications. Use a single batch when files need coordinated 
+    changes or analysis together. Use multiple batches when making mechanical/repetitive changes 
+    to many files where each file (or small group) can be processed independently.
 
-    **Batch structure:**
-    Each batch is a list of file specifications:
+    Batch structure - each batch is a list of file specs:
     ```
     {
         "path": "relative/path/to/file.py",
@@ -730,37 +683,31 @@ def process_files(
     }
     ```
 
+    **Model Selection:**
+    Choose model size based on task complexity (cost increases ~5x per size):
+    - **tiny**: Simple mechanical changes (e.g., adding docstrings, formatting)
+    - **small**: Straightforward refactoring (e.g., renaming variables, simple logic fixes)
+    - **medium**: Moderate complexity tasks (e.g., implementing simple features, bug fixes)
+    - **large** (default): Complex analysis and coordinated changes (e.g., architectural refactoring)
+    - **huge**: Most complex tasks requiring deep reasoning (e.g., security audits, complex migrations)
+
     **Examples:**
     ```python
-    # Single batch - process 3 related files together
-    batches=[
-        [
-            {"path": "main.py"},
-            {"path": "utils.py"},
-            {"path": "config.py"}
-        ]
-    ]
+    # Single batch - coordinated analysis
+    batches=[[{"path": "main.py"}, {"path": "utils.py"}, {"path": "config.py"}]]
 
-    # Multiple batches - process each file independently
-    batches=[
-        [{"path": "file1.py"}],
-        [{"path": "file2.py"}],
-        [{"path": "file3.py"}]
-    ]
+    # Multiple batches - independent mechanical changes with cheap model
+    batches=[[{"path": "file1.py"}], [{"path": "file2.py"}], [{"path": "file3.py"}]]
+    model="tiny"
 
     # Batch with line ranges
-    batches=[
-        [
-            {"path": "large_file.py", "start_line": 1, "end_line": 100},
-            {"path": "large_file.py", "start_line": 101, "end_line": 200}
-        ]
-    ]
+    batches=[[{"path": "large_file.py", "start_line": 1, "end_line": 100}]]
     ```
 
     Args:
         instructions: Instructions for processing the file(s)
         batches: List of batches, where each batch is a list of file specs
-        model: Model to use for batch processing (default: anthropic/claude-sonnet-4.5)
+        model: Model size: tiny, small, medium, large (default), huge
 
     Returns:
         Immediate: Dict keyed by batch index with {success: bool, result: str, cost: int, tool_called: str}
@@ -770,13 +717,10 @@ def process_files(
         error_result = {"error": "No batches specified"}
         return (error_result, "process_files: error")
 
-    # All batches are processed with separate LLM calls
-    api_key = os.environ.get('OPENROUTER_API_KEY')
-    if not api_key:
-        return ({"error": "OPENROUTER_API_KEY not set"}, "process_files: error")
-
-    # Get all tool schemas
-    tool_schemas = get_all_tool_schemas(add_rationale=False)
+    # Resolve model size to actual model name
+    if model not in MODELS:
+        return ({"error": f"Unknown model size: {model}"}, "process_files: error")
+    resolved_model = MODELS[model]
 
     # Process each batch
     results = {}
@@ -791,7 +735,7 @@ def process_files(
             start_line = file_spec.get('start_line')
             end_line = file_spec.get('end_line')
 
-            full_path = check_path(file_path, worktree_path)
+            full_path = check_path(file_path, maca.worktree_path)
             
             if not full_path.exists():
                 batch_contents.append(f"File: {file_path}\n\nError: File not found")
@@ -823,16 +767,12 @@ def process_files(
             {'role': 'user', 'content': batch_content}
         ]
 
-        # Call LLM using shared utility
-        from utils import call_llm
-        
         try:
             llm_result = call_llm(
-                api_key=api_key,
-                model=model,
+                api_key=maca.api_key,
+                model=resolved_model,
                 messages=messages,
-                tool_schemas=tool_schemas,
-                logger=None  # No logger for process_files LLM calls
+                tool_schemas=TOOL_SCHEMAS.values(),
             )
             
             message = llm_result['message']
@@ -853,7 +793,7 @@ def process_files(
             tool_args = json.loads(tool_call['function']['arguments'])
 
             # Execute the tool
-            tool_result, _ = execute_tool(called_tool_name, tool_args, worktree_path, repo_root, history, maca)
+            tool_result, _ = execute_tool(called_tool_name, tool_args, maca)
 
             results[batch_idx] = {
                 'success': True,
@@ -883,9 +823,6 @@ def process_files(
 def complete(
     result: str,
     commit_msg: str | None,
-    worktree_path: Path = None,
-    repo_root: Path = None,
-    history = None,
     maca = None
 ) -> bool:
     """
@@ -908,7 +845,7 @@ def complete(
 
     # Ask for approval
     response = choice(
-        message=f'{worktree_path} -- How to proceed?',
+        message=f'{maca.worktree_path} -- How to proceed?',
         options=[
             ('merge', 'Merge into main'),
             ('continue', 'Ask for further changes'),
@@ -921,25 +858,25 @@ def complete(
         cprint(C_INFO, 'Merging changes...')
 
         # Merge
-        conflict = git_ops.merge_to_main(repo_root, worktree_path, maca.branch_name, commit_msg or result)
+        conflict = git_ops.merge_to_main(maca.repo_root, maca.worktree_path, maca.branch_name, commit_msg or result)
 
         if conflict:
             cprint(C_BAD, "⚠ Merge conflicts!")
             return f"Merge conflict while rebasing. Please resolve merge conflicts by reading the affected files and using update_files to resolve the conflicts. Then use shell tool with `git add <filename>.. && git rebase --continue`, before calling complete again with the same arguments to try the merge again. Here is the rebase output:\n\n{conflict}"
         
         # Cleanup
-        git_ops.cleanup_session(repo_root, worktree_path, maca.branch_name)
+        git_ops.cleanup_session(maca.repo_root, maca.worktree_path, maca.branch_name)
         cprint(C_GOOD, '✓ Merged and cleaned up')
 
         return ReadyResult(result)
 
     elif response == 'continue':
-        feedback = pt_prompt("What changes do you want?\n> ", multiline=True, history=history)
+        feedback = pt_prompt("What changes do you want?\n> ", multiline=True, history=maca.history)
         maca.add_message({"role": "user", "content": feedback})
         return 'User rejected result and provided feedback.'
     
     elif response == 'delete':
-        git_ops.cleanup_session(repo_root, worktree_path, maca.branch_name)
+        git_ops.cleanup_session(maca.repo_root, maca.worktree_path, maca.branch_name)
         cprint(C_BAD, '✓ Deleted worktree and branch')
         return ReadyResult(result)
     

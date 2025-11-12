@@ -55,7 +55,6 @@ class MACA:
         # LLM context management
         self._messages = []
         self.last_head_commit = None
-        self.tool_schemas = None  # Set after system prompt is loaded
 
         # State tracking for AGENTS.md and code_map
         self.agents_md_state = None  # Current AGENTS.md content
@@ -135,7 +134,7 @@ class MACA:
                 if new != old:
                     diff = compute_diff(old, new)
                     if diff:
-                        content = f"# {name} Update\n\n```diff\n{diff}\n```"
+                        content = f"[[{name} Update]]\n\n```diff\n{diff}\n```"
                         self.add_message({
                             'role': 'user',
                             'content': content
@@ -160,138 +159,15 @@ class MACA:
             for name, new in state.items():
                 self.add_message({
                     'role': 'user',
-                    'content': f"# {name}\n\n{new}"
+                    'content': f"[[{name}]]\n\n{new}"
                 })
                 self.state_message_indices.append(len(self._messages) - 1)
 
         self.prev_state = state
 
-
-    def _load_initial_code_map(self):
-        """Generate and load initial code map as a system message."""
-        self.code_map_state = self._generate_code_map()
-        self.add_message({
-            'role': 'system',
-            'content': f"# Project Code Map\n\n{self.code_map_state}"
-        })
-        # Track this message index
-        self.state_message_indices.append(len(self._messages) - 1)
-
-    def _check_state_changes(self):
-        """
-        Check if AGENTS.md or code_map changed and add diff messages.
-        
-        Also handles history rewriting when we have 8 state updates.
-        """
-        # Check AGENTS.md
-        agents_md_path = self.repo_root / 'AGENTS.md'
-        if agents_md_path.exists():
-            new_agents_md = agents_md_path.read_text()
-            if new_agents_md != self.agents_md_state:
-                diff = self._compute_diff(self.agents_md_state, new_agents_md)
-                if diff:
-                    self.add_message({
-                        'role': 'system',
-                        'content': f"# AGENTS.md Update\n\n```diff\n{diff}\n```"
-                    })
-                    self.state_message_indices.append(len(self._messages) - 1)
-                    self.agents_md_state = new_agents_md
-        
-        # Check code_map
-        new_code_map = self._generate_code_map()
-        if new_code_map != self.code_map_state:
-            diff = self._compute_diff(self.code_map_state, new_code_map)
-            if diff:
-                self.add_message({
-                    'role': 'system',
-                    'content': f"# Code Map Update\n\n```diff\n{diff}\n```"
-                })
-                self.state_message_indices.append(len(self._messages) - 1)
-                self.code_map_state = new_code_map
-        
-        # If we have 8 or more state updates, rewrite history
-        if len(self.state_message_indices) >= 8:
-            self._rewrite_state_history()
-
-    def _rewrite_state_history(self):
-        """
-        Rewrite message history to replace all state diffs with new baselines.
-        
-        This keeps the context compact while maintaining current state.
-        """
-        cprint(C_IMPORTANT, '→ Rewriting state history (8+ updates accumulated)')
-        
-        # Remove all state update messages (walk backwards to preserve indices)
-        for idx in reversed(self.state_message_indices):
-            if idx < len(self._messages):
-                del self._messages[idx]
-        
-        # Clear the tracking list
-        self.state_message_indices.clear()
-        
-        # Add new baseline AGENTS.md
-        if self.agents_md_state:
-            self.add_message({
-                'role': 'system',
-                'content': f"# Project Documentation (AGENTS.md)\n\n{self.agents_md_state}"
-            })
-            self.state_message_indices.append(len(self._messages) - 1)
-        
-        # Add new baseline code_map
-        if self.code_map_state:
-            self.add_message({
-                'role': 'system',
-                'content': f"# Project Code Map\n\n{self.code_map_state}"
-            })
-            self.state_message_indices.append(len(self._messages) - 1)
-        
-        cprint(C_GOOD, '✓ State history rewritten')
-
-    def _check_head_changes(self):
-        """
-        Check if HEAD has changed since last invocation.
-
-        If changed, add a system message with commit info and changed files.
-        """
-        if not self.worktree_path or not self.last_head_commit:
-            return
-
-        current_head = git_ops.get_head_commit(cwd=self.worktree_path)
-
-        if current_head != self.last_head_commit:
-            # HEAD has changed, gather info
-            commits = git_ops.get_commits_between(self.last_head_commit, current_head, cwd=self.worktree_path)
-            changed_files = git_ops.get_changed_files_between(self.last_head_commit, current_head, cwd=self.worktree_path)
-
-            if commits or changed_files:
-                # Build system message
-                message_parts = ["# Repository Updates\n\nThe following changes have been made since you were last invoked:\n"]
-
-                if commits:
-                    message_parts.append("\n## New Commits\n")
-                    for commit in commits:
-                        message_parts.append(f"- `{commit['hash']}` {commit['message']}")
-
-                if changed_files:
-                    message_parts.append("\n\n## Changed Files\n")
-                    for filepath in changed_files:
-                        message_parts.append(f"- {filepath}")
-
-                self.add_message({
-                    'role': 'system',
-                    'content': '\n'.join(message_parts)
-                })
-
-            # Update tracking
-            self.last_head_commit = current_head
-
     def add_message(self, message: Dict):
         """Add a message dict to the context and the log."""
-        role = message.get('role', 'unknown')
-        content = message.get('content', '')
-        
-        log(tag='message', **message)
-            
+        log(tag='message', **message)            
         self._messages.append(message)
 
     def process_tool_call_from_message(self, message: Dict) -> tuple[bool, Optional[tuple]]:
@@ -329,9 +205,6 @@ class MACA:
             immediate_result, context_summary = tools.execute_tool(
                 tool_name,
                 tool_args,
-                worktree_path=self.worktree_path,
-                repo_root=self.repo_root,
-                history=self.history,
                 maca=self
             )
             tool_duration = time.time() - tool_start
@@ -424,15 +297,12 @@ class MACA:
             # Print thinking message
             cprint(C_INFO, "Thinking...")
 
-            # Check for HEAD changes before calling LLM
-            self._check_head_changes()
-
             # Call LLM (retry logic is in call_llm)
             result = call_llm(
                 api_key=self.api_key,
                 model=self.model,
                 messages=self._messages,
-                tool_schemas=self.tool_schemas
+                tool_schemas=tools.TOOL_SCHEMAS.values(),
             )
 
             # Add assistant message to history
@@ -463,16 +333,10 @@ class MACA:
         self.create_session()
 
         # Initialize logger
-        logger.init(self.repo_root, self.session_id, "main")
+        logger.init(self.repo_root, self.session_id)
 
         # Load system prompt
         self._load_system_prompt()
-
-        # Get all tool schemas
-        self.tool_schemas = tools.get_all_tool_schemas()
-
-        # Initialize HEAD tracking
-        self.last_head_commit = git_ops.get_head_commit(cwd=self.worktree_path)
 
         # Main loop
         while True:

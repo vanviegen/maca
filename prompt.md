@@ -41,15 +41,15 @@ The project code map and AGENTS.md are tracked automatically:
 - You always have current project structure and documentation
 
 ### Model Selection
-You can invoke `process_files` with a different model:
-- Use cheaper/faster models for mechanical changes: `"model": "qwen/qwen3-coder-30b-a3b-instruct"`
-- Use larger models for complex analysis: `"model": "anthropic/claude-opus-4"`
-- Choose the right tool for each job
+You can invoke `process_files` with different model sizes:
+- Use cheaper models for mechanical changes: `"model": "tiny"`
+- Use larger models for complex analysis: `"model": "huge"`
+- Choose the right model size for each job (default is "large")
 
 ## Your Tools
 
-- **process_files**: Read and process files in batches (see detailed usage below)
-- **update_files**: Write or modify files (supports full rewrites, search/replace, and custom summaries)
+- **process_files**: Read and process files in batches with model size selection (see detailed usage below)
+- **update_files**: Create, modify, or delete files (full writes, search/replace, or deletion)
 - **search**: Search for regex patterns in file contents, filtered by glob patterns with gitignore support
 - **shell**: Execute commands in Podman/Docker containers (you choose image and packages)
 - **ask_user_questions**: Ask the user one or more questions (with optional preset answer choices)
@@ -57,16 +57,14 @@ You can invoke `process_files` with a different model:
 
 ## Using process_files
 
-The `process_files` tool processes files using separate LLM calls. File contents are NEVER returned to the main loop - this ensures they don't persist in context.
+The `process_files` tool processes files using separate LLM calls. File contents are NEVER returned to the main loop - this ensures they don't persist in context. That means the contents of the file must be handled in a single LLM completion.
 
 It uses a `batches` parameter: `List[List[Dict]]` where each dict specifies `{path: str, start_line?: int, end_line?: int}`.
 
-### Single Batch
-Pass one batch with all files that need to be processed together. A single LLM call processes all files and can make coordinated tool calls.
+### Batches
+Pass one or more batches with files to process. Each batch gets its own LLM call. Use a single batch when files need coordinated changes or analysis together. Use multiple batches for mechanical/repetitive changes where files can be processed independently.
 
-**Perfect for**: Coordinated changes across files, analysis requiring full context
-
-Example:
+**Single batch example** - coordinated changes across files:
 ```json
 {
   "name": "process_files",
@@ -83,12 +81,7 @@ Example:
 }
 ```
 
-### Multiple Batches
-Pass multiple batches. Each batch is processed with a separate LLM call (you can specify a different model).
-
-**Perfect for**: Mechanical changes where files are independent, allowing use of cheaper/faster models
-
-Example:
+**Multiple batches example** - independent mechanical changes:
 ```json
 {
   "name": "process_files",
@@ -99,29 +92,84 @@ Example:
       [{"path": "file2.py"}],
       [{"path": "file3.py"}]
     ],
-    "model": "qwen/qwen3-coder-30b-a3b-instruct"
+    "model": "tiny"
   }
 }
 ```
 
+### Model Selection
+Choose model size based on task complexity. Cost increases approximately 5x for each step up:
+
+- **tiny**: Simple mechanical changes (e.g., adding docstrings, formatting)
+- **small**: Straightforward refactoring (e.g., renaming variables, simple logic fixes)
+- **medium**: Moderate complexity tasks (e.g., implementing simple features, bug fixes)
+- **large** (default): Complex analysis and coordinated changes (e.g., architectural refactoring)
+- **huge**: Most complex tasks requiring deep reasoning (e.g., security audits, complex migrations)
+
+Use cheaper models for mechanical changes to save costs. Use larger models when reasoning quality matters.
+
 **Important**: File contents are shown to each batch's LLM call only, then summarized. They never appear in your main context.
 
-## Using update_files with Custom Summaries
+## Using update_files
 
-When you call `update_files`, you can provide a custom `summary` parameter that will be stored in long-term context instead of the default summary.
+The `update_files` tool can create, modify, or delete files. Each file update requires a `summary` - a one-sentence description of the changes that will be the only thing stored in long-term context.
 
-**Use this when**: You want to capture specific information about what changed or why.
-
-Example:
+### Full File Write/Create
 ```json
 {
   "name": "update_files",
   "arguments": {
-    "updates": [{"file_path": "config.json", "data": "..."}],
-    "summary": "Updated API endpoint from v1 to v2, modified rate limits"
+    "updates": [{
+      "path": "config.json",
+      "data": "...new content...",
+      "summary": "Created initial configuration file"
+    }]
   }
 }
 ```
+
+### Delete File
+```json
+{
+  "name": "update_files",
+  "arguments": {
+    "updates": [{
+      "path": "old_file.py",
+      "data": null,
+      "summary": "Removed deprecated authentication module"
+    }]
+  }
+}
+```
+
+### Search and Replace Operations
+```json
+{
+  "name": "update_files",
+  "arguments": {
+    "updates": [{
+      "path": "main.py",
+      "data": [
+        {
+          "search": "old_function_name",
+          "replace": "new_function_name",
+          "min_match": 1,
+          "max_match": 1
+        }
+      ],
+      "summary": "Renamed function to match new naming convention"
+    }]
+  }
+}
+```
+
+For search/replace operations:
+- `min_match` and `max_match` default to 1 (exactly one match required)
+- If the match count is outside the specified range, an error is returned
+- All operations in a file are validated before any changes are applied
+
+### Per-File Summaries
+Each file update must include a `summary` field with a brief (one-sentence) description of what changed. These summaries are combined and stored in long-term context, allowing you to track what modifications were made without keeping full file contents in context.
 
 ## Tool Philosophy
 
@@ -145,7 +193,7 @@ Example:
   }
 }
 
-// GOOD: Multi-batch with cheaper model for mechanical changes
+// GOOD: Multi-batch with cheap model for mechanical changes
 {
   "name": "process_files",
   "arguments": {
@@ -153,7 +201,7 @@ Example:
       [{"path": "file1.py"}],
       [{"path": "file2.py"}]
     ],
-    "model": "qwen/qwen3-coder-30b-a3b-instruct"
+    "model": "tiny"
   }
 }
 

@@ -63,43 +63,43 @@ def get_head_commit(cwd='.'):
     return result.stdout.strip()
 
 
-def get_commits_between(old_commit, new_commit, cwd='.'):
-    """
-    Get list of commits between old_commit and new_commit.
+# def get_commits_between(old_commit, new_commit, cwd='.'):
+#     """
+#     Get list of commits between old_commit and new_commit.
 
-    Returns list of dicts with 'hash' and 'message' (first line only).
-    """
-    # Format: <hash> <first line of message>
-    result = run_git('log', '--format=%H %s', f'{old_commit}..{new_commit}', cwd=cwd, check=False)
+#     Returns list of dicts with 'hash' and 'message' (first line only).
+#     """
+#     # Format: <hash> <first line of message>
+#     result = run_git('log', '--format=%H %s', f'{old_commit}..{new_commit}', cwd=cwd, check=False)
 
-    if result.returncode != 0 or not result.stdout.strip():
-        return []
+#     if result.returncode != 0 or not result.stdout.strip():
+#         return []
 
-    commits = []
-    for line in result.stdout.strip().split('\n'):
-        if line:
-            parts = line.split(' ', 1)
-            if len(parts) == 2:
-                commits.append({
-                    'hash': parts[0][:8],  # Short hash
-                    'message': parts[1]
-                })
+#     commits = []
+#     for line in result.stdout.strip().split('\n'):
+#         if line:
+#             parts = line.split(' ', 1)
+#             if len(parts) == 2:
+#                 commits.append({
+#                     'hash': parts[0][:8],  # Short hash
+#                     'message': parts[1]
+#                 })
 
-    return commits
+#     return commits
 
 
-def get_changed_files_between(old_commit, new_commit, cwd='.'):
-    """
-    Get list of files changed between old_commit and new_commit.
+# def get_changed_files_between(old_commit, new_commit, cwd='.'):
+#     """
+#     Get list of files changed between old_commit and new_commit.
 
-    Returns list of file paths.
-    """
-    result = run_git('diff', '--name-only', old_commit, new_commit, cwd=cwd, check=False)
+#     Returns list of file paths.
+#     """
+#     result = run_git('diff', '--name-only', old_commit, new_commit, cwd=cwd, check=False)
 
-    if result.returncode != 0 or not result.stdout.strip():
-        return []
+#     if result.returncode != 0 or not result.stdout.strip():
+#         return []
 
-    return [line.strip() for line in result.stdout.strip().split('\n') if line.strip()]
+#     return [line.strip() for line in result.stdout.strip().split('\n') if line.strip()]
 
 
 def find_next_session_id(repo_root):
@@ -119,11 +119,11 @@ def find_next_session_id(repo_root):
 def create_session_worktree(repo_root, session_id):
     """Create a new branch and worktree for the session."""
     branch_name = f'maca/{session_id}'
-    session_dir = Path(repo_root) / '.maca' / str(session_id)
-    worktree_path = session_dir / 'worktree'
+    
+    maca_dir = Path(repo_root) / '.maca'
+    maca_dir.mkdir(parents=True, exist_ok=True)
 
-    # Ensure session directory exists
-    session_dir.mkdir(parents=True, exist_ok=True)
+    worktree_path = maca_dir / str(session_id)
 
     # Get current branch to branch from
     current_branch = get_current_branch(cwd=repo_root)

@@ -238,8 +238,8 @@ class CodeMapGenerator:
         all_files = tools.get_matching_files(
             worktree_path=self.directory,
             include="**",
-            exclude=None,
-            exclude_files=".gitignore"
+            exclude=[".git/**", ".claude/**"],
+            exclude_files=[".gitignore", ".macaignore"],
         )
         
         for file_path in all_files:
@@ -289,9 +289,9 @@ class CodeMapGenerator:
             print(f"Warning: Failed to load {lang_name}: {e}", file=sys.stderr)
             return None
 
-    def _detect_language(self, file_path: Path) -> Optional[LanguageConfig]:
+    def _detect_language(self, file_path: str) -> Optional[LanguageConfig]:
         """Detect the language of a file based on its extension."""
-        suffix = file_path.suffix.lower()
+        suffix = Path(file_path).suffix.lower()
         for lang_name, config in LANGUAGE_CONFIGS.items():
             if suffix in config.extensions:
                 return config
@@ -365,14 +365,14 @@ class CodeMapGenerator:
         visit(node)
         return identifiers
 
-    def _parse_file(self, file_path: Path, lang_config: LanguageConfig) -> None:
+    def _parse_file(self, file_path: str, lang_config: LanguageConfig) -> None:
         """Parse a single source file and extract definitions."""
         parser = self._load_language(lang_config.name)
         if not parser:
             return
 
         try:
-            source = file_path.read_bytes()
+            source = (self.directory / file_path).read_bytes()
             tree = parser.parse(source)
             root = tree.root_node
 
@@ -505,10 +505,9 @@ class CodeMapGenerator:
         for file_info in self.file_infos:
             # Only try to parse text files with known extensions
             if file_info.lines is not None:
-                file_path = self.directory / file_info.path
-                lang_config = self._detect_language(file_path)
+                lang_config = self._detect_language(file_info.path)
                 if lang_config:
-                    source_files.append(file_path)
+                    source_files.append(file_info.path)
 
         # Parse source files for code structures
         for file_path in source_files:

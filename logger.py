@@ -10,24 +10,20 @@ from pathlib import Path
 _log_file = None
 
 
-def init(repo_root: Path, session_id: int, context_id: str):
+def init(repo_root: Path, session_id: int):
     """
     Initialize the session logger.
 
     Args:
         repo_root: Path to the repository root
         session_id: The session ID number
-        context_id: The context ID (e.g., "main")
     """
-    global _log_file
     
-    session_dir = repo_root / '.maca' / str(session_id)
+    maca_dir = Path(repo_root) / '.maca'
+    maca_dir.mkdir(parents=True, exist_ok=True)
 
-    # Ensure session directory exists
-    session_dir.mkdir(parents=True, exist_ok=True)
-
-    _log_file = open(session_dir / f"{context_id}.log", 'a')
-
+    global _log_file
+    _log_file = open(maca_dir / f"{session_id}.log", 'a')
 
 def _find_heredoc_delimiter(value: str) -> str:
     """Find a delimiter that doesn't appear in the value."""

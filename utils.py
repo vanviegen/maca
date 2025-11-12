@@ -5,7 +5,7 @@ from prompt_toolkit import print_formatted_text
 from prompt_toolkit.formatted_text import FormattedText
 from pathlib import Path
 from fnmatch import fnmatch
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 import json
 import urllib.request
 import time
@@ -191,6 +191,10 @@ def call_llm(
         'tools': tool_schemas,
         'usage': {"include": True},
         'tool_choice': 'required',
+        'reasoning': {
+            'effort': 'medium',
+            'max_tokens': 650
+        }
     }
     
     # Retry up to 3 times
@@ -270,3 +274,99 @@ def compute_diff(old_text: str, new_text: str) -> Optional[str]:
     diff_text = ''.join(diff)
     
     return diff_text if diff_text else None
+
+
+def get_matching_files(
+    worktree_path: Path,
+    include: Optional[Union[str, List[str]]] = "**",
+    exclude: Optional[Union[str, List[str]]] = ".*",
+    exclude_files: Optional[Union[str, List[str]]] = None
+) -> List[Path]:
+    """
+    Get list of files matching include/exclude glob patterns.
+
+    Args:
+        worktree_path: Path to the worktree
+        include: Glob pattern(s) to include. Can be None, a string, or list of strings.
+                 Defaults to "**" (all files).
+        exclude: Glob pattern(s) to exclude. Can be None, a string, or list of strings.
+                 Defaults to ".*" (hidden files/directories).
+        exclude_files: File(s) containing exclude patterns (e.g., ".gitignore"). Can be None, a string, or list of strings.
+                       Defaults to None. When ".gitignore" is included, gitignore semantics are applied.
+
+    Returns:
+        List of Path objects for matching files (not directories)
+    """
+    from utils import parse_gitignore
+    
+    worktree = Path(worktree_path)
+
+    # Normalize include patterns
+    if include is None:
+        include_patterns = ["**"]
+    elif isinstance(include, str):
+        include_patterns = [include]
+    else:
+        include_patterns = include
+
+    # Normalize exclude patterns
+    if exclude is None:
+        exclude_patterns = []
+    elif isinstance(exclude, str):
+        exclude_patterns = [exclude]
+    else:
+        exclude_patterns = exclude
+
+    # Normalize exclude_files
+    if exclude_files is None:
+        exclude_file_list = []
+    elif isinstance(exclude_files, str):
+        exclude_file_list = [exclude_files]
+    else:
+        exclude_file_list = exclude_files
+
+    # Parse .gitignore if present in exclude_files
+    gitignore_matcher = None
+    if '.gitignore' in exclude_file_list:
+        gitignore_path = worktree / '.gitignore'
+        gitignore_matcher = parse_gitignore(gitignore_path)
+
+    # Collect all matching files
+    matching_files = set()
+
+    for pattern in include_patterns:
+        for path in worktree.glob(pattern):
+            if path.is_file():
+                matching_files.add(path)
+
+    # Filter out excluded files
+    filtered_files = []
+    for file_path in matching_files:
+        rel_path_str = str(file_path.relative_to(worktree))
+
+        # Check gitignore first
+        if gitignore_matcher:
+            if gitignore_matcher.matches(rel_path_str, is_dir=False):
+                continue
+
+        # Check if any exclude pattern matches
+        excluded = False
+        for exc_pattern in exclude_patterns:
+            # Check if pattern matches any part of the path
+            if fnmatch(rel_path_str, exc_pattern):
+                excluded = True
+                break
+            # Also check individual path components
+            for part in Path(rel_path_str).parts:
+                if fnmatch(part, exc_pattern):
+                    excluded = True
+                    break
+            if excluded:
+                break
+
+        if not excluded:
+            filtered_files.append(file_path)
+
+    return sorted(filtered_files)
+
+
