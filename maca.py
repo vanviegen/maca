@@ -198,7 +198,11 @@ class MACA:
                 raise ContextError(f"Expected exactly 1 tool call, got {len(tool_calls)}")
             args = json.loads(message['tool_calls'][0]['function']['arguments'])
             log(tag='tool_call', **args)
-            (long_term_summary, temporary_response, done) = tools.respond(**args, maca=self)
+            (long_term_response, temporary_response, done) = tools.respond(**args, maca=self)
+
+            # Serialize responses to JSON
+            long_term_json = json.dumps(long_term_response, indent=2)
+            temporary_json = json.dumps(temporary_response, indent=2)
 
             # Add assistant message (and trimmed version) to history
             self.add_message(message, 'long-term-only')
@@ -209,7 +213,7 @@ class MACA:
                     {
                         'type': 'tool_result',
                         'tool_use_id': tool_calls[0]['id'],
-                        'content': temporary_response,
+                        'content': temporary_json,
                         'cache_control': {'type': 'ephemeral'}
                     }
                 ]
@@ -220,7 +224,7 @@ class MACA:
                     {
                         'type': 'tool_result',
                         'tool_use_id': tool_calls[0]['id'],
-                        'content': long_term_summary,
+                        'content': long_term_json,
                         'cache_control': {'type': 'ephemeral'}
                     }
                 ]
@@ -249,31 +253,35 @@ class MACA:
         if response == 'merge':
             cprint(C_INFO, 'Merging changes...')
 
-            # Extract commit message from result (first line)
-            commit_msg = result.split('\n')[0]
+            # Use session ID as commit message
+            commit_msg = f"Session {self.session_id}"
 
             # Merge
-            conflict = git_ops.merge_to_main(maca.repo_root, maca.worktree_path, maca.branch_name, commit_msg)
+            conflict = git_ops.merge_to_main(self.repo_root, self.worktree_path, self.branch_name, commit_msg)
 
             if conflict:
                 cprint(C_BAD, "⚠ Merge conflicts!")
-                return (f"Merge conflict while rebasing. Please resolve merge conflicts by reading the affected files and using file_updates to resolve the conflicts. Then use a processor with shell_command to run `git add <filename>.. && git rebase --continue`, before calling respond again with complete=true to try the merge again. Here is the rebase output:\n\n{conflict}",
-                        "respond: merge conflict")
+                error_response = {
+                    "error": f"Merge conflict while rebasing. Please resolve merge conflicts by reading the affected files and using file_updates to resolve the conflicts. Then use a shell_command to run `git add <filename>.. && git rebase --continue`, before calling respond again with done=true to try the merge again. Here is the rebase output:\n\n{conflict}"
+                }
+                # Add error as user message so the assistant can fix it
+                self.add_message({"role": "user", "content": json.dumps(error_response, indent=2)})
+                return False
 
             # Cleanup
-            git_ops.cleanup_session(maca.repo_root, maca.worktree_path, maca.branch_name)
+            git_ops.cleanup_session(self.repo_root, self.worktree_path, self.branch_name)
             cprint(C_GOOD, '✓ Merged and cleaned up')
             git_ops.create_session_worktree(self.repo_root, self.session_id)
 
             return True
 
         if response == 'continue':
-            feedback = pt_prompt("What changes do you want?\n> ", multiline=True, history=maca.history)
-            maca.add_message({"role": "user", "content": feedback})
+            feedback = pt_prompt("What changes do you want?\n> ", multiline=True, history=self.history)
+            self.add_message({"role": "user", "content": feedback})
             return False
 
         if response == 'delete':
-            git_ops.cleanup_session(maca.repo_root, maca.worktree_path, maca.branch_name)
+            git_ops.cleanup_session(self.repo_root, self.worktree_path, self.branch_name)
             cprint(C_BAD, '✓ Deleted worktree and branch')
             return True
 

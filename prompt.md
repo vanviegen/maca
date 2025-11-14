@@ -321,12 +321,92 @@ The system automatically tracks:
 
 After each commit, diffs are added to your context. You always have current project state.
 
+### Understanding "OMITTED" in Tool Results
+
+Tool results are returned as JSON structures. The system maintains two forms of context:
+
+**Temporary context (ephemeral - current iteration only):**
+- Full data including file contents, search results, shell output, file updates
+- Available immediately after your respond call
+- Cleared after the next respond call (unless `keep_extended_context: true`)
+
+**Long-term context (persisted across iterations):**
+- Metadata and summaries only
+- Large data replaced with the string `"OMITTED"`
+- Compact representation for context efficiency
+
+**Example - File Reads:**
+
+Temporary context (you see this once):
+```json
+{
+  "file_reads": {
+    "count": 2,
+    "specs": [{"path": "config.py"}, {"path": "main.py"}],
+    "contents": ["File: config.py\n\nDEBUG = True\n...", "File: main.py\n\n..."]
+  }
+}
+```
+
+Long-term context (persisted):
+```json
+{
+  "file_reads": {
+    "count": 2,
+    "specs": [{"path": "config.py"}, {"path": "main.py"}],
+    "contents": "OMITTED"
+  }
+}
+```
+
+**Example - File Updates:**
+
+Temporary context:
+```json
+{
+  "file_updates": {
+    "status": "ok",
+    "summary": "Added error handling to API endpoints",
+    "updates": [
+      {
+        "path": "api.py",
+        "overwrite": "# Full file content here...",
+        "summary": "Added error handling"
+      }
+    ]
+  }
+}
+```
+
+Long-term context:
+```json
+{
+  "file_updates": {
+    "status": "ok",
+    "summary": "Added error handling to API endpoints",
+    "count": 1,
+    "paths": ["api.py"]
+  }
+}
+```
+
+**What "OMITTED" Means:**
+- The string `"OMITTED"` indicates data was available in temporary context but excluded from long-term
+- You saw the full data once and should have extracted key information
+- Metadata (count, paths, specs, commands, summaries) is always preserved
+- Don't re-request the same data unless absolutely necessary
+
+**Best Practices:**
+- Extract important findings into `notes_for_context` for future reference
+- Use `keep_extended_context: true` only if you need data for one more iteration
+- Trust that you processed the data correctly the first time you saw it
+
 ### File Contents Don't Persist
-When you use processors to read files:
-1. Files are shown to the processor (separate LLM call)
-2. Processor analyzes and returns summary
-3. Only the summary is added to your context
-4. File contents never clutter your main context
+When you use `file_reads`, `file_searches`, `shell_commands`, or `sub_processors`:
+1. Full results appear in temporary context (current iteration only)
+2. Long-term context stores metadata with data marked as "OMITTED"
+3. Extract and save important findings in `notes_for_context`
+4. Set `keep_extended_context: true` only if you need the full data for one more iteration
 
 This pattern keeps context compact while allowing thorough analysis.
 

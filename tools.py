@@ -550,7 +550,14 @@ def read_files(file_specs: List[FileRead], worktree_path: Path) -> List[str]:
     return contents
 
 
-def ask_questions(questions: List[Question], maca) -> str:
+def ask_questions(questions: List[Question], maca) -> None:
+    """
+    Ask questions to the user and store Q&A in context.
+
+    Args:
+        questions: List of questions to ask
+        maca: MACA instance
+    """
     for i, q in enumerate(questions, 1):
         prompt_text = q.get('prompt', '')
         preset_answers = q.get('preset_answers')
@@ -566,18 +573,18 @@ def ask_questions(questions: List[Question], maca) -> str:
             )
 
             if result == '__custom__':
-                answer = pt_prompt(f"> ", history=history)
+                answer = pt_prompt(f"> ", history=maca.history)
             else:
                 answer = result
         else:
             # Simple text input
-            answer = pt_prompt(f"Question {i}/{len(questions)}: {prompt_text}\n> ", history=history)
+            answer = pt_prompt(f"Question {i}/{len(questions)}: {prompt_text}\n> ", history=maca.history)
 
         maca.add_message({'role': 'assistant', 'content': prompt_text})
         maca.add_message({'role': 'user', 'content': answer})
 
 
-def execute_processor(processor: Processor, maca, subprompt: str) -> str:
+def execute_processor(processor: SubProcessor, maca, subprompt: str) -> str:
     """
     Execute a processor in its own context.
 
@@ -591,9 +598,8 @@ def execute_processor(processor: Processor, maca, subprompt: str) -> str:
     """
     model_name = processor.get('model', 'large')
     assignment = processor['assignment']
-    read_files_specs = processor.get('read_files', [])
-    shell_commands_specs = processor.get('shell_commands', [])
-    file_searches_specs = processor.get('file_searches', [])
+    file_reads_specs = processor.get('file_reads', [])
+    file_write_allow_patterns = processor.get('file_write_allow_patterns', [])
 
     # Resolve model name
     if model_name not in MODELS:
@@ -607,33 +613,12 @@ def execute_processor(processor: Processor, maca, subprompt: str) -> str:
         {'role': 'system', 'content': subprompt}
     ]
 
-    # Execute data gathering operations
-    data_parts = []
-
-    # Read files
-    if read_files_specs:
-        file_contents = read_files(read_files_specs, maca.worktree_path)
-        data_parts.append("# Files\n\n" + "\n\n---\n\n".join(file_contents))
-
-    # Execute shell commands
-    if shell_commands_specs:
-        shell_results = execute_shell_commands(shell_commands_specs, maca.worktree_path, maca.repo_root)
-        shell_output = []
-        for result in shell_results:
-            shell_output.append(f"Command: {result['command']}\n\n{json.dumps(result['output'], indent=2)}")
-        data_parts.append("# Shell Commands\n\n" + "\n\n---\n\n".join(shell_output))
-
-    # Execute searches
-    if file_searches_specs:
-        search_results = execute_searches(file_searches_specs, maca.worktree_path)
-        search_output = json.dumps(search_results, indent=2)
-        data_parts.append(f"# Search Results\n\n{search_output}")
-
-    # Combine all data
-    if data_parts:
-        combined_data = "\n\n===\n\n".join(data_parts)
+    # Read files if specified
+    if file_reads_specs:
+        file_contents = read_files(file_reads_specs, maca.worktree_path)
+        combined_data = "# Files\n\n" + "\n\n---\n\n".join(file_contents)
     else:
-        combined_data = "(no data gathered)"
+        combined_data = "(no files provided)"
 
     # Add assignment and data to processor context
     messages.append({
@@ -647,7 +632,7 @@ def execute_processor(processor: Processor, maca, subprompt: str) -> str:
             api_key=maca.api_key,
             model=resolved_model,
             messages=messages,
-            tool_schemas=[RESPOND_TOOL_SCHEMA],
+            tool_schemas=[SUBPROCESSOR_RESPOND_TOOL_SCHEMA],
         )
 
         message = llm_result['message']
@@ -661,12 +646,23 @@ def execute_processor(processor: Processor, maca, subprompt: str) -> str:
         tool_name = tool_call['function']['name']
         tool_args = json.loads(tool_call['function']['arguments'])
 
-        # Processor should call respond
-        if tool_name != 'respond':
-            return f"Error: Processor called {tool_name} instead of respond"
+        # Processor should call subprocessor_respond
+        if tool_name != 'subprocessor_respond':
+            return f"Error: Processor called {tool_name} instead of subprocessor_respond"
 
-        # Handle processor's file_updates if present
+        # Handle processor's file_updates if present (with write pattern validation)
         if 'file_updates' in tool_args and tool_args['file_updates']:
+            # Validate file paths against allow patterns
+            if file_write_allow_patterns:
+                import fnmatch
+                for update in tool_args['file_updates']:
+                    file_path = update['path']
+                    allowed = any(fnmatch.fnmatch(file_path, pattern) for pattern in file_write_allow_patterns)
+                    if not allowed:
+                        return f"Error: Processor tried to write to '{file_path}' which doesn't match allowed patterns: {file_write_allow_patterns}"
+            elif tool_args['file_updates']:
+                return "Error: Processor tried to write files but no file_write_allow_patterns were specified"
+
             immediate_result, _ = apply_file_updates(tool_args['file_updates'], maca.worktree_path)
             if immediate_result != "OK":
                 return f"Error in processor file_updates: {immediate_result}"
@@ -679,16 +675,31 @@ def execute_processor(processor: Processor, maca, subprompt: str) -> str:
 
 
 # ==============================================================================
-# SUBCONTEXT TOOL
+# SUBPROCESSOR TOOL
 # ==============================================================================
 
 
-def subprocessor_respond(        
+def subprocessor_respond(
     thoughts: str,
-    file_updates: Optional[List[FileUpdate]],
-    result: str
+    file_updates: Optional[List[FileUpdate]] = None,
+    result: str = ""
 ) -> tuple[str, str]:
-    pass # TODO
+    """
+    Tool for sub-processors to return results. Sub-processors operate in isolated contexts
+    and can optionally update files (subject to file_write_allow_patterns) before returning.
+
+    Args:
+        thoughts: Your reasoning about the task. Not saved or shown to user.
+        file_updates: Optional list of file modifications to apply.
+        result: The result to return to the main context. This should contain your findings,
+                analysis, or completion status. Be concise but complete.
+
+    Returns:
+        Tuple of (immediate_result, context_summary) - but this is handled by the tool system
+    """
+    # This function signature is used for schema generation only.
+    # Actual execution is handled in execute_processor()
+    pass
 
 # ==============================================================================
 # MAIN TOOL
@@ -696,32 +707,27 @@ def subprocessor_respond(
 
 def respond(
     thoughts: str,
-    keep_extended_context: Optional[bool],
-    file_updates: Optional[List[FileUpdate]],
-
-    user_questions: Optional[List[Question]],
-    file_reads: Optional[List[FileRead]],
-    file_searches: Optional[List[FileSearch]],
-    shell_commands: Optional[List[ShellCommand]],
-    sub_processors: Optional[List[SubProcessor]],
-
-    notes_for_context: Optional[str],
-    done: Optional[bool],
-    user_output: Optional[str],
+    keep_extended_context: Optional[bool] = None,
+    file_updates: Optional[List[FileUpdate]] = None,
+    user_questions: Optional[List[Question]] = None,
+    file_reads: Optional[List[FileRead]] = None,
+    file_searches: Optional[List[FileSearch]] = None,
+    shell_commands: Optional[List[ShellCommand]] = None,
+    sub_processors: Optional[List[SubProcessor]] = None,
+    notes_for_context: Optional[str] = None,
+    done: Optional[bool] = None,
+    user_output: Optional[str] = None,
 
     maca = None,
-) -> tuple[str, str]:
+) -> tuple[Dict[str, Any], Dict[str, Any], bool]:
     """
     Mandatory tool to call. Operations should be combined as much as possible. If you currently cannot complete the task, try to gather all info via user_questions, file_reads, file_searches, and shell_commands such that you can complete the entire task/subtask in the next call.
 
     Args:
         thoughts: Reason for yourself about what you need to do. This will not be saved in the context nor shown to the user. Be succinct (sacrifice grammar for briefness) and self-critical.
         keep_extended_context: Set to true if you need to preserve the temporary context (full results from file_reads, file_searches, shell_commands, sub_processors) for the iteration. Do this only if you just found out that you are missing some information to accomplish a task that requires access to those results. If it's possible to densely summarize the info you'll still need in the future to `notes_for_context`, do that instead.
-        file_updates: Optional list of file modifications to apply.
-        done: Set to true if you have completed the overall task given by the user. This will trigger the merge process. Make sure everything is done, nice and clean before you set this! If set, further operations (file_reads, file_searches, shell_commands, sub_processors) are not allowed. Also, you *must* provide a meaningful `user_output` answering the user question or briefly summarizing the work done.
-
+        file_updates: Optional list of file modifications to apply. Executed FIRST (before data gathering operations).
         user_questions: Optional list of questions to ask the user. Answers are stored in long-term context.
-
         file_reads: Optional list of file (parts) to read into temporary context.
         file_searches: Optional list of file searches to read into temporary context.
         shell_commands: Optional list of shell commands to execute. Stdout and stderr go into temporary context. Don't even use shell commands to write files - use file_updates for that!
@@ -731,38 +737,145 @@ def respond(
           - Ask a more capable LLM for help on a hard problem.
           - Ask a web-search-enabled LLM to look up info online.
           The result goes into temporary context.
-
         notes_for_context: Succinct (sacrifice grammar for briefness): A brief summary of...
           - Your thoughts (if valuable)
           - Temporary context that will be lost (all file_reads+file_searches+shell_commands+sub_processors unless keep_extended_context is set), insofar that you'll need it later in the conversation
           - What the next completion needs to do with the input data it receives (unless obvious)
           This will be saved in long-term context.
         user_output: Optionally what to show to the user. Don't provide this, unless there is something interesting and new to tell. If `done` is true, you *must* provide a meaningful answer here. Keep it short.
+        done: Set to true if you have completed the overall task given by the user. This will trigger the merge process. Make sure everything is done, nice and clean before you set this! If set, further operations (file_reads, file_searches, shell_commands, sub_processors) are not allowed. Also, you *must* provide a meaningful `user_output` answering the user question or briefly summarizing the work done.
+
+    Returns:
+        Tuple of (long_term_response, temporary_response, done):
+        - long_term_response: Dict with operation results (large data replaced with "OMITTED")
+        - temporary_response: Dict with full operation results including all data
+        - done: Whether the task is complete
     """
+    # Validate done constraints
+    if done:
+        if not user_output:
+            error_response = {
+                "error": "Error: 'done' is set but 'user_output' is missing. You must provide a meaningful summary when marking the task as complete."
+            }
+            return (error_response, error_response, False)
 
-    long_term_summary: list[str] = [] # This should contain brief info about what actions were taken (like which files were written, but no file data), brief action results (like how many lines changed), and the notes_for_context. For user_questions, the full Q&As go into permanent context as separate assistant and user messages.
-    temporary_response: list[str] = [] # This contains the full output of the operations done here (file_reads, file_searches, shell_commands, sub_processors, file_updates)
+        if any([file_reads, file_searches, shell_commands, sub_processors]):
+            error_response = {
+                "error": "Error: 'done' is set but data gathering operations (file_reads, file_searches, shell_commands, sub_processors) are not allowed when done=True."
+            }
+            return (error_response, error_response, False)
 
-    # 1. Handle file updates
+    # Build response structures
+    temporary_response = {}
+    long_term_response = {}
+
+    # 1. Handle file updates FIRST (LLM has already output the write comments)
     if file_updates:
         immediate_result, context_summary = apply_file_updates(file_updates, maca.worktree_path)
-        temporary_response.append(f"File Updates: {immediate_result}")
-        long_term_summary.append(context_summary)
 
         if immediate_result != "OK":
-            # File update failed, return early
-            immediate_output = "\n\n".join(temporary_response)
-            context_output = "; ".join(long_term_summary)
-            return (immediate_output, context_output)
+            # File update failed
+            temporary_response['file_updates'] = {
+                'status': 'error',
+                'error': immediate_result,
+                'updates': file_updates
+            }
+            # Omit large data from long-term response
+            long_term_response['file_updates'] = {
+                'status': 'error',
+                'summary': 'validation errors',
+                'count': len(file_updates),
+                'paths': [u['path'] for u in file_updates]
+            }
 
-    # 2. Handle processors
+            # Return early with error
+            return (long_term_response, temporary_response, False)
+        else:
+            temporary_response['file_updates'] = {
+                'status': 'ok',
+                'summary': context_summary,
+                'updates': file_updates
+            }
+            # Omit large data (overwrite content, search/replace ops) from long-term response
+            long_term_response['file_updates'] = {
+                'status': 'ok',
+                'summary': context_summary,
+                'count': len(file_updates),
+                'paths': [u['path'] for u in file_updates]
+            }
+
+            # Commit changes if files were updated
+            if maca.last_head_commit != git_ops.get_head_commit(maca.worktree_path):
+                commit_summary = context_summary.replace("file_updates: ", "")
+                git_ops.commit_changes(maca.worktree_path, f"AI: {commit_summary}")
+                maca.last_head_commit = git_ops.get_head_commit(maca.worktree_path)
+                maca.update_state()
+
+    # 2. Handle user questions (to get input before data gathering operations)
+    if user_questions:
+        # Q&A are stored as separate messages in long-term context
+        ask_questions(user_questions, maca)
+        temporary_response['user_questions'] = {
+            'count': len(user_questions),
+            'questions': user_questions
+        }
+        # Q&A already stored in separate messages, omit details from response
+        long_term_response['user_questions'] = {
+            'count': len(user_questions),
+            'details': "OMITTED"
+        }
+
+    # 3. Handle file reads
+    if file_reads:
+        file_contents = read_files(file_reads, maca.worktree_path)
+        temporary_response['file_reads'] = {
+            'count': len(file_reads),
+            'specs': file_reads,
+            'contents': file_contents
+        }
+        long_term_response['file_reads'] = {
+            'count': len(file_reads),
+            'specs': file_reads,
+            'contents': "OMITTED"
+        }
+
+    # 4. Handle file searches
+    if file_searches:
+        search_results = execute_searches(file_searches, maca.worktree_path)
+        temporary_response['file_searches'] = {
+            'count': len(file_searches),
+            'specs': file_searches,
+            'results': search_results
+        }
+        long_term_response['file_searches'] = {
+            'count': len(file_searches),
+            'match_count': len(search_results),
+            'specs': file_searches,
+            'results': "OMITTED"
+        }
+
+    # 5. Handle shell commands
+    if shell_commands:
+        shell_results = execute_shell_commands(shell_commands, maca.worktree_path, maca.repo_root)
+        temporary_response['shell_commands'] = {
+            'count': len(shell_commands),
+            'results': shell_results
+        }
+        long_term_response['shell_commands'] = {
+            'count': len(shell_commands),
+            'commands': [r['command'] for r in shell_results],
+            'results': "OMITTED"
+        }
+
+    # 6. Handle sub-processors
     if sub_processors:
         # Load subprompt
         script_dir = Path(__file__).parent
         subprompt_path = script_dir / 'SUBPROMPT.md'
 
         if not subprompt_path.exists():
-            return ("Error: SUBPROMPT.md not found", "respond: error")
+            error_response = {"error": "SUBPROMPT.md not found"}
+            return (error_response, error_response, False)
 
         subprompt = subprompt_path.read_text()
 
@@ -772,18 +885,33 @@ def respond(
             result = execute_processor(processor, maca, subprompt)
             processor_results.append(result)
 
-        temporary_response.append(f"Processor Results:\n" + "\n\n---\n\n".join(processor_results))
-        long_term_summary.append(f"processors: executed {len(sub_processors)}")
+        temporary_response['sub_processors'] = {
+            'count': len(sub_processors),
+            'results': processor_results
+        }
+        long_term_response['sub_processors'] = {
+            'count': len(sub_processors),
+            'results': "OMITTED"
+        }
 
-    # 3. Handle user questions
-    if user_questions:
-        # Q&A are stored as separate messages in long-term context
-        ask_questions(user_questions, maca)
+    # 7. Add notes to context if provided
+    if notes_for_context:
+        temporary_response['notes_for_context'] = notes_for_context
+        long_term_response['notes_for_context'] = notes_for_context
 
+    # 8. Add user output if provided
+    if user_output:
+        temporary_response['user_output'] = user_output
+        long_term_response['user_output'] = user_output
+        # Print to console
+        cprint(C_GOOD, user_output)
+
+    # 9. Manage context cleanup
     if not keep_extended_context:
         maca.clear_temporary_messages()
 
-    return ("\n\n".join(long_term_summary), "\n\n".join(temporary_response), done)
+    return (long_term_response, temporary_response, done or False)
 
 
 RESPOND_TOOL_SCHEMA = generate_tool_schema(respond)
+SUBPROCESSOR_RESPOND_TOOL_SCHEMA = generate_tool_schema(subprocessor_respond)

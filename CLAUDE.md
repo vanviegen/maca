@@ -60,10 +60,12 @@ respond(
 - Loads system prompt from `prompt.md` (plain markdown, no headers)
 - Model specified via -m command line argument (default: anthropic/claude-sonnet-4.5)
 - OpenRouter API used for all LLM calls (via `call_llm` in utils.py)
-- Automatic context size management:
-  - When tool output >500 chars: shown once with ephemeral cache, then replaced with summary
+- Two-tier context system:
+  - **Temporary context**: Full data (file contents, search results, shell output, complete file_updates)
+  - **Long-term context**: Metadata and summaries only; large data replaced with "OMITTED"
+  - Tool results shown once with full data (ephemeral cache), then only metadata persists
   - Uses Anthropic ephemeral cache control markers
-  - `process_tool_call_from_message()` method handles tool execution and result processing
+  - LLM sees full data once per respond call, extracts key info to `notes_for_context`
 
 **State Tracking** (AGENTS.md and code_map)
 - AGENTS.md and project code_map loaded at initialization as system messages
@@ -104,9 +106,12 @@ respond(
 
 **file_updates Parameter**
 - Create, modify, or delete files
+- **Executed FIRST** (before processors and data gathering operations)
 - Operations: `overwrite` (full file write), `update` (search/replace), `rename` (move/delete)
 - Each update requires a `summary` field for context tracking
 - Operations execute in order: overwrite, update, rename
+- Full update details (overwrite content, search/replace ops) shown in temporary context only
+- Long-term context stores: status, summary, count, and paths (content marked as "OMITTED")
 
 **processors Parameter**
 - Spawn sub-contexts for data gathering (reading files, shell commands, searches)
@@ -129,6 +134,26 @@ respond(
 - Set to `true` when task is fully complete
 - Triggers user review and merge workflow
 - User can merge, continue, cancel, or delete
+
+**respond Tool Return Values**
+- Returns tuple: `(long_term_response, temporary_response, done)`
+- Both responses are Dicts with same structure but different content:
+  - **temporary_response**: Full data including file contents, search results, complete file_updates
+  - **long_term_response**: Metadata only; large data replaced with "OMITTED"
+- Both responses serialized to JSON via `json.dumps()` in `maca.py`
+- Temporary response added with ephemeral cache control (cleared after next respond call)
+- Long-term response persists across all iterations
+
+**"OMITTED" Replacement Strategy**
+- String `"OMITTED"` replaces large data in long-term context
+- Applies to:
+  - `file_updates`: Full update objects → count + paths only
+  - `file_reads`: File contents → "OMITTED" string
+  - `file_searches`: Search results → "OMITTED" string
+  - `shell_commands`: Command output → "OMITTED" string
+  - `sub_processors`: Processor results → "OMITTED" string
+  - `user_questions`: Question details → "OMITTED" string (Q&A stored as separate messages)
+- Metadata always preserved: counts, paths, specs, commands, summaries
 
 **LLM Call Logic** (`utils.py`)
 - `call_llm()` function handles all LLM API interactions
@@ -160,12 +185,21 @@ respond(
 ### Understanding the Flow
 1. User provides task
 2. Assistant calls `respond` tool with appropriate parameters
-3. If `file_updates` provided, files are modified
-4. If `processors` provided, sub-contexts gather data and return results
-5. If `user_questions` provided, user is prompted for input
-6. Git commit created if files were modified
-7. After commits, AGENTS.md and code_map diffs are tracked (if changed)
-8. When complete, assistant sets `complete=true` → user approves → squash merge to main
+3. **Execution order in respond tool:**
+   a. `file_updates` executed FIRST (files modified, LLM already output write comments)
+   b. Git commit created if files were modified
+   c. AGENTS.md and code_map diffs tracked (if changed after commit)
+   d. `user_questions` asked (to get input before data gathering)
+   e. `file_reads` executed (file contents read into temporary context)
+   f. `file_searches` executed (search results into temporary context)
+   g. `shell_commands` executed (command output into temporary context)
+   h. `sub_processors` executed (processor results into temporary context)
+   i. `notes_for_context` and `user_output` added to responses
+4. Tool returns `(long_term_response, temporary_response, done)`
+5. Both responses serialized to JSON and added to context:
+   - Temporary: full data with ephemeral cache (cleared next iteration)
+   - Long-term: metadata with "OMITTED" for large data (persists)
+6. When complete, assistant sets `done=true` → user approves → squash merge to main
 
 ### Key Design Principles
 - **Single Tool**: All actions through one `respond` tool with different parameters
@@ -174,7 +208,7 @@ respond(
 - **Traceability**: Git commits per respond call, human-readable logs, state diffs
 - **Safety**: Docker for command execution
 - **Autonomy**: Works independently with minimal back-and-forth
-- **Context Management**: Processors keep file contents out of main context
+- **Context Management**: Two-tier system keeps full data ephemeral, metadata persists
 
 ### Testing and Debugging
 - Session logs in `.maca/<session_id>.log`
@@ -187,7 +221,10 @@ respond(
 - The `respond` tool is defined in `tools.py`
 - Parameters are defined as TypedDict classes
 - Helper functions handle specific operations (apply_file_updates, execute_processor, etc.)
-- Tool returns tuple: (immediate_result, context_summary)
+- Tool returns tuple: `(long_term_response, temporary_response, done)`
+  - Both responses are Dicts with mirrored structure
+  - Long-term response replaces large data with "OMITTED" string
+  - Temporary response contains full data
 - Schema auto-generated via reflection
 
 ### Adding New Processor Capabilities
