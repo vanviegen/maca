@@ -911,14 +911,8 @@ def respond(
             result = execute_processor(processor, maca, subprompt)
             processor_results.append(result)
 
-        temporary_response['sub_processors'] = {
-            'count': len(sub_processors),
-            'results': processor_results
-        }
-        long_term_response['sub_processors'] = {
-            'count': len(sub_processors),
-            'results': "OMITTED"
-        }
+        temporary_response['sub_processors'] = processor_results
+        long_term_response['sub_processors'] = "OMITTED"
 
     # 7. Add notes to context if provided
     if notes_for_context:

@@ -31,7 +31,7 @@ C_IMPORTANT = Color('#f39c12') # Modern orange (orange)
 C_INFO = Color('#3498db')      # Modern blue (peter river)
 
 
-def cprint(*args):
+def cprint(*args, end='\n'):
     """
     Print with color constants and text where color persists until changed.
     
@@ -55,7 +55,7 @@ def cprint(*args):
             # It's text, print with current color
             formatted_parts.append((current_color, str(arg)))
     
-    print_formatted_text(FormattedText(formatted_parts))
+    print_formatted_text(FormattedText(formatted_parts), end=end)
 
 
 class GitignoreMatcher:
@@ -162,20 +162,20 @@ def call_llm(
     tool_schemas: List[Dict[str, Any]]
 ) -> Dict[str, Any]:
     """
-    Call the OpenRouter LLM API with retry logic.
-    
+    Call the OpenRouter LLM API with retry logic and streaming.
+
     Args:
         api_key: OpenRouter API key
         model: Model identifier (e.g., "anthropic/claude-sonnet-4.5")
         messages: List of message dicts with role and content
         tool_schemas: List of tool schemas
-    
+
     Returns:
         Dict with:
         - message: Assistant message dict
         - cost: Cost in microdollars (integer)
         - usage: Usage dict with token counts
-    
+
     Raises:
         Exception: If API call fails after 3 retries
     """
@@ -192,32 +192,128 @@ def call_llm(
         'tools': tool_schemas,
         'usage': {"include": True},
         'tool_choice': 'required',
+        'stream': True,
+        'streamOptions': {'includeUsage': True}
         # 'reasoning': {
         #     'effort': 'medium'
         # }
     }
-    
+
     # Retry up to 3 times
     last_error = None
     for retry in range(3):
         start_time = time.time()
 
         try:
+            cprint(C_INFO, "LLM: starting...", end="")
+
             req = urllib.request.Request(
                 "https://openrouter.ai/api/v1/chat/completions",
                 data=json.dumps(data).encode('utf-8'),
                 headers=headers
             )
-            with urllib.request.urlopen(req) as response:
-                result = json.loads(response.read().decode('utf-8'))
-            
-            # Extract response
-            choice = result['choices'][0]
-            message = choice['message']
 
-            # Extract usage
-            usage = result.get('usage', {})
-            cost = int(usage.get('cost', 0) * 1_000_000)  # Convert dollars to microdollars
+            # Stream the response
+            partial_arg_json = ""
+            buffer = ""
+            message = None
+            usage = None
+
+            with urllib.request.urlopen(req) as response:
+                while True:
+                    chunk = response.read(1024)
+                    if not chunk:
+                        break
+
+                    chunk_str = chunk.decode('utf-8')
+                    buffer += chunk_str
+
+                    # Process complete lines from buffer
+                    while '\n' in buffer:
+                        line_end = buffer.find('\n')
+                        line = buffer[:line_end].strip()
+                        buffer = buffer[line_end + 1:]
+
+                        # Skip empty lines and comments
+                        if not line or line.startswith(':'):
+                            continue
+
+                        # Parse SSE data
+                        if line.startswith('data: '):
+                            data_str = line[6:]
+
+                            # Check for end of stream
+                            if data_str == '[DONE]':
+                                break
+
+                            try:
+                                data_obj = json.loads(data_str)
+
+                                # Extract delta content
+                                delta = data_obj.get('choices', [{}])[0].get('delta', {})
+
+                                # Accumulate tool calls
+                                if 'tool_calls' in delta:
+                                    if message is None:
+                                        message = {'role': 'assistant', 'content': '', 'tool_calls': []}
+
+                                    for tool_call_delta in delta['tool_calls']:
+                                        idx = tool_call_delta.get('index', 0)
+
+                                        # Ensure we have enough tool calls in the array
+                                        while len(message['tool_calls']) <= idx:
+                                            message['tool_calls'].append({
+                                                'id': '',
+                                                'type': 'function',
+                                                'function': {'name': '', 'arguments': ''}
+                                            })
+
+                                        tc = message['tool_calls'][idx]
+
+                                        # Accumulate tool call data
+                                        if 'id' in tool_call_delta:
+                                            tc['id'] = tool_call_delta['id']
+                                        if 'type' in tool_call_delta:
+                                            tc['type'] = tool_call_delta['type']
+                                        if 'function' in tool_call_delta:
+                                            if 'name' in tool_call_delta['function']:
+                                                tc['function']['name'] = tool_call_delta['function']['name']
+                                            if 'arguments' in tool_call_delta['function']:
+                                                tc['function']['arguments'] += tool_call_delta['function']['arguments']
+                                                partial_arg_json = tc['function']['arguments']
+
+                                # Extract usage from final chunk
+                                if 'usage' in data_obj:
+                                    usage = data_obj['usage']
+
+                            except json.JSONDecodeError:
+                                pass  # Ignore malformed JSON chunks
+
+                    # Try to find what field we're currently writing
+                    what = "receiving"
+                    if partial_arg_json:
+                        try:
+                            path = find_json_truncation_point(partial_arg_json)
+                            if path:
+                                what = "receiving " + path[0].replace('_', ' ')
+                        except:
+                            pass  # Ignore errors in truncation point detection
+
+                    # Show progress with current field being written
+                    print('\r\033[K', end='')
+                    cprint(C_INFO, f'LLM: {what}... ({len(partial_arg_json)} bytes)', end='')
+
+
+            # Clear progress line
+            print('\r\033[K', end='')
+            cprint(C_INFO, f'LLM: done! ({len(partial_arg_json)} bytes)')
+
+            # Validate we got a message
+            if message is None:
+                raise Exception("No message received from stream")
+
+            # Calculate cost
+            cost = int(usage.get('cost', 0) * 1_000_000) if usage else 0  # Convert dollars to microdollars
             duration = time.time() - start_time
 
             # Update global cumulative cost
@@ -225,25 +321,25 @@ def call_llm(
             _cumulative_cost += cost
 
             # Log the call
-            log(tag='llm_call', model=model, cost=cost, prompt_tokens=usage['prompt_tokens'], completion_tokens=usage['completion_tokens'], duration=duration)
+            log(tag='llm_call', model=model, cost=cost, prompt_tokens=usage.get('prompt_tokens', 0), completion_tokens=usage.get('completion_tokens', 0), duration=duration)
 
             return {
                 'message': message,
                 'cost': cost,
-                'usage': usage
+                'usage': usage or {}
             }
-            
+
         except Exception as e:
             last_error = e
             if hasattr(e, 'read'):
                 error_body = e.read().decode('utf-8')
             else:
                 error_body = str(e)
-            
+
             if retry < 2:  # Don't log on the last retry
                 cprint(C_BAD, f"LLM error: {error_body}. Attempt {retry+1}/3.")
                 log(tag='error', error="LLM ERROR", retry=retry, message=str(error_body))
-    
+
     # All retries failed
     raise Exception(f"LLM call failed after 3 retries: {last_error}")
 

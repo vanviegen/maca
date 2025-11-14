@@ -176,9 +176,6 @@ class MACA:
         # Loop until completion
         while not done:
 
-            # Print thinking message
-            cprint(C_INFO, "Thinking...")
-
             # Call LLM (retry logic is in call_llm)
             result = call_llm(
                 api_key=self.api_key,
