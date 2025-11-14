@@ -771,6 +771,20 @@ def respond(
 
     # 1. Handle file updates FIRST (LLM has already output the write comments)
     if file_updates:
+        # Print file updates summary
+        for update in file_updates:
+            path = update['path']
+            if update.get('overwrite') is not None:
+                line_count = len(update['overwrite'].splitlines())
+                cprint(C_INFO, f"Writing {path} ({line_count} lines)")
+            elif update.get('update') is not None:
+                cprint(C_INFO, f"Updating {path} ({len(update['update'])} operations)")
+            elif update.get('rename') is not None:
+                if update['rename'] == "":
+                    cprint(C_INFO, f"Deleting {path}")
+                else:
+                    cprint(C_INFO, f"Renaming {path} -> {update['rename']}")
+
         immediate_result, context_summary = apply_file_updates(file_updates, maca.worktree_path)
 
         if immediate_result != "OK":
@@ -827,6 +841,10 @@ def respond(
 
     # 3. Handle file reads
     if file_reads:
+        # Print concise summary
+        file_list = ', '.join(fr['path'] for fr in file_reads)
+        cprint(C_INFO, f"Reading {len(file_reads)} file(s): {file_list}")
+
         file_contents = read_files(file_reads, maca.worktree_path)
         temporary_response['file_reads'] = {
             'count': len(file_reads),
@@ -841,6 +859,10 @@ def respond(
 
     # 4. Handle file searches
     if file_searches:
+        # Print search summary
+        for search in file_searches:
+            cprint(C_INFO, f"Searching for /{search['regex']}/")
+
         search_results = execute_searches(file_searches, maca.worktree_path)
         temporary_response['file_searches'] = {
             'count': len(file_searches),
@@ -856,6 +878,10 @@ def respond(
 
     # 5. Handle shell commands
     if shell_commands:
+        # Print each command upfront
+        for cmd_spec in shell_commands:
+            cprint(C_INFO, f"Running: {cmd_spec['command']}")
+
         shell_results = execute_shell_commands(shell_commands, maca.worktree_path, maca.repo_root)
         temporary_response['shell_commands'] = {
             'count': len(shell_commands),

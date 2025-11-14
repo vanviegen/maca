@@ -10,6 +10,7 @@ import json
 import urllib.request
 import time
 from logger import log
+import re
 
 
 # Global cumulative cost tracking
@@ -369,3 +370,74 @@ def get_matching_files(
     return sorted(filtered_files)
 
 
+def find_json_truncation_point(json):
+    path, i = [], 0
+    
+    while i < len(json) and json[i].isspace():
+        i += 1
+    
+    if i >= len(json):
+        return path
+    
+    stack = []
+    
+    while i < len(json):
+        while i < len(json) and json[i].isspace():
+            i += 1
+        if i >= len(json):
+            break
+            
+        c = json[i]
+        
+        if c == '"':
+            start = i
+            i += 1
+            while i < len(json) and json[i] != '"':
+                i += 2 if json[i] == '\\' else 1
+            if i >= len(json):
+                break
+            i += 1
+            
+            # Check if this is a key
+            j = i
+            while j < len(json) and json[j].isspace():
+                j += 1
+            if j < len(json) and json[j] == ':':
+                key = json[start+1:i-1].replace('\\"', '"').replace('\\\\', '\\')
+                i = j + 1
+                stack.append(('obj', key))
+            elif stack and stack[-1][0] == 'obj':
+                stack.pop()
+                
+        elif c == '{':
+            i += 1
+        elif c == '[':
+            stack.append(('arr', 0))
+            i += 1
+        elif c == ']':
+            if stack and stack[-1][0] == 'arr':
+                stack.pop()
+            i += 1
+        elif c == '}':
+            if stack and stack[-1][0] == 'obj':
+                stack.pop()
+            i += 1
+        elif c == ',':
+            if stack and stack[-1][0] == 'arr':
+                stack[-1] = ('arr', stack[-1][1] + 1)
+            elif stack and stack[-1][0] == 'obj':
+                stack.pop()
+            i += 1
+        elif re.match(r'[-0-9]', c):
+            m = re.match(r'-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?', json[i:])
+            i += len(m.group(0)) if m else 1
+            if stack and stack[-1][0] == 'obj':
+                stack.pop()
+        elif json[i:i+4] in ('true', 'null') or json[i:i+5] == 'false':
+            i += 4 if json[i] == 't' or json[i] == 'n' else 5
+            if stack and stack[-1][0] == 'obj':
+                stack.pop()
+        else:
+            i += 1
+    
+    return [x[1] for x in stack]
