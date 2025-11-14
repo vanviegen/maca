@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """Multi-Agent Coding Assistant - Main entry point."""
 
+from copy import copy, deepcopy
 import sys
 import os
 import time
 import json
 from pathlib import Path
 from typing import Dict, Any, Optional
+from unittest import result
 
 from prompt_toolkit import prompt as pt_prompt
-from prompt_toolkit.shortcuts import radiolist_dialog
+from prompt_toolkit.shortcuts import choice
 from prompt_toolkit.history import FileHistory
 
 import git_ops
@@ -19,6 +21,9 @@ from logger import log
 import logger
 import code_map
 
+PERSIST_TEMPORARY = 1
+PERSIST_LONG_TERM = 2 
+PERSIST_PERMANENT = 4
 
 class ContextError(Exception):
     """Context operation failed."""
@@ -53,14 +58,15 @@ class MACA:
         self.branch_name = None  # Set during create_session
 
         # LLM context management
-        self._messages = []
+        self.messages: list[Dict] = []
+        self.long_term_messages: list[Dict] = []
+        self.permanent_messages: list[Dict] = []
         self.last_head_commit = None
 
         # State tracking for AGENTS.md and code_map
         self.agents_md_state = None  # Current AGENTS.md content
         self.code_map_state = None  # Current code map content
-        self.state_message_indices = []  # Track indices of state update messages
-        self.state_delta_size = 0
+        self.state_delta_threshold = 0
         self.prev_state = None
 
         # History (initialized after repo_root is set)
@@ -71,14 +77,13 @@ class MACA:
         if not git_ops.is_git_repo(self.repo_path):
             cprint(C_BAD, 'Not in a git repository.')
 
-            response = radiolist_dialog(
-                title='Git Repository Required',
-                text='MACA requires a git repository. Initialize one now?',
-                values=[
+            response = choice(
+                message='MACA requires a git repository. Initialize one now?',
+                options=[
                     ('yes', 'Yes, initialize git repository'),
                     ('no', 'No, exit')
                 ]
-            ).run()
+            )
 
             if response != 'yes':
                 print("Exiting.")
@@ -88,20 +93,6 @@ class MACA:
             cprint(C_GOOD, 'Git repository initialized.')
 
         return git_ops.get_repo_root(self.repo_path)
-
-    def create_session(self):
-        """Create a new session with worktree and branch."""
-        # Find next session ID
-        self.session_id = git_ops.find_next_session_id(self.repo_root)
-
-        # Create worktree and branch
-        self.worktree_path, self.branch_name = git_ops.create_session_worktree(self.repo_root, self.session_id)
-
-        cprint(
-            C_GOOD, f'Session {self.session_id} created',
-            C_NORMAL, ' (branch: ', C_INFO, self.branch_name,
-            C_NORMAL, ', worktree: ', C_INFO, str(self.worktree_path.relative_to(self.repo_root)), C_NORMAL, ')',
-        )
 
     def _load_system_prompt(self):
         """Load the system prompt from prompt.md."""
@@ -139,146 +130,39 @@ class MACA:
                         self.add_message({
                             'role': 'user',
                             'content': content
-                        })
-                        self.state_message_indices.append(len(self._messages) - 1)
-                        self.state_delta_size += len(content)
-
-            if self.state_delta_size > org_size * 0.25:
-                cprint(C_IMPORTANT, '→ State changes exceed 25% of original size, rewriting history')
-                # Remove all state update messages (walk backwards to preserve indices)
-                for idx in reversed(self.state_message_indices):
-                    if idx < len(self._messages):
-                        del self._messages[idx]
-
-                # Clear the tracking list
-                self.state_message_indices.clear()
-                self.state_delta_size = 0
-                self.prev_state = None
+                        }, 'state')
+            
+            self.state_delta_threshold = int(0.25 * org_size)
 
         if not self.prev_state:
             for name, new in state.items():
                 self.add_message({
                     'role': 'user',
                     'content': f"[[{name}]]\n\n{new}"
-                })
-                self.state_message_indices.append(len(self._messages) - 1)
+                }, 'state')
 
         self.prev_state = state
 
-    def add_message(self, message: Dict):
-        """Add a message dict to the context and the log."""
-        log(tag='message', **message)
-        self._messages.append(message)
+    def add_message(self, message: Dict, persistence = 'normal'):
+        """Add a message dict to the context and the log. Persistence can be normal, temporary, long-term-only, state."""
+        log(tag='message', persistence=persistence, **message)
+        if persistence != 'long-term-only':
+            self.messages.append(message)
+        if persistence != 'temporary':
+            self.long_term_messages.append(message)
+            if persistence == 'state':
+                self.state_delta_threshold -= len(json.dumps(message))
+            else:
+                self.permanent_messages.append(message)
 
-    def _check_state_changes(self):
-        """Check if AGENTS.md or code_map changed and update state."""
-        self.update_state()
-
-    def process_tool_call_from_message(self, message: Dict) -> tuple[bool, Optional[tuple]]:
-        """
-        Extract and execute tool call from LLM message, handle result.
-
-        Args:
-            message: LLM response message containing tool_calls
-
-        Returns:
-            Tuple of (completed, pending_summary_replacement)
-            - completed: True if this was a completion signal
-            - pending_summary_replacement: (tool_call_id, context_summary) if long output, None otherwise
-        """
-        completed = False
-        pending_summary_replacement = None
-
-        # Extract tool info
-        tool_calls = message.get('tool_calls', [])
-        if len(tool_calls) != 1:
-            raise ContextError(f"Expected exactly 1 tool call, got {len(tool_calls)}")
-        tool_call = tool_calls[0]
-        tool_name = tool_call['function']['name']
-        tool_args = json.loads(tool_call['function']['arguments'])
-
-        # Should always be 'respond' in new architecture
-        if tool_name != 'respond':
-            raise ContextError(f"Unexpected tool call: {tool_name} (expected 'respond')")
-
-        # Log tool call
-        log(tag='tool_call', tool=tool_name, args=str(tool_args))
-
-        # Print tool info
-        think_out_loud = tool_args.get('think_out_loud', '')
-        cprint(C_GOOD, '→ ', C_IMPORTANT, f"Thoughts: {think_out_loud}")
-
-        # Execute tool
-        tool_start = time.time()
-        try:
-            immediate_result, context_summary = tools.respond(
-                **tool_args,
-                maca=self
-            )
-            tool_duration = time.time() - tool_start
-        except Exception as err:
-            immediate_result = {"error": str(err)}
-            context_summary = f"respond: error"
-            tool_duration = time.time() - tool_start
-
-        # Check if this is a completion signal
-        if isinstance(immediate_result, tools.ReadyResult):
-            immediate_result = immediate_result.result
-            completed = True
-
-        # Log tool result
-        if completed:
-            log(tag='tool_result', tool=tool_name, duration=tool_duration, result="completed", completed=True)
-        elif isinstance(immediate_result, dict) and 'error' in immediate_result:
-            log(tag='tool_result', tool=tool_name, duration=tool_duration, error=immediate_result['error'])
-        else:
-            result_preview = str(immediate_result)[:100] + ('...' if len(str(immediate_result)) > 100 else '')
-            log(tag='tool_result', tool=tool_name, duration=tool_duration, result=result_preview, completed=False)
-
-        # Convert immediate result to string for LLM
-        immediate_output = immediate_result if isinstance(immediate_result, str) else json.dumps(immediate_result)
-
-        # Check if output is long (>500 chars) - show once then replace with summary
-        if not completed and len(immediate_output) > 500:
-            # Add the full immediate result (temporary, one-time view) with ephemeral cache
-            self.add_message({
-                'role': 'user',
-                'content': [
-                    {
-                        'type': 'tool_result',
-                        'tool_use_id': tool_call['id'],
-                        'content': immediate_output,
-                        'cache_control': {'type': 'ephemeral'}
-                    }
-                ]
-            })
-
-            cprint(C_IMPORTANT, f'→ Long output ({len(immediate_output)} chars), showing once with ephemeral cache')
-
-            # Schedule replacement with summary after next LLM call
-            pending_summary_replacement = (tool_call['id'], context_summary)
-        else:
-            # Short output or completion - add directly to context
-            self.add_message({
-                'role': 'user',
-                'content': [
-                    {
-                        'type': 'tool_result',
-                        'tool_use_id': tool_call['id'],
-                        'content': context_summary
-                    }
-                ]
-            })
-
-        # Check for git changes and commit if needed
-        commit_msg = "respond"
-        if git_ops.commit_changes(self.worktree_path, commit_msg):
-            cprint(C_GOOD, '✓ Committed changes')
-
-            # Check if AGENTS.md or code_map changed
-            self._check_state_changes()
-
-        return completed, pending_summary_replacement
+    def clear_temporary_messages(self):
+        """Clear all temporary messages from the context."""
+        if self.state_delta_threshold <= 0:
+            cprint(C_IMPORTANT, '→ State changes exceed 25% of original size, rewriting history')
+            self.long_term_messages = self.permanent_messages
+            self.prev_state = None
+            self.update_state()
+        self.messages = self.long_term_messages
 
     def run_main_loop(self):
         """
@@ -287,29 +171,10 @@ class MACA:
         Returns:
             None (runs until complete() is called)
         """
-        completed = False
-        pending_summary_replacement = None  # Track (tool_call_id, context_summary) to replace after next LLM call
+        done = False
 
         # Loop until completion
-        while not completed:
-            # Replace long output with summary if needed (after LLM has seen the full data)
-            if pending_summary_replacement:
-                tool_call_id, context_summary = pending_summary_replacement
-                # Remove the last message (tool result with ephemeral cache)
-                self._messages = self._messages[:-1]
-                # Add the concise summary instead
-                self.add_message({
-                    'role': 'user',
-                    'content': [
-                        {
-                            'type': 'tool_result',
-                            'tool_use_id': tool_call_id,
-                            'content': context_summary
-                        }
-                    ]
-                })
-                cprint(C_GOOD, '✓ Replaced long output with summary')
-                pending_summary_replacement = None
+        while not done:
 
             # Print thinking message
             cprint(C_INFO, "Thinking...")
@@ -318,23 +183,103 @@ class MACA:
             result = call_llm(
                 api_key=self.api_key,
                 model=self.model,
-                messages=self._messages,
+                messages=self.messages,
                 tool_schemas=[tools.RESPOND_TOOL_SCHEMA],
             )
 
-            # Add assistant message to history
-            self.add_message(result['message'])
+            # Log the full message temporarily. The respond function will strip 'message' of details,
+            # so we can log the short version to long-term below.
+            message = result['message']
+            self.add_message(deepcopy(message), 'temporary')
 
             # Process tool call from LLM response
-            message = result['message']
-            completed, new_pending = self.process_tool_call_from_message(message)
-            if new_pending:
-                pending_summary_replacement = new_pending
+            tool_calls = message.get('tool_calls', [])
+            if len(tool_calls) != 1:
+                raise ContextError(f"Expected exactly 1 tool call, got {len(tool_calls)}")
+            args = json.loads(message['tool_calls'][0]['function']['arguments'])
+            log(tag='tool_call', **args)
+            (long_term_summary, temporary_response, done) = tools.respond(**args, maca=self)
 
-            if completed:
-                cprint(C_GOOD, '✓ Task completed. Total cost: ', C_IMPORTANT, f'{get_cumulative_cost()}μ$')
-                log(tag='complete', total_cost=get_cumulative_cost())
-                break
+            # Add assistant message (and trimmed version) to history
+            self.add_message(message, 'long-term-only')
+
+            # Add tool result messages (temporary and long-term summary)
+            self.add_message({'role': 'user',
+                'content': [
+                    {
+                        'type': 'tool_result',
+                        'tool_use_id': tool_calls[0]['id'],
+                        'content': temporary_response,
+                        'cache_control': {'type': 'ephemeral'}
+                    }
+                ]
+            }, 'temporary')
+
+            self.add_message({'role': 'user',
+                'content': [
+                    {
+                        'type': 'tool_result',
+                        'tool_use_id': tool_calls[0]['id'],
+                        'content': long_term_summary,
+                        'cache_control': {'type': 'ephemeral'}
+                    }
+                ]
+            }, 'long-term-only')
+
+            if done and not self.handle_done():
+                done = False
+
+        cprint(C_GOOD, '✓ Task completed. Total cost: ', C_IMPORTANT, f'{get_cumulative_cost()}μ$')
+        log(tag='complete', total_cost=get_cumulative_cost())
+
+    def handle_done(self):
+        cprint(C_GOOD, '\n✓ Task completed!\n')
+
+        # Ask for approval
+        response = choice(
+            message=f'How to proceed? [{self.worktree_path}]',
+            options=[
+                ('merge', 'Merge into main'),
+                ('continue', 'Ask for further changes'),
+                ('cancel', 'Leave as-is for manual review'),
+                ('delete', 'Delete everything'),
+            ]
+        )
+
+        if response == 'merge':
+            cprint(C_INFO, 'Merging changes...')
+
+            # Extract commit message from result (first line)
+            commit_msg = result.split('\n')[0]
+
+            # Merge
+            conflict = git_ops.merge_to_main(maca.repo_root, maca.worktree_path, maca.branch_name, commit_msg)
+
+            if conflict:
+                cprint(C_BAD, "⚠ Merge conflicts!")
+                return (f"Merge conflict while rebasing. Please resolve merge conflicts by reading the affected files and using file_updates to resolve the conflicts. Then use a processor with shell_command to run `git add <filename>.. && git rebase --continue`, before calling respond again with complete=true to try the merge again. Here is the rebase output:\n\n{conflict}",
+                        "respond: merge conflict")
+
+            # Cleanup
+            git_ops.cleanup_session(maca.repo_root, maca.worktree_path, maca.branch_name)
+            cprint(C_GOOD, '✓ Merged and cleaned up')
+            git_ops.create_session_worktree(self.repo_root, self.session_id)
+
+            return True
+
+        if response == 'continue':
+            feedback = pt_prompt("What changes do you want?\n> ", multiline=True, history=maca.history)
+            maca.add_message({"role": "user", "content": feedback})
+            return False
+
+        if response == 'delete':
+            git_ops.cleanup_session(maca.repo_root, maca.worktree_path, maca.branch_name)
+            cprint(C_BAD, '✓ Deleted worktree and branch')
+            return True
+
+        cprint(C_IMPORTANT, "Keeping worktree for manual review.")
+        return True
+
 
     def run(self):
         """Main entry point that sets up and runs the assistant."""
@@ -347,7 +292,8 @@ class MACA:
         self.history = FileHistory(str(history_file))
 
         # Create session
-        self.create_session()
+        self.session_id = git_ops.find_next_session_id(self.repo_root)
+        self.worktree_path, self.branch_name = git_ops.create_session_worktree(self.repo_root, self.session_id)
 
         # Initialize logger
         logger.init(self.repo_root, self.session_id)

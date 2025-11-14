@@ -7,6 +7,8 @@ import re
 from pathlib import Path
 from typing import Optional
 
+from utils import C_GOOD, C_INFO, C_NORMAL, cprint
+
 
 class GitError(Exception):
     """Git operation failed."""
@@ -140,6 +142,12 @@ def create_session_worktree(repo_root, session_id):
     # Create .scratch directory for temporary analysis files
     scratch_dir = worktree_path / '.scratch'
     scratch_dir.mkdir(exist_ok=True)
+
+    cprint(
+        C_GOOD, f'Session {session_id} created',
+        C_NORMAL, ' (branch: ', C_INFO, branch_name,
+        C_NORMAL, ', worktree: ', C_INFO, str(worktree_path.relative_to(repo_root)), C_NORMAL, ')',
+    )
 
     return worktree_path, branch_name
 

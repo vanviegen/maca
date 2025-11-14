@@ -550,19 +550,7 @@ def read_files(file_specs: List[FileRead], worktree_path: Path) -> List[str]:
     return contents
 
 
-def ask_questions(questions: List[Question], history) -> str:
-    """
-    Ask the user questions and return answers.
-
-    Args:
-        questions: List of question specifications
-        history: FileHistory for prompt_toolkit
-
-    Returns:
-        Formatted string with all Q&A pairs
-    """
-    answers = []
-
+def ask_questions(questions: List[Question], maca) -> str:
     for i, q in enumerate(questions, 1):
         prompt_text = q.get('prompt', '')
         preset_answers = q.get('preset_answers')
@@ -585,10 +573,8 @@ def ask_questions(questions: List[Question], history) -> str:
             # Simple text input
             answer = pt_prompt(f"Question {i}/{len(questions)}: {prompt_text}\n> ", history=history)
 
-        answers.append(f"Q{i}: {prompt_text}\nA{i}: {answer}")
-
-    result = "\n\n".join(answers)
-    return result
+        maca.add_message({'role': 'assistant', 'content': prompt_text})
+        maca.add_message({'role': 'user', 'content': answer})
 
 
 def execute_processor(processor: Processor, maca, subprompt: str) -> str:
@@ -734,45 +720,43 @@ def respond(
         file_updates: Optional list of file modifications to apply.
         done: Set to true if you have completed the overall task given by the user. This will trigger the merge process. Make sure everything is done, nice and clean before you set this! If set, further operations (file_reads, file_searches, shell_commands, sub_processors) are not allowed. Also, you *must* provide a meaningful `user_output` answering the user question or briefly summarizing the work done.
 
+        user_questions: Optional list of questions to ask the user. Answers are stored in long-term context.
+
         file_reads: Optional list of file (parts) to read into temporary context.
         file_searches: Optional list of file searches to read into temporary context.
         shell_commands: Optional list of shell commands to execute. Stdout and stderr go into temporary context. Don't even use shell commands to write files - use file_updates for that!
-
-        user_questions: Optional list of questions to ask the user. Answers are stored in long-term context.
         sub_processors: Optional list of LLM-calls (in a a fresh context) to perform. These will be single-shots. They can only update files (optionally limited) and return a result. This can be very useful to:
           - Ask a cheaper LLM to do some file edits.
           - Split up independent work to different files into parallel LLM calls.
           - Ask a more capable LLM for help on a hard problem.
           - Ask a web-search-enabled LLM to look up info online.
+          The result goes into temporary context.
 
         notes_for_context: Succinct (sacrifice grammar for briefness): A brief summary of...
           - Your thoughts (if valuable)
-          - Temporary context that will be lost (all file_reads+file_searches+shell_commands unless keep_extended_context is set), insofar that you'll need it later in the conversation
+          - Temporary context that will be lost (all file_reads+file_searches+shell_commands+sub_processors unless keep_extended_context is set), insofar that you'll need it later in the conversation
           - What the next completion needs to do with the input data it receives (unless obvious)
           This will be saved in long-term context.
         user_output: Optionally what to show to the user. Don't provide this, unless there is something interesting and new to tell. If `done` is true, you *must* provide a meaningful answer here. Keep it short.
-
-    Returns:
-        Immediate: Full details of what happened
-        Long-term context: Brief summary for context
     """
-    immediate_parts = []
-    context_parts = []
+
+    long_term_summary: list[str] = [] # This should contain brief info about what actions were taken (like which files were written, but no file data), brief action results (like how many lines changed), and the notes_for_context. For user_questions, the full Q&As go into permanent context as separate assistant and user messages.
+    temporary_response: list[str] = [] # This contains the full output of the operations done here (file_reads, file_searches, shell_commands, sub_processors, file_updates)
 
     # 1. Handle file updates
     if file_updates:
         immediate_result, context_summary = apply_file_updates(file_updates, maca.worktree_path)
-        immediate_parts.append(f"File Updates: {immediate_result}")
-        context_parts.append(context_summary)
+        temporary_response.append(f"File Updates: {immediate_result}")
+        long_term_summary.append(context_summary)
 
         if immediate_result != "OK":
             # File update failed, return early
-            immediate_output = "\n\n".join(immediate_parts)
-            context_output = "; ".join(context_parts)
+            immediate_output = "\n\n".join(temporary_response)
+            context_output = "; ".join(long_term_summary)
             return (immediate_output, context_output)
 
     # 2. Handle processors
-    if processors:
+    if sub_processors:
         # Load subprompt
         script_dir = Path(__file__).parent
         subprompt_path = script_dir / 'SUBPROMPT.md'
@@ -783,81 +767,23 @@ def respond(
         subprompt = subprompt_path.read_text()
 
         processor_results = []
-        for i, processor in enumerate(processors):
-            cprint(C_INFO, f'  [{i + 1}/{len(processors)}] Executing processor')
+        for i, processor in enumerate(sub_processors):
+            cprint(C_INFO, f'  [{i + 1}/{len(sub_processors)}] Executing processor')
             result = execute_processor(processor, maca, subprompt)
             processor_results.append(result)
 
-        immediate_parts.append(f"Processor Results:\n" + "\n\n---\n\n".join(processor_results))
-        context_parts.append(f"processors: executed {len(processors)}")
+        temporary_response.append(f"Processor Results:\n" + "\n\n---\n\n".join(processor_results))
+        long_term_summary.append(f"processors: executed {len(sub_processors)}")
 
     # 3. Handle user questions
     if user_questions:
-        answers = ask_questions(user_questions, maca.history)
-        immediate_parts.append(f"User Answers:\n{answers}")
-        context_parts.append(f"user_questions: asked {len(user_questions)} questions")
+        # Q&A are stored as separate messages in long-term context
+        ask_questions(user_questions, maca)
 
-    # 4. Handle completion
-    if complete:
-        cprint(C_GOOD, '\n✓ Task completed!\n\n', C_NORMAL, result, '\n')
+    if not keep_extended_context:
+        maca.clear_temporary_messages()
 
-        # Ask for approval
-        response = choice(
-            message=f'{maca.worktree_path} -- How to proceed?',
-            options=[
-                ('merge', 'Merge into main'),
-                ('continue', 'Ask for further changes'),
-                ('cancel', 'Leave as-is for manual review'),
-                ('delete', 'Delete everything'),
-            ]
-        )
-
-        if response == 'merge':
-            cprint(C_INFO, 'Merging changes...')
-
-            # Extract commit message from result (first line)
-            commit_msg = result.split('\n')[0]
-
-            # Merge
-            conflict = git_ops.merge_to_main(maca.repo_root, maca.worktree_path, maca.branch_name, commit_msg)
-
-            if conflict:
-                cprint(C_BAD, "⚠ Merge conflicts!")
-                return (f"Merge conflict while rebasing. Please resolve merge conflicts by reading the affected files and using file_updates to resolve the conflicts. Then use a processor with shell_command to run `git add <filename>.. && git rebase --continue`, before calling respond again with complete=true to try the merge again. Here is the rebase output:\n\n{conflict}",
-                        "respond: merge conflict")
-
-            # Cleanup
-            git_ops.cleanup_session(maca.repo_root, maca.worktree_path, maca.branch_name)
-            cprint(C_GOOD, '✓ Merged and cleaned up')
-
-            return (ReadyResult(result), "respond: completed and merged")
-
-        elif response == 'continue':
-            feedback = pt_prompt("What changes do you want?\n> ", multiline=True, history=maca.history)
-            maca.add_message({"role": "user", "content": feedback})
-            return ('User rejected completion and provided feedback.', 'respond: completion rejected')
-
-        elif response == 'delete':
-            git_ops.cleanup_session(maca.repo_root, maca.worktree_path, maca.branch_name)
-            cprint(C_BAD, '✓ Deleted worktree and branch')
-            return (ReadyResult(result), "respond: completed and deleted")
-
-        else:  # cancel
-            print("Keeping worktree for manual review.")
-            return (ReadyResult(result), "respond: completed")
-
-    # Build final output
-    if immediate_parts:
-        immediate_output = "\n\n".join(immediate_parts)
-    else:
-        immediate_output = "OK"
-
-    if context_parts:
-        context_output = "respond: " + "; ".join(context_parts)
-    else:
-        context_output = "respond: executed"
-
-    return (immediate_output, context_output)
+    return ("\n\n".join(long_term_summary), "\n\n".join(temporary_response), done)
 
 
 RESPOND_TOOL_SCHEMA = generate_tool_schema(respond)
