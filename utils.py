@@ -191,10 +191,9 @@ def call_llm(
         'tools': tool_schemas,
         'usage': {"include": True},
         'tool_choice': 'required',
-        'reasoning': {
-            'effort': 'medium',
-            'max_tokens': 650
-        }
+        # 'reasoning': {
+        #     'effort': 'medium'
+        # }
     }
     
     # Retry up to 3 times

@@ -206,7 +206,7 @@ class MACA:
 
         # Print tool info
         think_out_loud = tool_args.get('think_out_loud', '')
-        cprint(C_GOOD, '→ ', C_IMPORTANT, f"respond: {think_out_loud}")
+        cprint(C_GOOD, '→ ', C_IMPORTANT, f"Thoughts: {think_out_loud}")
 
         # Execute tool
         tool_start = time.time()
@@ -240,18 +240,17 @@ class MACA:
 
         # Check if output is long (>500 chars) - show once then replace with summary
         if not completed and len(immediate_output) > 500:
-            # Add ephemeral cache control marker before the long message
+            # Add the full immediate result (temporary, one-time view) with ephemeral cache
             self.add_message({
                 'role': 'user',
-                'content': '',
-                'cache_control': {'type': 'ephemeral'}
-            })
-
-            # Add the full immediate result (temporary, one-time view)
-            self.add_message({
-                'type': 'function_call_output',
-                'call_id': tool_call['id'],
-                'output': immediate_output
+                'content': [
+                    {
+                        'type': 'tool_result',
+                        'tool_use_id': tool_call['id'],
+                        'content': immediate_output,
+                        'cache_control': {'type': 'ephemeral'}
+                    }
+                ]
             })
 
             cprint(C_IMPORTANT, f'→ Long output ({len(immediate_output)} chars), showing once with ephemeral cache')
@@ -261,9 +260,14 @@ class MACA:
         else:
             # Short output or completion - add directly to context
             self.add_message({
-                'type': 'function_call_output',
-                'call_id': tool_call['id'],
-                'output': context_summary
+                'role': 'user',
+                'content': [
+                    {
+                        'type': 'tool_result',
+                        'tool_use_id': tool_call['id'],
+                        'content': context_summary
+                    }
+                ]
             })
 
         # Check for git changes and commit if needed
@@ -291,13 +295,18 @@ class MACA:
             # Replace long output with summary if needed (after LLM has seen the full data)
             if pending_summary_replacement:
                 tool_call_id, context_summary = pending_summary_replacement
-                # Remove the last 2 messages (ephemeral cache marker + long output)
-                self._messages = self._messages[:-2]
+                # Remove the last message (tool result with ephemeral cache)
+                self._messages = self._messages[:-1]
                 # Add the concise summary instead
                 self.add_message({
-                    'type': 'function_call_output',
-                    'call_id': tool_call_id,
-                    'output': context_summary
+                    'role': 'user',
+                    'content': [
+                        {
+                            'type': 'tool_result',
+                            'tool_use_id': tool_call_id,
+                            'content': context_summary
+                        }
+                    ]
                 })
                 cprint(C_GOOD, '✓ Replaced long output with summary')
                 pending_summary_replacement = None
@@ -310,7 +319,7 @@ class MACA:
                 api_key=self.api_key,
                 model=self.model,
                 messages=self._messages,
-                tool_schemas=list(tools.TOOL_SCHEMAS.values()),
+                tool_schemas=[tools.RESPOND_TOOL_SCHEMA],
             )
 
             # Add assistant message to history

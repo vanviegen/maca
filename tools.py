@@ -9,7 +9,6 @@ from typing import get_type_hints, get_origin, get_args, Any, Dict, List, Union,
 import inspect
 import json
 import re
-import time
 
 from utils import cprint, call_llm, get_matching_files, C_GOOD, C_BAD, C_NORMAL, C_IMPORTANT, C_INFO
 from docker_ops import run_in_container
@@ -104,13 +103,12 @@ class FileSearch(TypedDict, total=False):
     lines_after: Optional[int]
 
 
-class Processor(TypedDict, total=False):
+class SubProcessor(TypedDict, total=False):
     """Specification for spawning a processor sub-context."""
     model: str
     assignment: str
-    read_files: Optional[List[FileRead]]
-    shell_commands: Optional[List[ShellCommand]]
-    file_searches: Optional[List[FileSearch]]
+    file_reads: Optional[List[FileRead]]
+    file_write_allow_patterns: Optional[List[str]] # List of globs that may be written to (default to none)
 
 
 class Question(TypedDict, total=False):
@@ -122,24 +120,6 @@ class Question(TypedDict, total=False):
 # ==============================================================================
 # TOOL SCHEMA GENERATION
 # ==============================================================================
-
-# Tool registry - single registry for all tools
-TOOL_SCHEMAS = {}
-
-
-def tool(func):
-    """
-    Decorator to register a function as an LLM tool.
-
-    Tools are registered by name and schemas are generated on-demand
-    based on the context that uses them.
-    """
-    TOOL_SCHEMAS[func.__name__] = generate_tool_schema(func)
-    # Store function reference for execution
-    func._is_tool = True
-    TOOL_SCHEMAS[func.__name__]['_func'] = func
-    return func
-
 
 def python_type_to_json_type(py_type) -> Dict:
     """Convert Python type hint to JSON schema type."""
@@ -621,7 +601,7 @@ def execute_processor(processor: Processor, maca, subprompt: str) -> str:
         subprompt: System prompt for the processor
 
     Returns:
-        The result_text from the processor's respond call
+        The result from the processor's respond call
     """
     model_name = processor.get('model', 'large')
     assignment = processor['assignment']
@@ -681,7 +661,7 @@ def execute_processor(processor: Processor, maca, subprompt: str) -> str:
             api_key=maca.api_key,
             model=resolved_model,
             messages=messages,
-            tool_schemas=list(TOOL_SCHEMAS.values()),
+            tool_schemas=[RESPOND_TOOL_SCHEMA],
         )
 
         message = llm_result['message']
@@ -705,45 +685,72 @@ def execute_processor(processor: Processor, maca, subprompt: str) -> str:
             if immediate_result != "OK":
                 return f"Error in processor file_updates: {immediate_result}"
 
-        # Return the result_text
-        return tool_args.get('result_text', '')
+        # Return the result
+        return tool_args.get('result', '')
 
     except Exception as e:
         return f"Error: Processor execution failed: {str(e)}"
 
 
 # ==============================================================================
+# SUBCONTEXT TOOL
+# ==============================================================================
+
+
+def subprocessor_respond(        
+    thoughts: str,
+    file_updates: Optional[List[FileUpdate]],
+    result: str
+) -> tuple[str, str]:
+    pass # TODO
+
+# ==============================================================================
 # MAIN TOOL
 # ==============================================================================
 
-@tool
 def respond(
-    think_out_loud: str,
-    result_text: str,
-    file_updates: Optional[List[FileUpdate]] = None,
-    processors: Optional[List[Processor]] = None,
-    user_questions: Optional[List[Question]] = None,
-    complete: bool = False,
-    maca = None
+    thoughts: str,
+    keep_extended_context: Optional[bool],
+    file_updates: Optional[List[FileUpdate]],
+
+    user_questions: Optional[List[Question]],
+    file_reads: Optional[List[FileRead]],
+    file_searches: Optional[List[FileSearch]],
+    shell_commands: Optional[List[ShellCommand]],
+    sub_processors: Optional[List[SubProcessor]],
+
+    notes_for_context: Optional[str],
+    done: Optional[bool],
+    user_output: Optional[str],
+
+    maca = None,
 ) -> tuple[str, str]:
     """
-    Single tool for responding to user requests.
-
-    This is the only tool available. Use it to:
-    - Think through the problem (think_out_loud)
-    - Update files (file_updates)
-    - Spawn processors for data gathering (processors)
-    - Ask the user questions (user_questions)
-    - Report results (result_text)
-    - Signal completion (complete)
+    Mandatory tool to call. Operations should be combined as much as possible. If you currently cannot complete the task, try to gather all info via user_questions, file_reads, file_searches, and shell_commands such that you can complete the entire task/subtask in the next call.
 
     Args:
-        think_out_loud: Brief reasoning about what you're doing (max 100 words)
-        result_text: What to report back to context (summary of work done, findings, etc.)
-        file_updates: Optional list of file modifications to apply
-        processors: Optional list of processor sub-contexts to spawn for data gathering
-        user_questions: Optional list of questions to ask the user
-        complete: Set to true when task is fully complete and ready for merge
+        thoughts: Reason for yourself about what you need to do. This will not be saved in the context nor shown to the user. Be succinct (sacrifice grammar for briefness) and self-critical.
+        keep_extended_context: Set to true if you need to preserve the temporary context (full results from file_reads, file_searches, shell_commands, sub_processors) for the iteration. Do this only if you just found out that you are missing some information to accomplish a task that requires access to those results. If it's possible to densely summarize the info you'll still need in the future to `notes_for_context`, do that instead.
+        file_updates: Optional list of file modifications to apply.
+        done: Set to true if you have completed the overall task given by the user. This will trigger the merge process. Make sure everything is done, nice and clean before you set this! If set, further operations (file_reads, file_searches, shell_commands, sub_processors) are not allowed. Also, you *must* provide a meaningful `user_output` answering the user question or briefly summarizing the work done.
+
+        file_reads: Optional list of file (parts) to read into temporary context.
+        file_searches: Optional list of file searches to read into temporary context.
+        shell_commands: Optional list of shell commands to execute. Stdout and stderr go into temporary context. Don't even use shell commands to write files - use file_updates for that!
+
+        user_questions: Optional list of questions to ask the user. Answers are stored in long-term context.
+        sub_processors: Optional list of LLM-calls (in a a fresh context) to perform. These will be single-shots. They can only update files (optionally limited) and return a result. This can be very useful to:
+          - Ask a cheaper LLM to do some file edits.
+          - Split up independent work to different files into parallel LLM calls.
+          - Ask a more capable LLM for help on a hard problem.
+          - Ask a web-search-enabled LLM to look up info online.
+
+        notes_for_context: Succinct (sacrifice grammar for briefness): A brief summary of...
+          - Your thoughts (if valuable)
+          - Temporary context that will be lost (all file_reads+file_searches+shell_commands unless keep_extended_context is set), insofar that you'll need it later in the conversation
+          - What the next completion needs to do with the input data it receives (unless obvious)
+          This will be saved in long-term context.
+        user_output: Optionally what to show to the user. Don't provide this, unless there is something interesting and new to tell. If `done` is true, you *must* provide a meaningful answer here. Keep it short.
 
     Returns:
         Immediate: Full details of what happened
@@ -792,7 +799,7 @@ def respond(
 
     # 4. Handle completion
     if complete:
-        cprint(C_GOOD, '\n✓ Task completed!\n\n', C_NORMAL, result_text, '\n')
+        cprint(C_GOOD, '\n✓ Task completed!\n\n', C_NORMAL, result, '\n')
 
         # Ask for approval
         response = choice(
@@ -808,8 +815,8 @@ def respond(
         if response == 'merge':
             cprint(C_INFO, 'Merging changes...')
 
-            # Extract commit message from result_text (first line)
-            commit_msg = result_text.split('\n')[0]
+            # Extract commit message from result (first line)
+            commit_msg = result.split('\n')[0]
 
             # Merge
             conflict = git_ops.merge_to_main(maca.repo_root, maca.worktree_path, maca.branch_name, commit_msg)
@@ -823,7 +830,7 @@ def respond(
             git_ops.cleanup_session(maca.repo_root, maca.worktree_path, maca.branch_name)
             cprint(C_GOOD, '✓ Merged and cleaned up')
 
-            return (ReadyResult(result_text), "respond: completed and merged")
+            return (ReadyResult(result), "respond: completed and merged")
 
         elif response == 'continue':
             feedback = pt_prompt("What changes do you want?\n> ", multiline=True, history=maca.history)
@@ -833,11 +840,11 @@ def respond(
         elif response == 'delete':
             git_ops.cleanup_session(maca.repo_root, maca.worktree_path, maca.branch_name)
             cprint(C_BAD, '✓ Deleted worktree and branch')
-            return (ReadyResult(result_text), "respond: completed and deleted")
+            return (ReadyResult(result), "respond: completed and deleted")
 
         else:  # cancel
             print("Keeping worktree for manual review.")
-            return (ReadyResult(result_text), "respond: completed")
+            return (ReadyResult(result), "respond: completed")
 
     # Build final output
     if immediate_parts:
@@ -851,3 +858,6 @@ def respond(
         context_output = "respond: executed"
 
     return (immediate_output, context_output)
+
+
+RESPOND_TOOL_SCHEMA = generate_tool_schema(respond)
