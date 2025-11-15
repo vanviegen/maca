@@ -13,7 +13,36 @@ MACA (Minimal AI Coding Assistant) is a Python-based coding assistant that uses 
 ./maca                    # Run interactively
 ./maca "your task here"   # Run with task argument
 ./maca --help             # Show CLI options
+./maca -n "task"          # Run in non-interactive mode (auto-answers questions, auto-merges)
 ```
+
+### Non-Interactive Mode
+Non-interactive mode (`-n` or `--non-interactive`) is designed for automated testing and CI/CD pipelines:
+
+- **Requirements**: Must be used with a task argument
+- **Behavior**:
+  - Any user questions are auto-answered with: "This agent is running non-interactively. Please try to take a guess at the answer yourself, but be a bit conservative and refuse the assignment if needed."
+  - On completion, changes are automatically merged to main branch and program exits
+  - No user prompts or confirmations
+- **Usage**: `./maca -n "your task here"`
+- **Testing**: Always test by calling `./maca` (not `maca.py` directly) to ensure proper environment setup
+
+### Verbose Mode
+Enable verbose logging to see all log entries in real-time:
+
+- **Usage**: `./maca -v` or `./maca --verbose`
+- Can be combined with other flags: `./maca -n -v "task"`
+- Can also be toggled during interactive sessions with `/verbose on` or `/verbose off`
+
+### Testing New Functionality
+When implementing new features, test them if possible using:
+```bash
+./maca -n "task description"
+# Optionally add -v for verbose output to debug:
+./maca -n -v "task description"
+```
+
+If testing requires user interaction and cannot be automated, output a single sentence about manual testing requirements instead.
 
 ### Environment Setup
 MACA auto-creates a virtual environment at `~/.cache/maca-venv-1` with required dependencies (prompt-toolkit).

@@ -4,7 +4,6 @@
 from copy import copy, deepcopy
 import sys
 import os
-import time
 import json
 from pathlib import Path
 from typing import Dict, Any, Optional
@@ -16,7 +15,7 @@ from prompt_toolkit.history import FileHistory
 
 import git_ops
 import tools
-from utils import cprint, call_llm, compute_diff, get_cumulative_cost, C_GOOD, C_BAD, C_NORMAL, C_IMPORTANT, C_INFO
+from utils import cprint, call_llm, compute_diff, get_cumulative_cost, C_GOOD, C_BAD, C_NORMAL, C_IMPORTANT, C_INFO, C_LOG
 from logger import log
 import logger
 import code_map
@@ -33,7 +32,7 @@ class ContextError(Exception):
 class MACA:
     """Main orchestration class for the coding assistant."""
 
-    def __init__(self, directory: str, task: str | None, model: str | None, api_key: str):
+    def __init__(self, directory: str, task: str | None, model: str | None, api_key: str, non_interactive: bool = False, verbose: bool = False):
         """
         Initialize MACA with all required attributes.
 
@@ -42,11 +41,15 @@ class MACA:
             task: Initial task description (optional)
             model: Model to use for LLM calls
             api_key: OpenRouter API key
+            non_interactive: Run in non-interactive mode
+            verbose: Enable verbose logging mode
         """
         # Basic configuration
         self.initial_prompt = task
         self.model = model or 'anthropic/claude-sonnet-4.5'
         self.api_key = api_key
+        self.non_interactive = non_interactive
+        self.verbose = verbose
 
         # Repository paths
         self.repo_path = Path(directory).resolve()
@@ -172,9 +175,22 @@ class MACA:
             None (runs until complete() is called)
         """
         done = False
+        last_cache_control_content = None
 
         # Loop until completion
         while not done:
+
+            # The message previous to the first transient message gets the cache control header
+            if last_cache_control_content:
+                del last_cache_control_content['cache_control']
+            for index, msg in enumerate(self.messages):
+                if msg not in self.long_term_messages:
+                    if index > 0:
+                        last_cache_control_content = self.messages[index-1]['content']
+                        if not isinstance(last_cache_control_content, dict):
+                            last_cache_control_content = self.messages[index-1]['content'] = {"type": "text", "text": last_cache_control_content}
+                        last_cache_control_content['cache_control'] = {'type': 'ephemeral'}
+                    break
 
             # Call LLM (retry logic is in call_llm)
             result = call_llm(
@@ -195,36 +211,31 @@ class MACA:
                 raise ContextError(f"Expected exactly 1 tool call, got {len(tool_calls)}")
             args = json.loads(message['tool_calls'][0]['function']['arguments'])
             log(tag='tool_call', **args)
-            (long_term_response, temporary_response, done) = tools.respond(**args, maca=self)
+            (temporary_response, done) = tools.respond(**args, maca=self)
 
             # Serialize responses to JSON
-            long_term_json = json.dumps(long_term_response, indent=2)
-            temporary_json = json.dumps(temporary_response, indent=2)
+            temporary_json = json.dumps(temporary_response)
 
             # Add assistant message (and trimmed version) to history
             self.add_message(message, 'long-term-only')
 
             # Add tool result messages (temporary and long-term summary)
-            self.add_message({'role': 'user',
-                'content': [
-                    {
-                        'type': 'tool_result',
-                        'tool_use_id': tool_calls[0]['id'],
-                        'content': temporary_json,
-                        'cache_control': {'type': 'ephemeral'}
-                    }
-                ]
+            self.add_message({
+                'role': 'user',
+                'content': [{
+                    'type': 'tool_result',
+                    'tool_use_id': tool_calls[0]['id'],
+                    'content': temporary_json,
+                }]
             }, 'temporary')
 
-            self.add_message({'role': 'user',
-                'content': [
-                    {
-                        'type': 'tool_result',
-                        'tool_use_id': tool_calls[0]['id'],
-                        'content': long_term_json,
-                        'cache_control': {'type': 'ephemeral'}
-                    }
-                ]
+            self.add_message({
+                'role': 'user',
+                'content': [{
+                    'type': 'tool_result',
+                    'tool_use_id': tool_calls[0]['id'],
+                    'content': "OMITTED",
+                }]
             }, 'long-term-only')
 
             if done and not self.handle_done():
@@ -236,16 +247,21 @@ class MACA:
     def handle_done(self):
         cprint(C_GOOD, '\n✓ Task completed!\n')
 
-        # Ask for approval
-        response = choice(
-            message=f'How to proceed? [{self.worktree_path}]',
-            options=[
-                ('merge', 'Merge into main'),
-                ('continue', 'Ask for further changes'),
-                ('cancel', 'Leave as-is for manual review'),
-                ('delete', 'Delete everything'),
-            ]
-        )
+        # In non-interactive mode, auto-merge and exit
+        if self.non_interactive:
+            cprint(C_INFO, 'Non-interactive mode: auto-merging changes')
+            response = 'merge'
+        else:
+            # Ask for approval
+            response = choice(
+                message=f'How to proceed? [{self.worktree_path}]',
+                options=[
+                    ('merge', 'Merge into main'),
+                    ('continue', 'Ask for further changes'),
+                    ('cancel', 'Leave as-is for manual review'),
+                    ('delete', 'Delete everything'),
+                ]
+            )
 
         if response == 'merge':
             cprint(C_INFO, 'Merging changes...')
@@ -268,6 +284,11 @@ class MACA:
             # Cleanup
             git_ops.cleanup_session(self.repo_root, self.worktree_path, self.branch_name)
             cprint(C_GOOD, '✓ Merged and cleaned up')
+
+            # In non-interactive mode, exit after successful merge
+            if self.non_interactive:
+                return True
+
             git_ops.create_session_worktree(self.repo_root, self.session_id)
 
             return True
@@ -303,6 +324,11 @@ class MACA:
         # Initialize logger
         logger.init(self.repo_root, self.session_id)
 
+        # Enable verbose mode if requested
+        if self.verbose:
+            logger.set_verbose(True)
+            cprint(C_GOOD, '✓ Verbose mode enabled')
+
         # Load system prompt
         self._load_system_prompt()
 
@@ -313,13 +339,30 @@ class MACA:
             if prompt:
                 self.initial_prompt = None  # Only use command line arg for first iteration
             else:
+                # In non-interactive mode without a task, exit
+                if self.non_interactive:
+                    break
                 cprint(C_IMPORTANT, 'Enter your task (press Alt+Enter or Esc+Enter to submit):')
                 prompt = pt_prompt("> ", multiline=True, history=self.history).strip()
 
             if prompt:
+                # Check for special commands
+                if prompt == '/verbose on':
+                    logger.set_verbose(True)
+                    cprint(C_GOOD, '✓ Verbose mode enabled')
+                    continue
+                elif prompt == '/verbose off':
+                    logger.set_verbose(False)
+                    cprint(C_GOOD, '✓ Verbose mode disabled')
+                    continue
+
                 self.update_state()
                 self.add_message({"role": "user", "content": prompt})
                 self.run_main_loop()
+
+                # In non-interactive mode, exit after completing the task
+                if self.non_interactive:
+                    break
 
 
 if __name__ == '__main__':
@@ -329,7 +372,14 @@ if __name__ == '__main__':
     parser.add_argument('task', nargs='?', help='Initial task description')
     parser.add_argument('-m', '--model', help='Model to use (default: anthropic/claude-sonnet-4.5)')
     parser.add_argument('-d', '--directory', default='.', help='Project directory (default: current)')
+    parser.add_argument('-n', '--non-interactive', action='store_true', help='Run in non-interactive mode (requires task argument)')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose logging mode')
     args = parser.parse_args()
+
+    # Validate non-interactive mode
+    if args.non_interactive and not args.task:
+        cprint(C_BAD, 'Error: --non-interactive (-n) requires a task argument')
+        sys.exit(1)
 
     # Get API key from environment
     api_key = os.environ.get('OPENROUTER_API_KEY')
@@ -342,6 +392,8 @@ if __name__ == '__main__':
         directory=args.directory,
         task=args.task,
         model=args.model,
-        api_key=api_key
+        api_key=api_key,
+        non_interactive=args.non_interactive,
+        verbose=args.verbose
     )
     maca.run()

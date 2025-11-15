@@ -209,6 +209,7 @@ class CodeMapGenerator:
         self.directory = directory
         self.definitions: Dict[str, Definition] = {}
         self.file_infos: List[FileInfo] = []
+        self.top_level_uses: Dict[str, Set[str]] = {}  # file_path -> set of identifiers
         self.id_counter = 1
         self.parsers: Dict[str, any] = {}
 
@@ -377,8 +378,42 @@ class CodeMapGenerator:
             root = tree.root_node
 
             self._extract_definitions(root, source, str(file_path), lang_config)
+            self._extract_top_level_uses(root, str(file_path), lang_config)
         except Exception as e:
             print(f"Warning: Failed to parse {file_path}: {e}", file=sys.stderr)
+
+    def _extract_top_level_uses(self, root: Node, file_path: str, lang_config: LanguageConfig) -> None:
+        """Extract identifier uses that are outside any function/class definition.
+
+        Args:
+            root: The root node of the AST
+            file_path: Path to the file being parsed
+            lang_config: Language configuration
+        """
+        # Collect all node types that represent definitions
+        definition_node_types = set()
+        for node_types_list in lang_config.node_types.values():
+            definition_node_types.update(node_types_list)
+
+        top_level_identifiers = set()
+
+        # Walk through root's children and extract identifiers from non-definition nodes
+        def extract_from_non_definitions(node: Node):
+            # If this is a definition node, skip it entirely
+            if node.type in definition_node_types:
+                return
+
+            # Otherwise, extract identifiers from this node
+            for child in node.children:
+                if child.type in ['identifier', 'type_identifier']:
+                    top_level_identifiers.add(child.text.decode('utf-8'))
+                # Recursively process children (but stop at definitions)
+                extract_from_non_definitions(child)
+
+        for child in root.children:
+            extract_from_non_definitions(child)
+
+        self.top_level_uses[file_path] = top_level_identifiers
 
     def _extract_definitions(
         self,
@@ -482,7 +517,7 @@ class CodeMapGenerator:
             id_map[definition.name] = definition.id
             self.id_counter += 1
 
-        # Second pass: resolve references
+        # Second pass: resolve references in definitions
         for key, definition in self.definitions.items():
             if definition.uses:
                 resolved_uses = set()
@@ -490,6 +525,14 @@ class CodeMapGenerator:
                     if identifier in id_map and identifier != definition.name:
                         resolved_uses.add(id_map[identifier])
                 definition.uses = resolved_uses
+
+        # Third pass: resolve top-level uses to only include defined symbols
+        for file_path, identifiers in self.top_level_uses.items():
+            resolved = set()
+            for identifier in identifiers:
+                if identifier in id_map:
+                    resolved.add(id_map[identifier])
+            self.top_level_uses[file_path] = resolved
 
     def generate_map(self) -> str:
         """Generate a code map for all files in the directory.
@@ -539,11 +582,16 @@ class CodeMapGenerator:
         for file_info in sorted(self.file_infos, key=lambda f: f.path):
             file_path_str = file_info.path
 
-            # Show file with size info
-            if file_info.lines is not None:
-                lines.append(f"{file_path_str} [{file_info.lines} lines]")
+            # Show file with size info and top-level uses
+            size_info = f"{file_info.lines} lines" if file_info.lines is not None else f"{file_info.bytes} bytes"
+
+            # Add top-level uses if any
+            if file_path_str in self.top_level_uses and self.top_level_uses[file_path_str]:
+                uses = sorted(self.top_level_uses[file_path_str])
+                uses_str = ' '.join(uses)
+                lines.append(f"{file_path_str} [{size_info}, uses {uses_str}]")
             else:
-                lines.append(f"{file_path_str} [{file_info.bytes} bytes]")
+                lines.append(f"{file_path_str} [{size_info}]")
 
             # If this file has code definitions, show them
             if file_path_str in by_file:

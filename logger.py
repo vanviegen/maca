@@ -8,6 +8,7 @@ from pathlib import Path
 
 # Global logger state
 _log_file = None
+_verbose_mode = False
 
 
 def init(repo_root: Path, session_id: int):
@@ -35,6 +36,17 @@ def _find_heredoc_delimiter(value: str) -> str:
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
 
 
+def set_verbose(enabled: bool):
+    """
+    Enable or disable verbose mode.
+
+    Args:
+        enabled: True to enable verbose mode, False to disable
+    """
+    global _verbose_mode
+    _verbose_mode = enabled
+
+
 def log(**kwargs):
     """
     Log an entry to the log file.
@@ -45,14 +57,14 @@ def log(**kwargs):
     if _log_file is None:
         # Logger not initialized, skip logging
         return
-    
+
     # Format timestamp in human-readable format
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
     # Build the log entry
     lines = []
     lines.append(f'timestamp: {timestamp}')
-    
+
     # Add all kwargs as key-value pairs
     for key, value in kwargs.items():
         # Handle non-string types by encoding as JSON
@@ -65,9 +77,15 @@ def log(**kwargs):
                 delimiter = _find_heredoc_delimiter(value)
                 value = f'<<<{delimiter}\n{value}\n{delimiter}'
         lines.append(f'{key}: {value}')
+        if _verbose_mode:
+            cprint(key, C_LOG, ": "+value)
 
-    _log_file.write('\n'.join(lines) + '\n\n')
+    log_text = '\n'.join(lines) + '\n\n'
+    _log_file.write(log_text)
     _log_file.flush()  # Ensure it's written immediately
+
+    if _verbose_mode:
+        print()
 
 
 def read_log(repo_root: Path, session_id: int, context_id: str) -> list:
@@ -126,3 +144,6 @@ def read_log(repo_root: Path, session_id: int, context_id: str) -> list:
             yield current_entry
 
         return True
+
+
+from utils import cprint, C_LOG

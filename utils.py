@@ -9,7 +9,6 @@ from typing import List, Dict, Any, Optional, Union
 import json
 import urllib.request
 import time
-from logger import log
 import re
 
 
@@ -29,6 +28,7 @@ C_BAD = Color('#e74c3c')       # Modern red (alizarin)
 C_NORMAL = Color('')           # White/default
 C_IMPORTANT = Color('#f39c12') # Modern orange (orange)
 C_INFO = Color('#3498db')      # Modern blue (peter river)
+C_LOG = Color('#808080')       # Gray for verbose logging
 
 
 def cprint(*args, end='\n'):
@@ -537,3 +537,6 @@ def find_json_truncation_point(json):
             i += 1
     
     return [x[1] for x in stack]
+
+
+from logger import log

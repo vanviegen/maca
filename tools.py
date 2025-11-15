@@ -9,6 +9,7 @@ from typing import get_type_hints, get_origin, get_args, Any, Dict, List, Union,
 import inspect
 import json
 import re
+import fnmatch
 
 from utils import cprint, call_llm, get_matching_files, C_GOOD, C_BAD, C_NORMAL, C_IMPORTANT, C_INFO
 from docker_ops import run_in_container
@@ -108,7 +109,7 @@ class SubProcessor(TypedDict, total=False):
     model: str
     assignment: str
     file_reads: Optional[List[FileRead]]
-    file_write_allow_patterns: Optional[List[str]] # List of globs that may be written to (default to none)
+    file_write_allow_globs: Optional[List[str]] # List of globs that may be written to (default to none)
 
 
 class Question(TypedDict, total=False):
@@ -297,7 +298,6 @@ def apply_file_updates(updates: List[FileUpdate], worktree_path: Path) -> tuple[
         - immediate_result: "OK" or error details
         - context_summary: Combined per-file summaries
     """
-    file_summaries = []
     errors = []
 
     for update in updates:
@@ -305,10 +305,8 @@ def apply_file_updates(updates: List[FileUpdate], worktree_path: Path) -> tuple[
         overwrite = update.get('overwrite')
         update_ops = update.get('update')
         rename_to = update.get('rename')
-        file_summary = update['summary']
 
         full_path = check_path(file_path, worktree_path)
-        existed_before = full_path.exists()
 
         # Execute operations in order: overwrite, update, rename
 
@@ -321,42 +319,30 @@ def apply_file_updates(updates: List[FileUpdate], worktree_path: Path) -> tuple[
         # 2. Update (search/replace) operations
         if update_ops is not None:
             if not full_path.exists():
-                errors.append(f"{file_path}: Cannot apply search/replace to non-existent file")
+                errors.append({"error": "Cannot apply search/replace to non-existent file", "path": file_path})
                 continue
 
             content = full_path.read_text()
 
             # Validate all operations first
-            operation_errors = []
             for i, op in enumerate(update_ops):
                 search_str = op['search']
                 min_match = op.get('min_match', 1)
                 max_match = op.get('max_match', 1)
 
                 count = content.count(search_str)
-
                 if count < min_match:
-                    operation_errors.append(
-                        f"  Operation {i+1}: Found {count} matches, expected at least {min_match}\n"
-                        f"    Search: {json.dumps(search_str)}"
-                    )
+                    errors.append({"error": "Too few matches", "path": file_path, "index": i, "search": search_str, "match_count": count, "min_match": min_match, "partial": "Other replace blocks may have succeeded"})
                 elif count > max_match:
-                    operation_errors.append(
-                        f"  Operation {i+1}: Found {count} matches, expected at most {max_match}\n"
-                        f"    Search: {json.dumps(search_str)}"
-                    )
+                    errors.append({"error": "Too many matches", "path": file_path, "index": i, "search": search_str, "match_count": count, "max_match": max_match, "partial": "Other replace blocks may have succeeded"})
+                else:
+                    content = content.replace(search_str, op['replace'])
 
-            if operation_errors:
-                errors.append(f"{file_path}:\n" + "\n".join(operation_errors))
+            try:
+                full_path.write_text(content)
+            except Exception as e:
+                errors.append({"error": f"Failed to write updated content: {str(e)}", "path": file_path})
                 continue
-
-            # Apply all operations
-            for op in update_ops:
-                search_str = op['search']
-                replace_str = op['replace']
-                content = content.replace(search_str, replace_str)
-
-            full_path.write_text(content)
 
         # 3. Rename operation (includes delete)
         if rename_to is not None:
@@ -365,29 +351,20 @@ def apply_file_updates(updates: List[FileUpdate], worktree_path: Path) -> tuple[
                 if full_path.exists():
                     full_path.unlink()
                 else:
-                    errors.append(f"{file_path}: Cannot delete non-existent file")
+                    errors.append({"error": "Cannot delete non-existent file", "path": file_path})
                     continue
             else:
                 # Rename/move file
                 if not full_path.exists():
-                    errors.append(f"{file_path}: Cannot rename non-existent file")
+                    errors.append({"error": "Cannot rename non-existent file", "path": file_path})
                     continue
 
                 new_path = check_path(rename_to, worktree_path)
                 new_path.parent.mkdir(parents=True, exist_ok=True)
                 full_path.rename(new_path)
 
-        file_summaries.append(file_summary)
-
     # If there were errors, return them
-    if errors:
-        error_msg = "Search/replace validation errors:\n\n" + "\n\n".join(errors)
-        return (error_msg, "file_updates: validation errors")
-
-    # Build final summary from per-file summaries
-    final_summary = "file_updates: " + "; ".join(file_summaries) if file_summaries else "file_updates: no changes"
-
-    return ("OK", final_summary)
+    return errors
 
 
 def execute_searches(searches: List[FileSearch], worktree_path: Path) -> List[Dict[str, Any]]:
@@ -496,10 +473,7 @@ def execute_shell_commands(commands: List[ShellCommand], worktree_path: Path, re
             tail=tail
         )
 
-        results.append({
-            'command': command,
-            'output': result
-        })
+        results.append(result)
 
     return results
 
@@ -513,9 +487,9 @@ def read_files(file_specs: List[FileRead], worktree_path: Path) -> List[str]:
         worktree_path: Path to the worktree
 
     Returns:
-        List of file contents (formatted with path and optional line range)
+        List of file contents
     """
-    contents = []
+    contents = {}
 
     for file_spec in file_specs:
         file_path = file_spec['path']
@@ -538,14 +512,12 @@ def read_files(file_specs: List[FileRead], worktree_path: Path) -> List[str]:
                 end_idx = end_line if end_line else len(lines)
                 selected_lines = lines[start_idx:end_idx]
                 data = ''.join(selected_lines)
-                contents.append(
-                    f"File: {file_path} (lines {start_idx + 1}-{end_idx})\n\n{data}"
-                )
+                contents[file_path] = {"data": data, "lines": f"{start_idx + 1}-{end_idx}"}
             else:
                 data = ''.join(lines)
-                contents.append(f"File: {file_path}\n\n{data}")
+                contents[file_path] = {"data": data}
         except Exception as e:
-            contents.append(f"File: {file_path}\n\nError: {str(e)}")
+            contents[file_path] = {"error": str(e)}
 
     return contents
 
@@ -562,7 +534,12 @@ def ask_questions(questions: List[Question], maca) -> None:
         prompt_text = q.get('prompt', '')
         preset_answers = q.get('preset_answers')
 
-        if preset_answers:
+        # Handle non-interactive mode
+        if maca.non_interactive:
+            answer = "This agent is running non-interactively. Please try to take a guess at the answer yourself, but be a bit conservative and refuse the assignment if needed."
+            cprint(C_INFO, f"Question {i}/{len(questions)}: {prompt_text}")
+            cprint(C_INFO, f"Auto-response: {answer}")
+        elif preset_answers:
             # Show choice selection
             choices = [(answer, answer) for answer in preset_answers]
             choices.append(('__custom__', 'Other (custom input)'))
@@ -584,7 +561,7 @@ def ask_questions(questions: List[Question], maca) -> None:
         maca.add_message({'role': 'user', 'content': answer})
 
 
-def execute_processor(processor: SubProcessor, maca, subprompt: str) -> str:
+def run_subprocessor(processor: SubProcessor, maca, system_prompt: str) -> str:
     """
     Execute a processor in its own context.
 
@@ -599,7 +576,7 @@ def execute_processor(processor: SubProcessor, maca, subprompt: str) -> str:
     model_name = processor.get('model', 'large')
     assignment = processor['assignment']
     file_reads_specs = processor.get('file_reads', [])
-    file_write_allow_patterns = processor.get('file_write_allow_patterns', [])
+    file_write_allow_globs = processor.get('file_write_allow_globs', [])
 
     # Resolve model name
     if model_name not in MODELS:
@@ -609,22 +586,20 @@ def execute_processor(processor: SubProcessor, maca, subprompt: str) -> str:
     cprint(C_INFO, f'  Spawning processor with model={model_name}')
 
     # Build processor context
-    messages = [
-        {'role': 'system', 'content': subprompt}
-    ]
+    prompt = f"# Assignment\n\n{assignment}"
+
+    if file_write_allow_globs:
+        prompt = prompt + "\n\n# Allowed globs for update_files:\n\n" + json.dumps(file_write_allow_globs) 
 
     # Read files if specified
     if file_reads_specs:
-        file_contents = read_files(file_reads_specs, maca.worktree_path)
-        combined_data = "# Files\n\n" + "\n\n---\n\n".join(file_contents)
-    else:
-        combined_data = "(no files provided)"
+        prompt = "# Files\n\n" + json.dumps(read_files(file_reads_specs, maca.worktree_path)) + "\n\n" + prompt
 
     # Add assignment and data to processor context
-    messages.append({
-        'role': 'user',
-        'content': f"# Assignment\n\n{assignment}\n\n# Data\n\n{combined_data}"
-    })
+    messages = [
+        {'role': 'system', 'content': system_prompt},
+        {'role': 'user', 'content': prompt},
+    ]
 
     # Call LLM for processor
     try:
@@ -632,7 +607,7 @@ def execute_processor(processor: SubProcessor, maca, subprompt: str) -> str:
             api_key=maca.api_key,
             model=resolved_model,
             messages=messages,
-            tool_schemas=[SUBPROCESSOR_RESPOND_TOOL_SCHEMA],
+            tool_schemas=[SUBPROCESSOR_RESPOND_TOOL_SCHEMA if file_write_allow_globs else SUBPROCESSOR_RESPOND_NO_UPDATES_TOOL_SCHEMA],
         )
 
         message = llm_result['message']
@@ -653,19 +628,28 @@ def execute_processor(processor: SubProcessor, maca, subprompt: str) -> str:
         # Handle processor's file_updates if present (with write pattern validation)
         if 'file_updates' in tool_args and tool_args['file_updates']:
             # Validate file paths against allow patterns
-            if file_write_allow_patterns:
-                import fnmatch
-                for update in tool_args['file_updates']:
-                    file_path = update['path']
-                    allowed = any(fnmatch.fnmatch(file_path, pattern) for pattern in file_write_allow_patterns)
-                    if not allowed:
-                        return f"Error: Processor tried to write to '{file_path}' which doesn't match allowed patterns: {file_write_allow_patterns}"
-            elif tool_args['file_updates']:
-                return "Error: Processor tried to write files but no file_write_allow_patterns were specified"
+            file_updates = []
+            for update in tool_args['file_updates']:
+                file_path = update['path']
+                allowed = any(fnmatch.fnmatch(file_path, pattern) for pattern in file_write_allow_globs)
+                if allowed:
+                    file_updates.append(update)
+                else:
+                    errors({"error": f"Processor tried to write to '{file_path}' which doesn't match allowed globs", "path": file_path})
 
-            immediate_result, _ = apply_file_updates(tool_args['file_updates'], maca.worktree_path)
-            if immediate_result != "OK":
-                return f"Error in processor file_updates: {immediate_result}"
+            errors = apply_file_updates(tool_args['file_updates'], maca.worktree_path)
+            if errors:
+                messages.append({
+                    'role': 'user',
+                    'content': [{
+                        'type': 'tool_result',
+                        'tool_use_id': tool_calls[0]['id'],
+                        'content': json.dumps({"file_update_errors": errors, "proceed": "Carefully retry just the rejected file updates"})
+                    }]
+                })
+
+            if errors:
+                return json.dumps(errors)
 
         # Return the result
         return tool_args.get('result', '')
@@ -683,19 +667,31 @@ def subprocessor_respond(
     thoughts: str,
     file_updates: Optional[List[FileUpdate]] = None,
     result: str = ""
-) -> tuple[str, str]:
+):
     """
-    Tool for sub-processors to return results. Sub-processors operate in isolated contexts
-    and can optionally update files (subject to file_write_allow_patterns) before returning.
+    Mandatory tool to use.
 
     Args:
         thoughts: Your reasoning about the task. Not saved or shown to user.
         file_updates: Optional list of file modifications to apply.
         result: The result to return to the main context. This should contain your findings,
                 analysis, or completion status. Be concise but complete.
+    """
+    # This function signature is used for schema generation only.
+    # Actual execution is handled in execute_processor()
+    pass
 
-    Returns:
-        Tuple of (immediate_result, context_summary) - but this is handled by the tool system
+def subprocessor_respond_no_updates(
+    thoughts: str,
+    result: str = ""
+):
+    """
+    Mandatory tool to use.
+
+    Args:
+        thoughts: Your reasoning about the task. Not saved or shown to user.
+        result: The result to return to the main context. This should contain your findings,
+                analysis, or completion status. Be concise but complete.
     """
     # This function signature is used for schema generation only.
     # Actual execution is handled in execute_processor()
@@ -714,12 +710,13 @@ def respond(
     file_searches: Optional[List[FileSearch]] = None,
     shell_commands: Optional[List[ShellCommand]] = None,
     sub_processors: Optional[List[SubProcessor]] = None,
+    file_change_description: Optional[str] = None,
     notes_for_context: Optional[str] = None,
     done: Optional[bool] = None,
     user_output: Optional[str] = None,
 
     maca = None,
-) -> tuple[Dict[str, Any], Dict[str, Any], bool]:
+) -> Dict[str, Any]:
     """
     Mandatory tool to call. Operations should be combined as much as possible. If you currently cannot complete the task, try to gather all info via user_questions, file_reads, file_searches, and shell_commands such that you can complete the entire task/subtask in the next call.
 
@@ -731,12 +728,14 @@ def respond(
         file_reads: Optional list of file (parts) to read into temporary context.
         file_searches: Optional list of file searches to read into temporary context.
         shell_commands: Optional list of shell commands to execute. Stdout and stderr go into temporary context. Don't even use shell commands to write files - use file_updates for that!
-        sub_processors: Optional list of LLM-calls (in a a fresh context) to perform. These will be single-shots. They can only update files (optionally limited) and return a result. This can be very useful to:
+        sub_processors: Optional list of LLM-calls (in a a fresh context) to perform. These will be single-shots. They can only update files and return a result. This can be very useful to:
           - Ask a cheaper LLM to do some file edits.
           - Split up independent work to different files into parallel LLM calls.
           - Ask a more capable LLM for help on a hard problem.
           - Ask a web-search-enabled LLM to look up info online.
-          The result goes into temporary context.
+          The `model` field can be one of: small, medium, large, huge or search. The `assignment` should contain a full briefing - the sub-processor has no access to prior context. The `file_reads` field can be used to provide input data files. Specify `file_reads` to pass file contents into the sub-processor's context. The `file_write_allow_globs` field can be used to give the model write access to certain files. If left empty, no files can be updated. 
+          The result goes into our temporary context.
+        file_change_description: An optional brief (one sentence) description of the purpose of file changes made by file_updates, shell_commands and/or sub_processors. This will be used as the git commit message.
         notes_for_context: Succinct (sacrifice grammar for briefness): A brief summary of...
           - Your thoughts (if valuable)
           - Temporary context that will be lost (all file_reads+file_searches+shell_commands+sub_processors unless keep_extended_context is set), insofar that you'll need it later in the conversation
@@ -746,28 +745,25 @@ def respond(
         done: Set to true if you have completed the overall task given by the user. This will trigger the merge process. Make sure everything is done, nice and clean before you set this! If set, further operations (file_reads, file_searches, shell_commands, sub_processors) are not allowed. Also, you *must* provide a meaningful `user_output` answering the user question or briefly summarizing the work done.
 
     Returns:
-        Tuple of (long_term_response, temporary_response, done):
-        - long_term_response: Dict with operation results (large data replaced with "OMITTED")
+        Tuple of (temporary_response, done):
         - temporary_response: Dict with full operation results including all data
         - done: Whether the task is complete
     """
+
+    # Build response structures
+    response = {}
+    if done is None:
+        done = False
+
     # Validate done constraints
     if done:
         if not user_output:
-            error_response = {
-                "error": "Error: 'done' is set but 'user_output' is missing. You must provide a meaningful summary when marking the task as complete."
-            }
-            return (error_response, error_response, False)
+            response["done"] = "Error: 'done' is set but 'user_output' is missing. You must provide a meaningful summary when marking the task as complete."
+            done = False
 
         if any([file_reads, file_searches, shell_commands, sub_processors]):
-            error_response = {
-                "error": "Error: 'done' is set but data gathering operations (file_reads, file_searches, shell_commands, sub_processors) are not allowed when done=True."
-            }
-            return (error_response, error_response, False)
-
-    # Build response structures
-    temporary_response = {}
-    long_term_response = {}
+            response["done"] = "Error: 'done' is set but data gathering operations (file_reads, file_searches, shell_commands, sub_processors) are not allowed when done=True."
+            done = False
 
     # 1. Handle file updates FIRST (LLM has already output the write comments)
     if file_updates:
@@ -785,59 +781,16 @@ def respond(
                 else:
                     cprint(C_INFO, f"Renaming {path} -> {update['rename']}")
 
-        immediate_result, context_summary = apply_file_updates(file_updates, maca.worktree_path)
-
-        if immediate_result != "OK":
-            # File update failed
-            temporary_response['file_updates'] = {
-                'status': 'error',
-                'error': immediate_result,
-                'updates': file_updates
-            }
-            # Omit large data from long-term response
-            long_term_response['file_updates'] = {
-                'status': 'error',
-                'summary': 'validation errors',
-                'count': len(file_updates),
-                'paths': [u['path'] for u in file_updates]
-            }
-
-            # Return early with error
-            return (long_term_response, temporary_response, False)
-        else:
-            temporary_response['file_updates'] = {
-                'status': 'ok',
-                'summary': context_summary,
-                'updates': file_updates
-            }
-            # Omit large data (overwrite content, search/replace ops) from long-term response
-            long_term_response['file_updates'] = {
-                'status': 'ok',
-                'summary': context_summary,
-                'count': len(file_updates),
-                'paths': [u['path'] for u in file_updates]
-            }
-
-            # Commit changes if files were updated
-            if maca.last_head_commit != git_ops.get_head_commit(maca.worktree_path):
-                commit_summary = context_summary.replace("file_updates: ", "")
-                git_ops.commit_changes(maca.worktree_path, f"AI: {commit_summary}")
-                maca.last_head_commit = git_ops.get_head_commit(maca.worktree_path)
-                maca.update_state()
+        response['file_updates'] = apply_file_updates(file_updates, maca.worktree_path) or 'OK'
+        if response['file_updates'] != 'OK':
+            done = False
 
     # 2. Handle user questions (to get input before data gathering operations)
+    if user_output:
+        cprint(C_GOOD, user_output)
     if user_questions:
         # Q&A are stored as separate messages in long-term context
         ask_questions(user_questions, maca)
-        temporary_response['user_questions'] = {
-            'count': len(user_questions),
-            'questions': user_questions
-        }
-        # Q&A already stored in separate messages, omit details from response
-        long_term_response['user_questions'] = {
-            'count': len(user_questions),
-            'details': "OMITTED"
-        }
 
     # 3. Handle file reads
     if file_reads:
@@ -845,17 +798,7 @@ def respond(
         file_list = ', '.join(fr['path'] for fr in file_reads)
         cprint(C_INFO, f"Reading {len(file_reads)} file(s): {file_list}")
 
-        file_contents = read_files(file_reads, maca.worktree_path)
-        temporary_response['file_reads'] = {
-            'count': len(file_reads),
-            'specs': file_reads,
-            'contents': file_contents
-        }
-        long_term_response['file_reads'] = {
-            'count': len(file_reads),
-            'specs': file_reads,
-            'contents': "OMITTED"
-        }
+        response['file_reads'] = read_files(file_reads, maca.worktree_path)
 
     # 4. Handle file searches
     if file_searches:
@@ -863,18 +806,7 @@ def respond(
         for search in file_searches:
             cprint(C_INFO, f"Searching for /{search['regex']}/")
 
-        search_results = execute_searches(file_searches, maca.worktree_path)
-        temporary_response['file_searches'] = {
-            'count': len(file_searches),
-            'specs': file_searches,
-            'results': search_results
-        }
-        long_term_response['file_searches'] = {
-            'count': len(file_searches),
-            'match_count': len(search_results),
-            'specs': file_searches,
-            'results': "OMITTED"
-        }
+        response['file_searches'] = execute_searches(file_searches, maca.worktree_path)
 
     # 5. Handle shell commands
     if shell_commands:
@@ -882,56 +814,35 @@ def respond(
         for cmd_spec in shell_commands:
             cprint(C_INFO, f"Running: {cmd_spec['command']}")
 
-        shell_results = execute_shell_commands(shell_commands, maca.worktree_path, maca.repo_root)
-        temporary_response['shell_commands'] = {
-            'count': len(shell_commands),
-            'results': shell_results
-        }
-        long_term_response['shell_commands'] = {
-            'count': len(shell_commands),
-            'commands': [r['command'] for r in shell_results],
-            'results': "OMITTED"
-        }
+        response['shell_commands'] = execute_shell_commands(shell_commands, maca.worktree_path, maca.repo_root)
+
+    # Commit changes if files were updated
+    if maca.last_head_commit != git_ops.get_head_commit(maca.worktree_path):
+        git_ops.commit_changes(maca.worktree_path, f"MACA: {file_change_description or 'No description'}")
+        maca.last_head_commit = git_ops.get_head_commit(maca.worktree_path)
 
     # 6. Handle sub-processors
     if sub_processors:
         # Load subprompt
         script_dir = Path(__file__).parent
-        subprompt_path = script_dir / 'SUBPROMPT.md'
-
-        if not subprompt_path.exists():
-            error_response = {"error": "SUBPROMPT.md not found"}
-            return (error_response, error_response, False)
-
+        subprompt_path = script_dir / 'subprompt.md'
         subprompt = subprompt_path.read_text()
 
         processor_results = []
         for i, processor in enumerate(sub_processors):
             cprint(C_INFO, f'  [{i + 1}/{len(sub_processors)}] Executing processor')
-            result = execute_processor(processor, maca, subprompt)
+            result = run_subprocessor(processor, maca, subprompt)
             processor_results.append(result)
 
-        temporary_response['sub_processors'] = processor_results
-        long_term_response['sub_processors'] = "OMITTED"
-
-    # 7. Add notes to context if provided
-    if notes_for_context:
-        temporary_response['notes_for_context'] = notes_for_context
-        long_term_response['notes_for_context'] = notes_for_context
-
-    # 8. Add user output if provided
-    if user_output:
-        temporary_response['user_output'] = user_output
-        long_term_response['user_output'] = user_output
-        # Print to console
-        cprint(C_GOOD, user_output)
+        response['sub_processors'] = processor_results
 
     # 9. Manage context cleanup
     if not keep_extended_context:
         maca.clear_temporary_messages()
 
-    return (long_term_response, temporary_response, done or False)
+    return (response, done)
 
 
 RESPOND_TOOL_SCHEMA = generate_tool_schema(respond)
 SUBPROCESSOR_RESPOND_TOOL_SCHEMA = generate_tool_schema(subprocessor_respond)
+SUBPROCESSOR_RESPOND_NO_UPDATES_TOOL_SCHEMA = generate_tool_schema(subprocessor_respond_no_updates)
