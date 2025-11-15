@@ -15,6 +15,11 @@ import re
 # Global cumulative cost tracking
 _cumulative_cost = 0
 
+# Debug/testing support
+_debug_llm_responses = None
+_debug_llm_index = 0
+_cprint_callback = None
+
 
 @dataclass(frozen=True)
 class Color:
@@ -34,18 +39,18 @@ C_LOG = Color('#808080')       # Gray for verbose logging
 def cprint(*args, end='\n'):
     """
     Print with color constants and text where color persists until changed.
-    
+
     Args:
         *args: Mixed arguments - Color instances change the current color,
                all other values are printed as text with the current color.
-    
+
     Example:
         cprint(C_BAD, "Error: ", C_IMPORTANT, msg, C_NORMAL, " attempt ", attempt)
         # "Error: " in red, msg in orange, " attempt " and attempt in default color
     """
     formatted_parts = []
     current_color = ''
-    
+
     for arg in args:
         # Check if this is a Color instance
         if isinstance(arg, Color):
@@ -54,8 +59,15 @@ def cprint(*args, end='\n'):
         else:
             # It's text, print with current color
             formatted_parts.append((current_color, str(arg)))
-    
-    print_formatted_text(FormattedText(formatted_parts), end=end)
+
+    # If there's a callback registered (for testing), call it
+    global _cprint_callback
+    if _cprint_callback:
+        # Extract just the text without colors for callback
+        text = ''.join(part[1] for part in formatted_parts)
+        _cprint_callback(text, end)
+    else:
+        print_formatted_text(FormattedText(formatted_parts), end=end)
 
 
 class GitignoreMatcher:
@@ -179,6 +191,25 @@ def call_llm(
     Raises:
         Exception: If API call fails after 3 retries
     """
+    # Check if we're in debug mode
+    global _debug_llm_responses, _debug_llm_index
+    if _debug_llm_responses is not None:
+        if _debug_llm_index >= len(_debug_llm_responses):
+            raise Exception(f"Debug LLM responses exhausted (needed {_debug_llm_index + 1}, have {len(_debug_llm_responses)})")
+
+        response = _debug_llm_responses[_debug_llm_index]
+        _debug_llm_index += 1
+
+        cprint(C_INFO, f'LLM: debug response {_debug_llm_index}/{len(_debug_llm_responses)}')
+
+        # Log the call
+        log(tag='llm_call', model=model, cost=response.get('cost', 0),
+            prompt_tokens=response.get('usage', {}).get('prompt_tokens', 0),
+            completion_tokens=response.get('usage', {}).get('completion_tokens', 0),
+            duration=0)
+
+        return response
+
     headers = {
         'Content-Type': 'application/json',
         'Authorization': f'Bearer {api_key}',
@@ -537,6 +568,37 @@ def find_json_truncation_point(json):
             i += 1
     
     return [x[1] for x in stack]
+
+
+def set_debug_llm_responses(responses: Optional[List[Dict[str, Any]]]):
+    """
+    Set debug LLM responses for testing.
+
+    Args:
+        responses: List of response dicts, each containing 'message', 'cost', and 'usage'.
+                   Set to None to disable debug mode and use real API calls.
+
+    Each response dict should have:
+        - message: Assistant message dict with 'role', 'content', and optional 'tool_calls'
+        - cost: Cost in microdollars (integer)
+        - usage: Usage dict with 'prompt_tokens' and 'completion_tokens'
+    """
+    global _debug_llm_responses, _debug_llm_index, _cumulative_cost
+    _debug_llm_responses = responses
+    _debug_llm_index = 0
+    _cumulative_cost = 0
+
+
+def set_cprint_callback(callback: Optional[callable]):
+    """
+    Set a callback function to capture cprint output for testing.
+
+    Args:
+        callback: Function that takes (text: str, end: str) as arguments.
+                  Set to None to disable callback and use normal printing.
+    """
+    global _cprint_callback
+    _cprint_callback = callback
 
 
 from logger import log

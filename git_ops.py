@@ -210,8 +210,19 @@ def merge_to_main(root_path, worktree_path, org_branch_name, commit_message):
     # Soft reset to base
     run_git('reset', '--soft', base_commit, cwd=worktree_path)
 
+    # Stage all changes (excluding .scratch and .maca)
+    run_git('add', '-A', ':!.scratch', ':!.maca', cwd=worktree_path)
+
     # Commit everything as one commit with enhanced message
-    run_git('commit', '-m', enhanced_message, cwd=worktree_path)
+    result = run_git('commit', '-m', enhanced_message, cwd=worktree_path, check=False)
+    if result.returncode != 0:
+        # If commit fails, it might be because there are no changes (edge case)
+        # Just continue without erroring
+        if 'nothing to commit' in result.stdout + result.stderr:
+            return None
+        else:
+            # Real error, re-raise
+            raise GitError(f"Git command failed: git commit\nstdout: {result.stdout}\nstderr: {result.stderr}")
 
     # Try to rebase the session branch onto main
     result = run_git('rebase', root_branch, cwd=worktree_path, check=False)
@@ -219,8 +230,8 @@ def merge_to_main(root_path, worktree_path, org_branch_name, commit_message):
     if result.returncode != 0:
         return result.stdout
 
-    # Fast-forward merge
-    run_git('merge', '--ff-only', worktree_branch, cwd=root_path)
+    # Fast-forward merge the rebased descriptive branch
+    run_git('merge', '--ff-only', descriptive_branch, cwd=root_path)
 
 
 def cleanup_session(repo_root, worktree_path, branch_name):
