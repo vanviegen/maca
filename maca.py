@@ -122,27 +122,28 @@ class MACA:
         }
 
         if self.prev_state:
-            org_size = 0
             for name, new in state.items():
-                org_size += len(new)
                 old = self.prev_state.get(name, '')
                 if new != old:
                     diff = compute_diff(old, new)
                     if diff:
                         content = f"[[{name} Update]]\n\n```diff\n{diff}\n```"
+                        self.state_delta_threshold -= len(content)
                         self.add_message({
                             'role': 'user',
                             'content': content
                         }, 'state')
-            
-            self.state_delta_threshold = int(0.25 * org_size)
 
         if not self.prev_state:
+            org_size = 0
             for name, new in state.items():
+                org_size += len(new)
                 self.add_message({
                     'role': 'user',
                     'content': f"[[{name}]]\n\n{new}"
                 }, 'state')
+            
+            self.state_delta_threshold = int(0.25 * org_size)
 
         self.prev_state = state
 

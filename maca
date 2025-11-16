@@ -10,4 +10,8 @@ fi
 # Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-"$VENV/bin/python" "$SCRIPT_DIR/run.py" "$@"
+if [ "$1" = "--test" ] ; then
+  "$VENV/bin/python" "$SCRIPT_DIR/test_integration.py" "$@"
+else
+  "$VENV/bin/python" "$SCRIPT_DIR/run.py" "$@"
+fi

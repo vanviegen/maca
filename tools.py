@@ -724,7 +724,7 @@ def respond(
         thoughts: Reason for yourself about what you need to do. This will not be saved in the context nor shown to the user. Be succinct (sacrifice grammar for briefness) and self-critical.
         keep_extended_context: Set to true if you need to preserve the temporary context (full results from file_reads, file_searches, shell_commands, sub_processors) for the iteration. Do this only if you just found out that you are missing some information to accomplish a task that requires access to those results. If it's possible to densely summarize the info you'll still need in the future to `notes_for_context`, do that instead.
         file_updates: Optional list of file modifications to apply. Executed FIRST (before data gathering operations).
-        user_questions: Optional list of questions to ask the user. Answers are stored in long-term context.
+        user_questions: Optional list of questions to ask the user. Answers are stored in long-term context. If `preset_answers` is given, a 'other' option is always added automatically.
         file_reads: Optional list of file (parts) to read into temporary context.
         file_searches: Optional list of file searches to read into temporary context.
         shell_commands: Optional list of shell commands to execute. Stdout and stderr go into temporary context. Don't even use shell commands to write files - use file_updates for that!
