@@ -15,7 +15,8 @@ from prompt_toolkit.history import FileHistory
 
 import git_ops
 import tools
-from utils import cprint, call_llm, compute_diff, get_cumulative_cost, C_GOOD, C_BAD, C_NORMAL, C_IMPORTANT, C_INFO, C_LOG
+from utils import cprint, compute_diff, C_GOOD, C_BAD, C_NORMAL, C_IMPORTANT, C_INFO, C_LOG
+from llm import call_llm, get_cumulative_cost
 from logger import log
 import logger
 import code_map

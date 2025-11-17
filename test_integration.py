@@ -96,7 +96,8 @@ TEST_CASES: List[TestCase] = [
 
 
 from maca import MACA
-from utils import set_debug_llm_responses, set_cprint_callback
+from utils import set_cprint_callback
+from llm import set_debug_llm_responses
 import git_ops
 
 

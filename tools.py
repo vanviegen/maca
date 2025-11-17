@@ -11,7 +11,8 @@ import json
 import re
 import fnmatch
 
-from utils import cprint, call_llm, get_matching_files, C_GOOD, C_BAD, C_NORMAL, C_IMPORTANT, C_INFO
+from utils import cprint, get_matching_files, C_GOOD, C_BAD, C_NORMAL, C_IMPORTANT, C_INFO
+from llm import call_llm
 from docker_ops import run_in_container
 import git_ops
 
