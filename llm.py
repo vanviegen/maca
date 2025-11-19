@@ -5,6 +5,8 @@ import json
 import urllib.request
 import time
 import re
+import os
+import sys
 
 from logger import log
 from utils import cprint, C_INFO, C_BAD
@@ -16,6 +18,13 @@ _cumulative_cost = 0
 # Debug/testing support
 _debug_llm_responses = None
 _debug_llm_index = 0
+
+
+# Get API key from environment
+api_key = os.environ.get('OPENROUTER_API_KEY')
+if not api_key:
+    cprint(C_BAD, 'Error: OPENROUTER_API_KEY environment variable not set')
+    sys.exit(1)
 
 
 class LLMStreamReader:
@@ -172,7 +181,6 @@ class LLMStreamReader:
 
 
 def call_llm(
-    api_key: str,
     model: str,
     messages: List[Dict[str, Any]],
     tool_schemas: List[Dict[str, Any]]
@@ -181,7 +189,6 @@ def call_llm(
     Call the OpenRouter LLM API with retry logic and streaming.
 
     Args:
-        api_key: OpenRouter API key
         model: Model identifier (e.g., "anthropic/claude-sonnet-4.5")
         messages: List of message dicts with role and content
         tool_schemas: List of tool schemas

@@ -34,7 +34,7 @@ TEST_CASES: List[TestCase] = [
                 }],
                 'file_change_description': 'Add hello.txt',
                 'user_output': 'Created hello.txt with greeting',
-                'done': True
+                'commit_message': 'Add hello.txt\n\nCreated hello.txt with greeting message'
             }
         ],
         'expected_files': {
@@ -58,7 +58,7 @@ TEST_CASES: List[TestCase] = [
                 }],
                 'file_change_description': 'Update README.md',
                 'user_output': 'Updated README.md with description',
-                'done': True
+                'commit_message': 'Update README.md\n\nAdded description to README'
             }
         ],
         'expected_files': {
@@ -84,7 +84,7 @@ TEST_CASES: List[TestCase] = [
                 }],
                 'file_change_description': 'Add todo.txt',
                 'user_output': 'Created todo.txt',
-                'done': True
+                'commit_message': 'Add todo.txt\n\nCreated todo list for Test Project'
             }
         ],
         'expected_files': {
@@ -210,7 +210,6 @@ def run_test_case(test_case: TestCase):
             directory=str(repo_path),
             task=test_case['task'],
             model='test-model',
-            api_key='test-key',
             non_interactive=True,
             verbose=False
         )

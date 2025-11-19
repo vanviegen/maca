@@ -25,12 +25,6 @@ if args.non_interactive and not task_str:
     cprint(C_BAD, 'Error: --non-interactive (-n) requires a task argument')
     sys.exit(1)
 
-# Resolve API key at startup
-api_key = os.environ.get('OPENROUTER_API_KEY')
-if not api_key:
-    print("Error: OPENROUTER_API_KEY environment variable not set", file=sys.stderr)
-    sys.exit(1)
-
 # Create MACA instance and run
-maca = MACA(args.directory, task_str, args.model, api_key, args.non_interactive, args.verbose)
+maca = MACA(args.directory, task_str, args.model, args.non_interactive, args.verbose)
 maca.run()

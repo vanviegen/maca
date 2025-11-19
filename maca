@@ -7,11 +7,12 @@ if [ ! -d "$VENV" ] ; then
   "$VENV/bin/pip" install prompt-toolkit tree-sitter-language-pack
 fi
 
-# Get the directory where this script is located
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Get the directory where this script is actually located (resolve symlinks)
+SCRIPT_PATH="$(readlink -f "$0")"
+SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
 if [ "$1" = "--test" ] ; then
-  "$VENV/bin/python" "$SCRIPT_DIR/test_integration.py" "$@"
+  "$VENV/bin/python" "$SCRIPT_DIR/test.py" "$@"
 else
   "$VENV/bin/python" "$SCRIPT_DIR/run.py" "$@"
 fi

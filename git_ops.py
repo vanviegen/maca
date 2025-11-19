@@ -2,12 +2,12 @@
 """Git operations for agentic coding assistant worktree management."""
 
 import subprocess
-import os
 import re
 from pathlib import Path
-from typing import Optional
 
 from utils import C_GOOD, C_INFO, C_NORMAL, cprint
+
+ALWAYS_EXCLUDE = [':!.scratch', ':!.maca']
 
 
 class GitError(Exception):
@@ -191,6 +191,8 @@ def generate_descriptive_branch_name(commit_message):
 
     return name
 
+def check_uncommitted(worktree_path):
+    return run_git('status', '--porcelain', *ALWAYS_EXCLUDE, cwd=worktree_path).stdout.strip() != ''
 
 def merge_to_main(root_path, worktree_path, org_branch_name, commit_message):
     """Merge the session branch into main using squash + rebase + ff strategy."""
@@ -211,7 +213,7 @@ def merge_to_main(root_path, worktree_path, org_branch_name, commit_message):
     run_git('reset', '--soft', base_commit, cwd=worktree_path)
 
     # Stage all changes (excluding .scratch and .maca)
-    run_git('add', '-A', ':!.scratch', ':!.maca', cwd=worktree_path)
+    run_git('add', '-A', *ALWAYS_EXCLUDE, cwd=worktree_path)
 
     # Commit everything as one commit with enhanced message
     result = run_git('commit', '-m', enhanced_message, cwd=worktree_path, check=False)

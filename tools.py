@@ -605,7 +605,6 @@ def run_subprocessor(processor: SubProcessor, maca, system_prompt: str) -> str:
     # Call LLM for processor
     try:
         llm_result = call_llm(
-            api_key=maca.api_key,
             model=resolved_model,
             messages=messages,
             tool_schemas=[SUBPROCESSOR_RESPOND_TOOL_SCHEMA if file_write_allow_globs else SUBPROCESSOR_RESPOND_NO_UPDATES_TOOL_SCHEMA],
@@ -659,11 +658,6 @@ def run_subprocessor(processor: SubProcessor, maca, system_prompt: str) -> str:
         return f"Error: Processor execution failed: {str(e)}"
 
 
-# ==============================================================================
-# SUBPROCESSOR TOOL
-# ==============================================================================
-
-
 def subprocessor_respond(
     thoughts: str,
     file_updates: Optional[List[FileUpdate]] = None,
@@ -682,6 +676,7 @@ def subprocessor_respond(
     # Actual execution is handled in execute_processor()
     pass
 
+
 def subprocessor_respond_no_updates(
     thoughts: str,
     result: str = ""
@@ -698,9 +693,6 @@ def subprocessor_respond_no_updates(
     # Actual execution is handled in execute_processor()
     pass
 
-# ==============================================================================
-# MAIN TOOL
-# ==============================================================================
 
 def respond(
     thoughts: str,
@@ -713,8 +705,8 @@ def respond(
     sub_processors: Optional[List[SubProcessor]] = None,
     file_change_description: Optional[str] = None,
     notes_for_context: Optional[str] = None,
-    done: Optional[bool] = None,
     user_output: Optional[str] = None,
+    commit_message: Optional[str] = None,
 
     maca = None,
 ) -> Dict[str, Any]:
@@ -742,29 +734,13 @@ def respond(
           - Temporary context that will be lost (all file_reads+file_searches+shell_commands+sub_processors unless keep_extended_context is set), insofar that you'll need it later in the conversation
           - What the next completion needs to do with the input data it receives (unless obvious)
           This will be saved in long-term context.
-        user_output: Optionally what to show to the user. Don't provide this, unless there is something interesting and new to tell. If `done` is true, you *must* provide a meaningful answer here. Keep it short.
-        done: Set to true if you have completed the overall task given by the user. This will trigger the merge process. Make sure everything is done, nice and clean before you set this! If set, further operations (file_reads, file_searches, shell_commands, sub_processors) are not allowed. Also, you *must* provide a meaningful `user_output` answering the user question or briefly summarizing the work done.
-
-    Returns:
-        Tuple of (temporary_response, done):
-        - temporary_response: Dict with full operation results including all data
-        - done: Whether the task is complete
+        user_output: What to show the user. If you are *not* ordering further operations (user_questions, file_reads, file_searches, shell_commands, sub_processors) you *must* provide a meaningful answer or a summary of what was done here. Otherwise, only provide this if there really is something interesting to say at this point. Keep it short.
+        commit_message: If you believe the the code you created is fully complete and ready to be merged into `main` *and* you are not ordering any further commands (except perhaps the last `file_updates`), set this field to a git commit message (a short summary line followed by a blank line and an optional multi-line description). The message should encompass all changes made since the start of the task (or the last `commit_message`). It should not reflect meandering/intermediate steps, just the end result.
     """
 
     # Build response structures
     response = {}
-    if done is None:
-        done = False
-
-    # Validate done constraints
-    if done:
-        if not user_output:
-            response["done"] = "Error: 'done' is set but 'user_output' is missing. You must provide a meaningful summary when marking the task as complete."
-            done = False
-
-        if any([file_reads, file_searches, shell_commands, sub_processors]):
-            response["done"] = "Error: 'done' is set but data gathering operations (file_reads, file_searches, shell_commands, sub_processors) are not allowed when done=True."
-            done = False
+    done = True
 
     # 1. Handle file updates FIRST (LLM has already output the write comments)
     if file_updates:
@@ -784,6 +760,7 @@ def respond(
 
         response['file_updates'] = apply_file_updates(file_updates, maca.worktree_path) or 'OK'
         if response['file_updates'] != 'OK':
+            keep_extended_context = True
             done = False
 
     # 2. Handle user questions (to get input before data gathering operations)
@@ -800,6 +777,7 @@ def respond(
         cprint(C_INFO, f"Reading {len(file_reads)} file(s): {file_list}")
 
         response['file_reads'] = read_files(file_reads, maca.worktree_path)
+        done = False
 
     # 4. Handle file searches
     if file_searches:
@@ -808,6 +786,7 @@ def respond(
             cprint(C_INFO, f"Searching for /{search['regex']}/")
 
         response['file_searches'] = execute_searches(file_searches, maca.worktree_path)
+        done = False
 
     # 5. Handle shell commands
     if shell_commands:
@@ -816,11 +795,7 @@ def respond(
             cprint(C_INFO, f"Running: {cmd_spec['command']}")
 
         response['shell_commands'] = execute_shell_commands(shell_commands, maca.worktree_path, maca.repo_root)
-
-    # Commit changes if files were updated
-    if maca.last_head_commit != git_ops.get_head_commit(maca.worktree_path):
-        git_ops.commit_changes(maca.worktree_path, f"MACA: {file_change_description or 'No description'}")
-        maca.last_head_commit = git_ops.get_head_commit(maca.worktree_path)
+        done = False
 
     # 6. Handle sub-processors
     if sub_processors:
@@ -836,8 +811,58 @@ def respond(
             processor_results.append(result)
 
         response['sub_processors'] = processor_results
+        done = False
 
-    # 9. Manage context cleanup
+    # Commit changes if files were updated
+    if maca.last_head_commit != git_ops.get_head_commit(maca.worktree_path):
+        git_ops.commit_changes(maca.worktree_path, f"MACA: {file_change_description or 'No description'}")
+        maca.last_head_commit = git_ops.get_head_commit(maca.worktree_path)
+
+    # 9. Handle commit_message (merge to main if requested)
+    if commit_message and done:
+        # In non-interactive mode, auto-merge
+        if maca.non_interactive:
+            should_merge = True
+        else:
+            # Ask user for approval
+            cprint(C_GOOD, '\n✓ Ready to merge!\n')
+            cprint(C_INFO, f'Commit message:\n{commit_message}\n')
+            response_choice = choice(
+                message='Merge to main?',
+                options=[
+                    ('yes', 'Merge and continue'),
+                    ('no', 'Continue without merging'),
+                ]
+            )
+            should_merge = (response_choice == 'yes')
+
+        if should_merge:
+            cprint(C_INFO, 'Merging changes...')
+            conflict = git_ops.merge_to_main(maca.repo_root, maca.worktree_path, maca.branch_name, commit_message)
+
+            if conflict:
+                cprint(C_BAD, "⚠ Merge conflicts!")
+                error_response = {
+                    "error": f"Merge conflict while rebasing. Please resolve merge conflicts by reading the affected files and using file_updates to resolve the conflicts. Then use a shell_command to run `git add <filename>.. && git rebase --continue`, before trying again with another commit_message. Here is the rebase output:\n\n{conflict}"
+                }
+                # Add error as user message so the assistant can fix it
+                maca.add_message({"role": "user", "content": json.dumps(error_response, indent=2)})
+                return (response, False)
+
+            # Cleanup
+            git_ops.cleanup_session(maca.repo_root, maca.worktree_path, maca.branch_name)
+            cprint(C_GOOD, '✓ Merged and cleaned up')
+
+            # If in interactive mode, create new session for next task
+            if not maca.non_interactive:
+                import logger
+                maca.session_id = git_ops.find_next_session_id(maca.repo_root)
+                maca.worktree_path, maca.branch_name = git_ops.create_session_worktree(maca.repo_root, maca.session_id)
+                logger.init(maca.repo_root, maca.session_id)
+                maca._load_system_prompt()
+            # In non-interactive mode, we'll return and the main loop will exit
+
+    # 10. Manage context cleanup
     if not keep_extended_context:
         maca.clear_temporary_messages()
 

@@ -3,7 +3,6 @@
 
 from copy import copy, deepcopy
 import sys
-import os
 import json
 from pathlib import Path
 from typing import Dict, Any, Optional
@@ -33,7 +32,8 @@ class ContextError(Exception):
 class MACA:
     """Main orchestration class for the coding assistant."""
 
-    def __init__(self, directory: str, task: str | None, model: str | None, api_key: str, non_interactive: bool = False, verbose: bool = False):
+
+    def __init__(self, directory: str, task: str | None, model: str | None, non_interactive: bool = False, verbose: bool = False):
         """
         Initialize MACA with all required attributes.
 
@@ -41,14 +41,12 @@ class MACA:
             directory: Project directory path
             task: Initial task description (optional)
             model: Model to use for LLM calls
-            api_key: OpenRouter API key
             non_interactive: Run in non-interactive mode
             verbose: Enable verbose logging mode
         """
         # Basic configuration
         self.initial_prompt = task
         self.model = model or 'anthropic/claude-sonnet-4.5'
-        self.api_key = api_key
         self.non_interactive = non_interactive
         self.verbose = verbose
 
@@ -76,6 +74,7 @@ class MACA:
         # History (initialized after repo_root is set)
         self.history = None
 
+
     def ensure_git_repo(self):
         """Ensure we're in a git repository, or offer to initialize one."""
         if not git_ops.is_git_repo(self.repo_path):
@@ -98,6 +97,7 @@ class MACA:
 
         return git_ops.get_repo_root(self.repo_path)
 
+
     def _load_system_prompt(self):
         """Load the system prompt from prompt.md."""
         # Find prompt.md (next to the script)
@@ -113,6 +113,7 @@ class MACA:
             'role': 'system',
             'content': system_prompt
         })
+
 
     def update_state(self):
         """Update state tracking for AGENTS.md and code_map."""
@@ -148,6 +149,7 @@ class MACA:
 
         self.prev_state = state
 
+
     def add_message(self, message: Dict, persistence = 'normal'):
         """Add a message dict to the context and the log. Persistence can be normal, temporary, long-term-only, state."""
         log(tag='message', persistence=persistence, **message)
@@ -160,6 +162,7 @@ class MACA:
             else:
                 self.permanent_messages.append(message)
 
+
     def clear_temporary_messages(self):
         """Clear all temporary messages from the context."""
         if self.state_delta_threshold <= 0:
@@ -168,6 +171,7 @@ class MACA:
             self.prev_state = None
             self.update_state()
         self.messages = self.long_term_messages
+
 
     def run_main_loop(self):
         """
@@ -196,7 +200,6 @@ class MACA:
 
             # Call LLM (retry logic is in call_llm)
             result = call_llm(
-                api_key=self.api_key,
                 model=self.model,
                 messages=self.messages,
                 tool_schemas=[tools.RESPOND_TOOL_SCHEMA],
@@ -211,12 +214,11 @@ class MACA:
             tool_calls = message.get('tool_calls', [])
             if len(tool_calls) != 1:
                 raise ContextError(f"Expected exactly 1 tool call, got {len(tool_calls)}")
-            args = json.loads(message['tool_calls'][0]['function']['arguments'])
+            tool_call = tool_calls[0]
+            
+            args = json.loads(tool_call['function']['arguments'])
             log(tag='tool_call', **args)
             (temporary_response, done) = tools.respond(**args, maca=self)
-
-            # Serialize responses to JSON
-            temporary_json = json.dumps(temporary_response)
 
             # Add assistant message (and trimmed version) to history
             self.add_message(message, 'long-term-only')
@@ -226,8 +228,8 @@ class MACA:
                 'role': 'user',
                 'content': [{
                     'type': 'tool_result',
-                    'tool_use_id': tool_calls[0]['id'],
-                    'content': temporary_json,
+                    'tool_use_id': tool_call['id'],
+                    'content': json.dumps(temporary_response),
                 }]
             }, 'temporary')
 
@@ -235,78 +237,10 @@ class MACA:
                 'role': 'user',
                 'content': [{
                     'type': 'tool_result',
-                    'tool_use_id': tool_calls[0]['id'],
+                    'tool_use_id': tool_call['id'],
                     'content': "OMITTED",
                 }]
             }, 'long-term-only')
-
-            if done and not self.handle_done():
-                done = False
-
-        cprint(C_GOOD, '✓ Task completed. Total cost: ', C_IMPORTANT, f'{get_cumulative_cost()}μ$')
-        log(tag='complete', total_cost=get_cumulative_cost())
-
-    def handle_done(self):
-        cprint(C_GOOD, '\n✓ Task completed!\n')
-
-        # In non-interactive mode, auto-merge and exit
-        if self.non_interactive:
-            cprint(C_INFO, 'Non-interactive mode: auto-merging changes')
-            response = 'merge'
-        else:
-            # Ask for approval
-            response = choice(
-                message=f'How to proceed? [{self.worktree_path}]',
-                options=[
-                    ('merge', 'Merge into main'),
-                    ('continue', 'Ask for further changes'),
-                    ('cancel', 'Leave as-is for manual review'),
-                    ('delete', 'Delete everything'),
-                ]
-            )
-
-        if response == 'merge':
-            cprint(C_INFO, 'Merging changes...')
-
-            # Use session ID as commit message
-            commit_msg = f"Session {self.session_id}"
-
-            # Merge
-            conflict = git_ops.merge_to_main(self.repo_root, self.worktree_path, self.branch_name, commit_msg)
-
-            if conflict:
-                cprint(C_BAD, "⚠ Merge conflicts!")
-                error_response = {
-                    "error": f"Merge conflict while rebasing. Please resolve merge conflicts by reading the affected files and using file_updates to resolve the conflicts. Then use a shell_command to run `git add <filename>.. && git rebase --continue`, before calling respond again with done=true to try the merge again. Here is the rebase output:\n\n{conflict}"
-                }
-                # Add error as user message so the assistant can fix it
-                self.add_message({"role": "user", "content": json.dumps(error_response, indent=2)})
-                return False
-
-            # Cleanup
-            git_ops.cleanup_session(self.repo_root, self.worktree_path, self.branch_name)
-            cprint(C_GOOD, '✓ Merged and cleaned up')
-
-            # In non-interactive mode, exit after successful merge
-            if self.non_interactive:
-                return True
-
-            git_ops.create_session_worktree(self.repo_root, self.session_id)
-
-            return True
-
-        if response == 'continue':
-            feedback = pt_prompt("What changes do you want?\n> ", multiline=True, history=self.history)
-            self.add_message({"role": "user", "content": feedback})
-            return False
-
-        if response == 'delete':
-            git_ops.cleanup_session(self.repo_root, self.worktree_path, self.branch_name)
-            cprint(C_BAD, '✓ Deleted worktree and branch')
-            return True
-
-        cprint(C_IMPORTANT, "Keeping worktree for manual review.")
-        return True
 
 
     def run(self):
@@ -367,6 +301,7 @@ class MACA:
                     break
 
 
+
 if __name__ == '__main__':
     import argparse
 
@@ -383,18 +318,11 @@ if __name__ == '__main__':
         cprint(C_BAD, 'Error: --non-interactive (-n) requires a task argument')
         sys.exit(1)
 
-    # Get API key from environment
-    api_key = os.environ.get('OPENROUTER_API_KEY')
-    if not api_key:
-        cprint(C_BAD, 'Error: OPENROUTER_API_KEY environment variable not set')
-        sys.exit(1)
-
     # Create and run MACA
     maca = MACA(
         directory=args.directory,
         task=args.task,
         model=args.model,
-        api_key=api_key,
         non_interactive=args.non_interactive,
         verbose=args.verbose
     )
