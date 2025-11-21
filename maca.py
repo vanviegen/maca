@@ -167,10 +167,10 @@ class MACA:
         """Clear all temporary messages from the context."""
         if self.state_delta_threshold <= 0:
             cprint(C_IMPORTANT, '→ State changes exceed 25% of original size, rewriting history')
-            self.long_term_messages = self.permanent_messages
+            self.long_term_messages = self.permanent_messages.copy()
             self.prev_state = None
             self.update_state()
-        self.messages = self.long_term_messages
+        self.messages = self.long_term_messages.copy()  # Make a copy to avoid aliasing
 
 
     def run_main_loop(self):
@@ -221,7 +221,18 @@ class MACA:
             (temporary_response, done) = tools.respond(**args, maca=self)
 
             # Add assistant message (and trimmed version) to history
-            self.add_message(message, 'long-term-only')
+            args.pop('thoughts', None)
+            if 'file_updates' in args:
+                for f in args['file_updates']:
+                    if 'overwrite' in f:
+                        f['overwrite'] = "OMITTED"
+                    if 'update' in f:
+                        f['update'] = "OMITTED"
+            args.pop('user_questions', None)  # Will be added as separate messages
+            if not done:
+                args.pop('commit_message', None)
+            # Add to both messages and long_term to maintain proper message alternation
+            self.add_message(message, 'normal')
 
             # Add tool result messages (temporary and long-term summary)
             self.add_message({

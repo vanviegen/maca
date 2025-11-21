@@ -821,9 +821,7 @@ def respond(
     # 9. Handle commit_message (merge to main if requested)
     if commit_message and done:
         # In non-interactive mode, auto-merge
-        if maca.non_interactive:
-            should_merge = True
-        else:
+        if not maca.non_interactive:
             # Ask user for approval
             cprint(C_GOOD, '\n✓ Ready to merge!\n')
             cprint(C_INFO, f'Commit message:\n{commit_message}\n')
@@ -834,33 +832,33 @@ def respond(
                     ('no', 'Continue without merging'),
                 ]
             )
-            should_merge = (response_choice == 'yes')
+            if not (response_choice == 'yes'):
+                return
 
-        if should_merge:
-            cprint(C_INFO, 'Merging changes...')
-            conflict = git_ops.merge_to_main(maca.repo_root, maca.worktree_path, maca.branch_name, commit_message)
+        cprint(C_INFO, 'Merging changes...')
+        conflict = git_ops.merge_to_main(maca.repo_root, maca.worktree_path, maca.branch_name, commit_message)
 
-            if conflict:
-                cprint(C_BAD, "⚠ Merge conflicts!")
-                error_response = {
-                    "error": f"Merge conflict while rebasing. Please resolve merge conflicts by reading the affected files and using file_updates to resolve the conflicts. Then use a shell_command to run `git add <filename>.. && git rebase --continue`, before trying again with another commit_message. Here is the rebase output:\n\n{conflict}"
-                }
-                # Add error as user message so the assistant can fix it
-                maca.add_message({"role": "user", "content": json.dumps(error_response, indent=2)})
-                return (response, False)
+        if conflict:
+            cprint(C_BAD, "⚠ Merge conflicts!")
+            error_response = {
+                "error": f"Merge conflict while rebasing. Please resolve merge conflicts by reading the affected files and using file_updates to resolve the conflicts. Then use a shell_command to run `git add <filename>.. && git rebase --continue`, before trying again with another commit_message. Here is the rebase output:\n\n{conflict}"
+            }
+            # Add error as user message so the assistant can fix it
+            maca.add_message({"role": "user", "content": json.dumps(error_response, indent=2)})
+            return (response, False)
 
-            # Cleanup
-            git_ops.cleanup_session(maca.repo_root, maca.worktree_path, maca.branch_name)
-            cprint(C_GOOD, '✓ Merged and cleaned up')
+        maca.add_message({"role": "user", "content": "Squashed and merged into main! You're now working on a fresh feature branch."})
 
-            # If in interactive mode, create new session for next task
-            if not maca.non_interactive:
-                import logger
-                maca.session_id = git_ops.find_next_session_id(maca.repo_root)
-                maca.worktree_path, maca.branch_name = git_ops.create_session_worktree(maca.repo_root, maca.session_id)
-                logger.init(maca.repo_root, maca.session_id)
-                maca._load_system_prompt()
-            # In non-interactive mode, we'll return and the main loop will exit
+        # Cleanup
+        git_ops.cleanup_session(maca.repo_root, maca.worktree_path, maca.branch_name)
+        cprint(C_GOOD, '✓ Squashed and merged!')
+
+        # In non-interactive mode, we'll return and the main loop will exit
+        if maca.non_interactive:
+            exit(0)
+
+        # If in interactive mode, create git tree/branch for the next task
+        maca.worktree_path, maca.branch_name = git_ops.create_session_worktree(maca.repo_root, maca.session_id)
 
     # 10. Manage context cleanup
     if not keep_extended_context:

@@ -56,20 +56,31 @@ class LLMStreamReader:
                 try:
                     data_obj = json.loads(data_str)
                     delta = data_obj.get('choices', [{}])[0].get('delta', {})
-                    
+
+                    # Handle text content
+                    if 'content' in delta and delta['content'] is not None:
+                        if self.message is None:
+                            self.message = {'role': 'assistant', 'content': ''}
+                        if 'content' not in self.message:
+                            self.message['content'] = ''
+                        self.message['content'] += delta['content']
+
+                    # Handle tool calls
                     if 'tool_calls' in delta:
                         if self.message is None:
-                            self.message = {'role': 'assistant', 'content': '', 'tool_calls': []}
-                        
+                            self.message = {'role': 'assistant', 'tool_calls': []}
+                        if 'tool_calls' not in self.message:
+                            self.message['tool_calls'] = []
+
                         for tool_call_delta in delta['tool_calls']:
                             idx = tool_call_delta.get('index', 0)
-                            
+
                             while len(self.message['tool_calls']) <= idx:
                                 self.message['tool_calls'].append({
                                     'id': '', 'type': 'function',
                                     'function': {'name': '', 'arguments': ''}
                                 })
-                            
+
                             tc = self.message['tool_calls'][idx]
                             if 'id' in tool_call_delta:
                                 tc['id'] = tool_call_delta['id']
@@ -81,7 +92,7 @@ class LLMStreamReader:
                                 if 'arguments' in tool_call_delta['function']:
                                     tc['function']['arguments'] += tool_call_delta['function']['arguments']
                                     self._partial_arg_json = tc['function']['arguments']
-                    
+
                     if 'usage' in data_obj:
                         self.usage = data_obj['usage']
                 
@@ -275,6 +286,11 @@ def call_llm(
             # Validate we got a message
             if stream.message is None:
                 raise Exception("No message received from stream")
+
+            # Clean up empty content: OpenAI/OpenRouter format allows null content with tool calls
+            # Anthropic requires non-empty content, but OpenRouter should handle the conversion
+            if stream.message.get('content') == '':
+                stream.message['content'] = None
 
             # Calculate cost
             cost = int(stream.usage.get('cost', 0) * 1_000_000) if stream.usage else 0  # Convert dollars to microdollars
