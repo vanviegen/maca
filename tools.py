@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""Tool system with single respond tool and processor support."""
+"""Command execution system for MACA."""
 
 from dataclasses import dataclass
 from pathlib import Path
 from prompt_toolkit import prompt as pt_prompt
 from prompt_toolkit.shortcuts import choice
-from typing import get_type_hints, get_origin, get_args, Any, Dict, List, Union, Optional, TypedDict
-import inspect
-import json
-import re
+from typing import Dict, List, Optional, Any
 import fnmatch
+import re
+import json
 
 from utils import cprint, get_matching_files, C_GOOD, C_BAD, C_NORMAL, C_IMPORTANT, C_INFO
 from llm import call_llm
 from docker_ops import run_in_container
+from command_parser import Command, parse_commands, format_command_results, get_cancelled_ids
 import git_ops
 
 
@@ -58,412 +58,358 @@ def check_path(path: str, worktree_path: Path) -> Path:
 
 
 # ==============================================================================
-# TYPE DEFINITIONS
-# ==============================================================================
-
-class FileRead(TypedDict, total=False):
-    """Specification for reading a file or file range."""
-    path: str
-    start_line: Optional[int]
-    end_line: Optional[int]
-
-
-class SearchReplaceOp(TypedDict, total=False):
-    """A single search/replace operation."""
-    search: str
-    replace: str
-    min_match: Optional[int]  # Optional, defaults to 1
-    max_match: Optional[int]  # Optional, defaults to 1
-
-
-class FileUpdate(TypedDict, total=False):
-    """Specification for updating a single file."""
-    path: str
-    overwrite: Optional[str]  # Overwrite file with this content
-    update: Optional[List[SearchReplaceOp]]  # Apply search/replace operations
-    rename: Optional[str]  # Rename to this path (empty string means delete)
-    summary: str  # One-sentence description of changes
-
-
-class ShellCommand(TypedDict, total=False):
-    """Specification for executing a shell command."""
-    command: str
-    docker_image: Optional[str]
-    docker_runs: Optional[List[str]]
-    head: Optional[int]
-    tail: Optional[int]
-
-
-class FileSearch(TypedDict, total=False):
-    """Specification for searching file contents."""
-    regex: str
-    include: Optional[Union[str, List[str]]]
-    exclude: Optional[Union[str, List[str]]]
-    exclude_files: Optional[Union[str, List[str]]]
-    max_results: Optional[int]
-    lines_before: Optional[int]
-    lines_after: Optional[int]
-
-
-class SubProcessor(TypedDict, total=False):
-    """Specification for spawning a processor sub-context."""
-    model: str
-    assignment: str
-    file_reads: Optional[List[FileRead]]
-    file_write_allow_globs: Optional[List[str]] # List of globs that may be written to (default to none)
-
-
-class Question(TypedDict, total=False):
-    """A single question with optional preset answers."""
-    prompt: str
-    preset_answers: Optional[List[str]]
-
-
-# ==============================================================================
-# TOOL SCHEMA GENERATION
-# ==============================================================================
-
-def python_type_to_json_type(py_type) -> Dict:
-    """Convert Python type hint to JSON schema type."""
-    origin = get_origin(py_type)
-
-    # Handle TypedDict
-    if hasattr(py_type, '__annotations__'):
-        properties = {}
-        required_keys = []
-
-        for field_name, field_type in get_type_hints(py_type).items():
-            properties[field_name] = python_type_to_json_type(field_type)
-
-            # Field is required if it's not wrapped in Optional
-            field_origin = get_origin(field_type)
-            if field_origin is Union:
-                # Check if None is in the union args
-                if type(None) not in get_args(field_type):
-                    required_keys.append(field_name)
-            else:
-                # Not a Union, so it's required
-                required_keys.append(field_name)
-
-        schema = {
-            'type': 'object',
-            'properties': properties,
-            'additionalProperties': False
-        }
-        if required_keys:
-            schema['required'] = required_keys
-        return schema
-
-    # Handle Union types
-    if origin is Union:
-        args = get_args(py_type)
-        has_none = type(None) in args
-        non_none_args = [arg for arg in args if arg is not type(None)]
-
-        # Convert each union member to a schema
-        schemas = []
-        for arg in non_none_args:
-            schemas.append(python_type_to_json_type(arg))
-
-        if has_none:
-            schemas.append({'type': 'null'})
-
-        # If only one schema (plus maybe null), simplify
-        if len(schemas) == 1:
-            return schemas[0]
-
-        # Multiple schemas - use anyOf
-        return {'anyOf': schemas}
-
-    # Handle List
-    if origin is list:
-        args = get_args(py_type)
-        if args:
-            item_schema = python_type_to_json_type(args[0])
-            return {'type': 'array', 'items': item_schema}
-        return {'type': 'array'}
-
-    # Handle Dict
-    if origin is dict:
-        return {'type': 'object'}
-
-    # Handle basic types
-    if py_type == str:
-        return {'type': 'string'}
-    elif py_type == int:
-        return {'type': 'integer'}
-    elif py_type == float:
-        return {'type': 'number'}
-    elif py_type == bool:
-        return {'type': 'boolean'}
-    elif py_type == type(None):
-        return {'type': 'null'}
-    elif py_type == Any:
-        return {}
-    else:
-        # Default to string for unknown types
-        return {'type': 'string'}
-
-
-def generate_tool_schema(func) -> Dict:
-    """Generate OpenAI-compatible function schema from a Python function."""
-    sig = inspect.signature(func)
-    type_hints = get_type_hints(func)
-    doc = inspect.getdoc(func) or ""
-
-    # Extract description and parameter docs from docstring
-    description_lines = []
-    param_docs = {}
-
-    in_args_section = False
-    current_param = None
-
-    for line in doc.split('\n'):
-        line = line.strip()
-        if line.lower().startswith('args:'):
-            in_args_section = True
-            continue
-        elif line.lower().startswith('returns:'):
-            in_args_section = False
-            continue
-
-        if in_args_section:
-            # Parse parameter documentation
-            match = re.match(r'(\w+):\s*(.*)', line)
-            if match:
-                current_param = match.group(1)
-                param_docs[current_param] = match.group(2)
-            elif current_param and line:
-                param_docs[current_param] += ' ' + line
-        elif not in_args_section and line:
-            description_lines.append(line)
-
-    description = ' '.join(description_lines).strip()
-
-    # Build parameters schema
-    properties = {}
-    required = []
-
-    for param_name, param in sig.parameters.items():
-        # Skip internal parameters
-        if param_name in ('self', 'maca'):
-            continue
-
-        param_schema = python_type_to_json_type(type_hints.get(param_name, str))
-
-        # Add description if available
-        if param_name in param_docs:
-            param_schema['description'] = param_docs[param_name]
-
-        properties[param_name] = param_schema
-
-        # Check if required (no default value)
-        if param.default == inspect.Parameter.empty:
-            required.append(param_name)
-
-    return {
-        'type': 'function',
-        'function': {
-            'name': func.__name__,
-            'description': description,
-            'parameters': {
-                'type': 'object',
-                'properties': properties,
-                'required': required,
-                'additionalProperties': False
-            }
-        }
-    }
-
-
-# ==============================================================================
 # HELPER FUNCTIONS
 # ==============================================================================
 
-@dataclass
-class ReadyResult:
-    """Signals that the task is complete and ready for merge."""
-    result: Any
-
-
-def apply_file_updates(updates: List[FileUpdate], worktree_path: Path) -> tuple[str, str]:
+def apply_single_update(cmd: Command, worktree_path: Path) -> Dict[str, Any]:
     """
-    Apply file updates: create, modify, or delete files.
+    Apply a single UPDATE command (search/replace).
 
     Args:
-        updates: List of file update specifications
+        cmd: Command with search, replace, min_match, max_match args
         worktree_path: Path to the worktree
 
     Returns:
-        Tuple of (immediate_result, context_summary)
-        - immediate_result: "OK" or error details
-        - context_summary: Combined per-file summaries
+        Result dict
     """
-    errors = []
+    path = cmd.args.get('path')
+    search = cmd.args.get('search')
+    replace = cmd.args.get('replace')
+    min_match = int(cmd.args.get('min_match', '1'))
+    max_match = int(cmd.args.get('max_match', '1'))
 
-    for update in updates:
-        file_path = update['path']
-        overwrite = update.get('overwrite')
-        update_ops = update.get('update')
-        rename_to = update.get('rename')
+    if not path or not search:
+        return {'id': cmd.id, 'status': 'error', 'error': 'Missing required args: path, search'}
 
-        full_path = check_path(file_path, worktree_path)
+    if replace is None:
+        replace = ''
 
-        # Execute operations in order: overwrite, update, rename
+    try:
+        full_path = check_path(path, worktree_path)
+    except ValueError as e:
+        return {'id': cmd.id, 'status': 'error', 'error': str(e)}
 
-        # 1. Overwrite operation
-        if overwrite is not None:
-            # Ensure parent directory exists
-            full_path.parent.mkdir(parents=True, exist_ok=True)
-            full_path.write_text(overwrite)
+    if not full_path.exists():
+        return {'id': cmd.id, 'status': 'error', 'error': 'File not found', 'path': path}
 
-        # 2. Update (search/replace) operations
-        if update_ops is not None:
-            if not full_path.exists():
-                errors.append({"error": "Cannot apply search/replace to non-existent file", "path": file_path})
-                continue
+    try:
+        content = full_path.read_text()
+        count = content.count(search)
 
-            content = full_path.read_text()
-
-            # Validate all operations first
-            for i, op in enumerate(update_ops):
-                search_str = op['search']
-                min_match = op.get('min_match', 1)
-                max_match = op.get('max_match', 1)
-
-                count = content.count(search_str)
-                if count < min_match:
-                    errors.append({"error": "Too few matches", "path": file_path, "index": i, "search": search_str, "match_count": count, "min_match": min_match, "partial": "Other replace blocks may have succeeded"})
-                elif count > max_match:
-                    errors.append({"error": "Too many matches", "path": file_path, "index": i, "search": search_str, "match_count": count, "max_match": max_match, "partial": "Other replace blocks may have succeeded"})
-                else:
-                    content = content.replace(search_str, op['replace'])
-
-            try:
-                full_path.write_text(content)
-            except Exception as e:
-                errors.append({"error": f"Failed to write updated content: {str(e)}", "path": file_path})
-                continue
-
-        # 3. Rename operation (includes delete)
-        if rename_to is not None:
-            if rename_to == "":
-                # Delete file
-                if full_path.exists():
-                    full_path.unlink()
-                else:
-                    errors.append({"error": "Cannot delete non-existent file", "path": file_path})
-                    continue
-            else:
-                # Rename/move file
-                if not full_path.exists():
-                    errors.append({"error": "Cannot rename non-existent file", "path": file_path})
-                    continue
-
-                new_path = check_path(rename_to, worktree_path)
-                new_path.parent.mkdir(parents=True, exist_ok=True)
-                full_path.rename(new_path)
-
-    # If there were errors, return them
-    return errors
+        if count < min_match:
+            return {
+                'id': cmd.id,
+                'status': 'error',
+                'error': 'Too few matches',
+                'path': path,
+                'match_count': count,
+                'min_match': min_match,
+                'search': search[:100]  # Truncate for readability
+            }
+        elif count > max_match:
+            return {
+                'id': cmd.id,
+                'status': 'error',
+                'error': 'Too many matches',
+                'path': path,
+                'match_count': count,
+                'max_match': max_match,
+                'search': search[:100]
+            }
+        else:
+            content = content.replace(search, replace)
+            full_path.write_text(content)
+            return {
+                'id': cmd.id,
+                'status': 'success',
+                'path': path,
+                'replacements': count
+            }
+    except Exception as e:
+        return {'id': cmd.id, 'status': 'error', 'error': str(e), 'path': path}
 
 
-def execute_searches(searches: List[FileSearch], worktree_path: Path) -> List[Dict[str, Any]]:
+def apply_overwrite(cmd: Command, worktree_path: Path) -> Dict[str, Any]:
     """
-    Execute file searches and return results.
+    Apply OVERWRITE command (write entire file).
 
     Args:
-        searches: List of search specifications
+        cmd: Command with path and content args
         worktree_path: Path to the worktree
 
     Returns:
-        List of search results
+        Result dict
     """
-    all_results = []
+    path = cmd.args.get('path')
+    content = cmd.args.get('content', '')
 
-    for search_spec in searches:
-        regex = search_spec['regex']
-        include = search_spec.get('include', '**')
-        exclude = search_spec.get('exclude', '.*')
-        exclude_files = search_spec.get('exclude_files')
-        max_results = search_spec.get('max_results', 10)
-        lines_before = search_spec.get('lines_before', 2)
-        lines_after = search_spec.get('lines_after', 2)
+    if not path:
+        return {'id': cmd.id, 'status': 'error', 'error': 'Missing required arg: path'}
 
-        # Default exclude_files to ['.gitignore'] if not specified
-        if exclude_files is None:
-            exclude_files = ['.gitignore']
+    try:
+        full_path = check_path(path, worktree_path)
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        full_path.write_text(content)
 
-        results = []
+        line_count = len(content.splitlines())
+        cprint(C_INFO, f"Writing {path} ({line_count} lines)")
+
+        return {
+            'id': cmd.id,
+            'status': 'success',
+            'path': path,
+            'lines': line_count
+        }
+    except Exception as e:
+        return {'id': cmd.id, 'status': 'error', 'error': str(e), 'path': path}
+
+
+def apply_rename(cmd: Command, worktree_path: Path) -> Dict[str, Any]:
+    """
+    Apply RENAME command (move file).
+
+    Args:
+        cmd: Command with old_path and new_path args
+        worktree_path: Path to the worktree
+
+    Returns:
+        Result dict
+    """
+    old_path = cmd.args.get('old_path')
+    new_path = cmd.args.get('new_path')
+
+    if not old_path or not new_path:
+        return {'id': cmd.id, 'status': 'error', 'error': 'Missing required args: old_path, new_path'}
+
+    try:
+        old_full = check_path(old_path, worktree_path)
+        new_full = check_path(new_path, worktree_path)
+
+        if not old_full.exists():
+            return {'id': cmd.id, 'status': 'error', 'error': 'File not found', 'path': old_path}
+
+        new_full.parent.mkdir(parents=True, exist_ok=True)
+        old_full.rename(new_full)
+
+        cprint(C_INFO, f"Renamed {old_path} -> {new_path}")
+
+        return {
+            'id': cmd.id,
+            'status': 'success',
+            'old_path': old_path,
+            'new_path': new_path
+        }
+    except Exception as e:
+        return {'id': cmd.id, 'status': 'error', 'error': str(e)}
+
+
+def apply_delete(cmd: Command, worktree_path: Path) -> Dict[str, Any]:
+    """
+    Apply DELETE command.
+
+    Args:
+        cmd: Command with path arg
+        worktree_path: Path to the worktree
+
+    Returns:
+        Result dict
+    """
+    path = cmd.args.get('path')
+
+    if not path:
+        return {'id': cmd.id, 'status': 'error', 'error': 'Missing required arg: path'}
+
+    try:
+        full_path = check_path(path, worktree_path)
+
+        if not full_path.exists():
+            return {'id': cmd.id, 'status': 'error', 'error': 'File not found', 'path': path}
+
+        full_path.unlink()
+
+        cprint(C_INFO, f"Deleted {path}")
+
+        return {
+            'id': cmd.id,
+            'status': 'success',
+            'path': path
+        }
+    except Exception as e:
+        return {'id': cmd.id, 'status': 'error', 'error': str(e), 'path': path}
+
+
+def execute_read(cmd: Command, worktree_path: Path) -> Dict[str, Any]:
+    """
+    Execute READ command.
+
+    Args:
+        cmd: Command with path, start_line, end_line args
+        worktree_path: Path to the worktree
+
+    Returns:
+        Result dict with file contents
+    """
+    path = cmd.args.get('path')
+    start_line = cmd.args.get('start_line')
+    end_line = cmd.args.get('end_line')
+
+    if not path:
+        return {'id': cmd.id, 'status': 'error', 'error': 'Missing required arg: path'}
+
+    try:
+        full_path = check_path(path, worktree_path)
+
+        if not full_path.exists():
+            return {'id': cmd.id, 'status': 'error', 'error': 'File not found', 'path': path}
+
+        with open(full_path, 'r') as f:
+            lines = f.readlines()
+
+        # Handle line range
+        if start_line or end_line:
+            start_idx = (int(start_line) - 1) if start_line else 0
+            end_idx = int(end_line) if end_line else len(lines)
+            selected_lines = lines[start_idx:end_idx]
+            data = ''.join(selected_lines)
+            line_range = f"{start_idx + 1}-{end_idx}"
+        else:
+            data = ''.join(lines)
+            line_range = f"1-{len(lines)}"
+
+        cprint(C_INFO, f"Reading {path} (lines {line_range})")
+
+        return {
+            'id': cmd.id,
+            'status': 'success',
+            'path': path,
+            'lines': line_range,
+            'line_count': len(data.splitlines()),
+            'data': data
+        }
+    except Exception as e:
+        return {'id': cmd.id, 'status': 'error', 'error': str(e), 'path': path}
+
+
+def execute_search(cmd: Command, worktree_path: Path) -> Dict[str, Any]:
+    """
+    Execute SEARCH command.
+
+    Args:
+        cmd: Command with regex and other search args
+        worktree_path: Path to the worktree
+
+    Returns:
+        Result dict with search results
+    """
+    regex = cmd.args.get('regex')
+    include = cmd.args.get('include', '**')
+    exclude = cmd.args.get('exclude', '.*')
+    exclude_files = cmd.args.get('exclude_files', '.gitignore')
+    max_results = int(cmd.args.get('max_results', '10'))
+    lines_before = int(cmd.args.get('lines_before', '2'))
+    lines_after = int(cmd.args.get('lines_after', '2'))
+
+    if not regex:
+        return {'id': cmd.id, 'status': 'error', 'error': 'Missing required arg: regex'}
+
+    try:
         content_pattern = re.compile(regex)
-        files_with_matches = set()
+    except re.error as e:
+        return {'id': cmd.id, 'status': 'error', 'error': f'Invalid regex: {e}'}
 
-        # Get matching files using helper
+    # Parse exclude_files
+    if isinstance(exclude_files, str):
+        exclude_files = [exclude_files] if exclude_files else []
+
+    cprint(C_INFO, f"Searching for /{regex}/")
+
+    results = []
+    files_with_matches = set()
+
+    # Get matching files using helper
+    try:
         matching_files = get_matching_files(
             worktree_path=worktree_path,
             include=include,
             exclude=exclude,
             exclude_files=exclude_files
         )
+    except Exception as e:
+        return {'id': cmd.id, 'status': 'error', 'error': str(e)}
 
-        for file_path in matching_files:
-            rel_path_str = str(file_path.relative_to(worktree_path))
+    for file_path in matching_files:
+        rel_path_str = str(file_path.relative_to(worktree_path))
 
-            try:
-                with open(file_path, 'r') as f:
-                    lines = f.readlines()
+        try:
+            with open(file_path, 'r') as f:
+                lines = f.readlines()
 
-                for i, line in enumerate(lines):
-                    if content_pattern.search(line):
-                        start = max(0, i - lines_before)
-                        end = min(len(lines), i + lines_after + 1)
-                        context = ''.join(lines[start:end])
+            for i, line in enumerate(lines):
+                if content_pattern.search(line):
+                    start = max(0, i - lines_before)
+                    end = min(len(lines), i + lines_after + 1)
+                    context = ''.join(lines[start:end])
 
-                        results.append({
-                            'file_path': rel_path_str,
-                            'line_number': i + 1,
-                            'lines': context
-                        })
-                        files_with_matches.add(rel_path_str)
+                    results.append({
+                        'file_path': rel_path_str,
+                        'line_number': i + 1,
+                        'context': context
+                    })
+                    files_with_matches.add(rel_path_str)
 
-                        if len(results) >= max_results:
-                            break
-            except Exception:
-                # Skip files that can't be read
-                continue
+                    if len(results) >= max_results:
+                        break
+        except Exception:
+            # Skip files that can't be read
+            continue
 
-            if len(results) >= max_results:
-                break
+        if len(results) >= max_results:
+            break
 
-        all_results.extend(results)
+    return {
+        'id': cmd.id,
+        'status': 'success',
+        'regex': regex,
+        'match_count': len(results),
+        'file_count': len(files_with_matches),
+        'files': sorted(files_with_matches),
+        'matches': results
+    }
 
-    return all_results
 
-
-def execute_shell_commands(commands: List[ShellCommand], worktree_path: Path, repo_root: Path) -> List[Dict[str, Any]]:
+def execute_shell(cmd: Command, worktree_path: Path, repo_root: Path) -> Dict[str, Any]:
     """
-    Execute shell commands and return results.
+    Execute SHELL command.
 
     Args:
-        commands: List of shell command specifications
+        cmd: Command with command and docker args
         worktree_path: Path to the worktree
         repo_root: Path to the repo root
 
     Returns:
-        List of command results
+        Result dict with command output
     """
-    results = []
+    command = cmd.args.get('command')
+    docker_image = cmd.args.get('docker_image', 'debian:stable')
+    docker_runs = cmd.args.get('docker_runs', '')
+    head = int(cmd.args.get('head', '50'))
+    tail = int(cmd.args.get('tail', '50'))
 
-    for cmd_spec in commands:
-        command = cmd_spec['command']
-        docker_image = cmd_spec.get('docker_image', 'debian:stable')
-        docker_runs = cmd_spec.get('docker_runs')
-        head = cmd_spec.get('head', 50)
-        tail = cmd_spec.get('tail', 50)
+    if not command:
+        return {'id': cmd.id, 'status': 'error', 'error': 'Missing required arg: command'}
 
-        if docker_runs is None:
-            docker_runs = []
+    # Parse docker_runs (could be JSON list or newline-separated)
+    if docker_runs:
+        if docker_runs.startswith('['):
+            docker_runs = json.loads(docker_runs)
+        else:
+            docker_runs = [line.strip() for line in docker_runs.split('\n') if line.strip()]
+    else:
+        docker_runs = []
 
+    cprint(C_INFO, f"Running: {command}")
+
+    try:
         result = run_in_container(
             command=command,
             worktree_path=worktree_path,
@@ -474,114 +420,38 @@ def execute_shell_commands(commands: List[ShellCommand], worktree_path: Path, re
             tail=tail
         )
 
-        results.append(result)
+        return {
+            'id': cmd.id,
+            'status': 'success',
+            'command': command,
+            'exit_code': result.get('exit_code', 0),
+            'output': result.get('output', '')
+        }
+    except Exception as e:
+        return {'id': cmd.id, 'status': 'error', 'error': str(e), 'command': command}
 
-    return results
 
-
-def read_files(file_specs: List[FileRead], worktree_path: Path) -> List[str]:
+def execute_process(cmd: Command, maca) -> Dict[str, Any]:
     """
-    Read files and return their contents.
+    Execute PROCESS command (spawn subprocessor).
 
     Args:
-        file_specs: List of file read specifications
-        worktree_path: Path to the worktree
+        cmd: Command with model, assignment, and other args
+        maca: MACA instance
 
     Returns:
-        List of file contents
+        Result dict with processor result
     """
-    contents = {}
+    model_name = cmd.args.get('model', 'large')
+    assignment = cmd.args.get('assignment')
 
-    for file_spec in file_specs:
-        file_path = file_spec['path']
-        start_line = file_spec.get('start_line')
-        end_line = file_spec.get('end_line')
-
-        full_path = check_path(file_path, worktree_path)
-
-        if not full_path.exists():
-            contents.append(f"File: {file_path}\n\nError: File not found")
-            continue
-
-        try:
-            with open(full_path, 'r') as f:
-                lines = f.readlines()
-
-            # Handle line range
-            if start_line is not None or end_line is not None:
-                start_idx = (start_line - 1) if start_line else 0
-                end_idx = end_line if end_line else len(lines)
-                selected_lines = lines[start_idx:end_idx]
-                data = ''.join(selected_lines)
-                contents[file_path] = {"data": data, "lines": f"{start_idx + 1}-{end_idx}"}
-            else:
-                data = ''.join(lines)
-                contents[file_path] = {"data": data}
-        except Exception as e:
-            contents[file_path] = {"error": str(e)}
-
-    return contents
-
-
-def ask_questions(questions: List[Question], maca) -> None:
-    """
-    Ask questions to the user and store Q&A in context.
-
-    Args:
-        questions: List of questions to ask
-        maca: MACA instance
-    """
-    for i, q in enumerate(questions, 1):
-        prompt_text = q.get('prompt', '')
-        preset_answers = q.get('preset_answers')
-
-        # Handle non-interactive mode
-        if maca.non_interactive:
-            answer = "This agent is running non-interactively. Please try to take a guess at the answer yourself, but be a bit conservative and refuse the assignment if needed."
-            cprint(C_INFO, f"Question {i}/{len(questions)}: {prompt_text}")
-            cprint(C_INFO, f"Auto-response: {answer}")
-        elif preset_answers:
-            # Show choice selection
-            choices = [(answer, answer) for answer in preset_answers]
-            choices.append(('__custom__', 'Other (custom input)'))
-
-            result = choice(
-                message=f"Question {i}/{len(questions)}: {prompt_text}",
-                options=choices
-            )
-
-            if result == '__custom__':
-                answer = pt_prompt(f"> ", history=maca.history)
-            else:
-                answer = result
-        else:
-            # Simple text input
-            answer = pt_prompt(f"Question {i}/{len(questions)}: {prompt_text}\n> ", history=maca.history)
-
-        maca.add_message({'role': 'assistant', 'content': prompt_text})
-        maca.add_message({'role': 'user', 'content': answer})
-
-
-def run_subprocessor(processor: SubProcessor, maca, system_prompt: str) -> str:
-    """
-    Execute a processor in its own context.
-
-    Args:
-        processor: Processor specification
-        maca: MACA instance
-        subprompt: System prompt for the processor
-
-    Returns:
-        The result from the processor's respond call
-    """
-    model_name = processor.get('model', 'large')
-    assignment = processor['assignment']
-    file_reads_specs = processor.get('file_reads', [])
-    file_write_allow_globs = processor.get('file_write_allow_globs', [])
+    if not assignment:
+        return {'id': cmd.id, 'status': 'error', 'error': 'Missing required arg: assignment'}
 
     # Resolve model name
     if model_name not in MODELS:
-        raise ValueError(f"Unknown model size: {model_name}")
+        return {'id': cmd.id, 'status': 'error', 'error': f'Unknown model: {model_name}'}
+
     resolved_model = MODELS[model_name]
 
     cprint(C_INFO, f'  Spawning processor with model={model_name}')
@@ -589,236 +459,308 @@ def run_subprocessor(processor: SubProcessor, maca, system_prompt: str) -> str:
     # Build processor context
     prompt = f"# Assignment\n\n{assignment}"
 
+    # Add file_write_allow_globs if specified
+    file_write_allow_globs = cmd.args.get('file_write_allow_globs', '')
     if file_write_allow_globs:
-        prompt = prompt + "\n\n# Allowed globs for update_files:\n\n" + json.dumps(file_write_allow_globs) 
+        if file_write_allow_globs.startswith('['):
+            globs = json.loads(file_write_allow_globs)
+        else:
+            globs = [g.strip() for g in file_write_allow_globs.split('\n') if g.strip()]
+        prompt += f"\n\n# Allowed file write globs:\n\n{json.dumps(globs)}"
+    else:
+        globs = []
 
     # Read files if specified
-    if file_reads_specs:
-        prompt = "# Files\n\n" + json.dumps(read_files(file_reads_specs, maca.worktree_path)) + "\n\n" + prompt
+    file_reads = cmd.args.get('file_reads', '')
+    if file_reads:
+        if file_reads.startswith('['):
+            reads = json.loads(file_reads)
+        else:
+            reads = [{'path': p.strip()} for p in file_reads.split('\n') if p.strip()]
+
+        # Read files
+        file_contents = {}
+        for read_spec in reads:
+            path = read_spec.get('path')
+            if path:
+                try:
+                    full_path = check_path(path, maca.worktree_path)
+                    if full_path.exists():
+                        file_contents[path] = full_path.read_text()
+                    else:
+                        file_contents[path] = f"ERROR: File not found"
+                except Exception as e:
+                    file_contents[path] = f"ERROR: {e}"
+
+        prompt = f"# Files\n\n{json.dumps(file_contents, indent=2)}\n\n" + prompt
+
+    # Load subprompt
+    script_dir = Path(__file__).parent
+    subprompt_path = script_dir / 'subprompt.md'
+    subprompt = subprompt_path.read_text()
 
     # Add assignment and data to processor context
     messages = [
-        {'role': 'system', 'content': system_prompt},
+        {'role': 'system', 'content': subprompt},
         {'role': 'user', 'content': prompt},
     ]
 
-    # Call LLM for processor
+    # Call LLM for processor (no tool schemas - just text output)
     try:
         llm_result = call_llm(
             model=resolved_model,
             messages=messages,
-            tool_schemas=[SUBPROCESSOR_RESPOND_TOOL_SCHEMA if file_write_allow_globs else SUBPROCESSOR_RESPOND_NO_UPDATES_TOOL_SCHEMA],
+            tool_schemas=None,
         )
 
         message = llm_result['message']
+        text_content = message.get('content', '')
 
-        # Extract and execute tool call
-        tool_calls = message.get('tool_calls', [])
-        if not tool_calls:
-            return "Error: Processor did not make a tool call"
+        # Parse commands from processor output
+        parse_result = parse_commands(text_content)
+        cancelled_ids = get_cancelled_ids(parse_result.commands)
 
-        tool_call = tool_calls[0]
-        tool_name = tool_call['function']['name']
-        tool_args = json.loads(tool_call['function']['arguments'])
+        # Execute processor commands (limited set)
+        processor_results = []
+        for proc_cmd in parse_result.commands:
+            if proc_cmd.id in cancelled_ids:
+                continue
 
-        # Processor should call subprocessor_respond
-        if tool_name != 'subprocessor_respond':
-            return f"Error: Processor called {tool_name} instead of subprocessor_respond"
+            if proc_cmd.command == 'OVERWRITE':
+                # Check against allowed globs
+                path = proc_cmd.args.get('path')
+                if globs and path:
+                    allowed = any(fnmatch.fnmatch(path, pattern) for pattern in globs)
+                    if not allowed:
+                        processor_results.append({
+                            'id': proc_cmd.id,
+                            'status': 'error',
+                            'error': f"Path '{path}' not allowed by write globs"
+                        })
+                        continue
+                processor_results.append(apply_overwrite(proc_cmd, maca.worktree_path))
 
-        # Handle processor's file_updates if present (with write pattern validation)
-        if 'file_updates' in tool_args and tool_args['file_updates']:
-            # Validate file paths against allow patterns
-            file_updates = []
-            for update in tool_args['file_updates']:
-                file_path = update['path']
-                allowed = any(fnmatch.fnmatch(file_path, pattern) for pattern in file_write_allow_globs)
-                if allowed:
-                    file_updates.append(update)
-                else:
-                    errors({"error": f"Processor tried to write to '{file_path}' which doesn't match allowed globs", "path": file_path})
+            elif proc_cmd.command == 'UPDATE':
+                # Check against allowed globs
+                path = proc_cmd.args.get('path')
+                if globs and path:
+                    allowed = any(fnmatch.fnmatch(path, pattern) for pattern in globs)
+                    if not allowed:
+                        processor_results.append({
+                            'id': proc_cmd.id,
+                            'status': 'error',
+                            'error': f"Path '{path}' not allowed by write globs"
+                        })
+                        continue
+                processor_results.append(apply_single_update(proc_cmd, maca.worktree_path))
 
-            errors = apply_file_updates(tool_args['file_updates'], maca.worktree_path)
-            if errors:
-                messages.append({
-                    'role': 'user',
-                    'content': [{
-                        'type': 'tool_result',
-                        'tool_use_id': tool_calls[0]['id'],
-                        'content': json.dumps({"file_update_errors": errors, "proceed": "Carefully retry just the rejected file updates"})
-                    }]
-                })
+            elif proc_cmd.command == 'OUTPUT':
+                # Collect output (this is the result)
+                pass
 
-            if errors:
-                return json.dumps(errors)
+        # Extract OUTPUT command result
+        output_cmds = [c for c in parse_result.commands if c.command == 'OUTPUT']
+        if output_cmds:
+            result_text = output_cmds[0].args.get('text', '')
+        else:
+            result_text = parse_result.thinking[:500] if parse_result.thinking else "No output"
 
-        # Return the result
-        return tool_args.get('result', '')
+        return {
+            'id': cmd.id,
+            'status': 'success',
+            'model': model_name,
+            'result': result_text,
+            'commands_executed': len(processor_results)
+        }
 
     except Exception as e:
-        return f"Error: Processor execution failed: {str(e)}"
+        return {'id': cmd.id, 'status': 'error', 'error': f'Processor failed: {str(e)}'}
 
 
-def subprocessor_respond(
-    thoughts: str,
-    file_updates: Optional[List[FileUpdate]] = None,
-    result: str = ""
-):
+def execute_ask(cmd: Command, maca) -> Dict[str, Any]:
     """
-    Mandatory tool to use.
+    Execute ASK command (ask user a question).
 
     Args:
-        thoughts: Your reasoning about the task. Not saved or shown to user.
-        file_updates: Optional list of file modifications to apply.
-        result: The result to return to the main context. This should contain your findings,
-                analysis, or completion status. Be concise but complete.
+        cmd: Command with question and option args
+        maca: MACA instance
+
+    Returns:
+        Result dict
     """
-    # This function signature is used for schema generation only.
-    # Actual execution is handled in execute_processor()
-    pass
+    question = cmd.args.get('question')
+
+    if not question:
+        return {'id': cmd.id, 'status': 'error', 'error': 'Missing required arg: question'}
+
+    # Collect preset options
+    options = []
+    i = 1
+    while f'option{i}' in cmd.args:
+        options.append(cmd.args[f'option{i}'])
+        i += 1
+
+    # Handle non-interactive mode
+    if maca.non_interactive:
+        answer = "This agent is running non-interactively. Please try to take a guess at the answer yourself, but be a bit conservative and refuse the assignment if needed."
+        cprint(C_INFO, f"Question: {question}")
+        cprint(C_INFO, f"Auto-response: {answer}")
+    elif options:
+        # Show choice selection
+        choices = [(opt, opt) for opt in options]
+        choices.append(('__custom__', 'Other (custom input)'))
+
+        result = choice(
+            message=f"Question: {question}",
+            options=choices
+        )
+
+        if result == '__custom__':
+            answer = pt_prompt(f"> ", history=maca.history)
+        else:
+            answer = result
+    else:
+        # Simple text input
+        answer = pt_prompt(f"Question: {question}\n> ", history=maca.history)
+
+    # Add Q&A to context
+    maca.add_message({'role': 'assistant', 'content': question})
+    maca.add_message({'role': 'user', 'content': answer})
+
+    return {
+        'id': cmd.id,
+        'status': 'success',
+        'question': question,
+        'answer': answer
+    }
 
 
-def subprocessor_respond_no_updates(
-    thoughts: str,
-    result: str = ""
-):
+def execute_commands(text: str, maca) -> tuple[List[Dict], List[Dict], bool, str]:
     """
-    Mandatory tool to use.
+    Parse and execute commands from LLM text output.
 
     Args:
-        thoughts: Your reasoning about the task. Not saved or shown to user.
-        result: The result to return to the main context. This should contain your findings,
-                analysis, or completion status. Be concise but complete.
+        text: Raw text from LLM
+        maca: MACA instance
+
+    Returns:
+        Tuple of (temporary_results, long_term_results, done, thinking)
+        - temporary_results: Full command results with data
+        - long_term_results: Metadata only (data replaced with OMITTED)
+        - done: Whether task is complete (no pending operations)
+        - thinking: Non-command text from LLM
     """
-    # This function signature is used for schema generation only.
-    # Actual execution is handled in execute_processor()
-    pass
+    # Parse commands
+    parse_result = parse_commands(text)
+    cancelled_ids = get_cancelled_ids(parse_result.commands)
 
+    # Track state
+    temporary_results = []
+    keep_context = False
+    notes_for_context = None
+    user_output = None
+    commit_message = None
+    done = True  # Assume done unless we execute data-gathering commands
 
-def respond(
-    thoughts: str,
-    keep_extended_context: Optional[bool] = None,
-    file_updates: Optional[List[FileUpdate]] = None,
-    user_questions: Optional[List[Question]] = None,
-    file_reads: Optional[List[FileRead]] = None,
-    file_searches: Optional[List[FileSearch]] = None,
-    shell_commands: Optional[List[ShellCommand]] = None,
-    sub_processors: Optional[List[SubProcessor]] = None,
-    file_change_description: Optional[str] = None,
-    notes_for_context: Optional[str] = None,
-    user_output: Optional[str] = None,
-    commit_message: Optional[str] = None,
+    # Execute commands
+    for cmd in parse_result.commands:
+        # Skip cancelled commands
+        if cmd.id in cancelled_ids or cmd.command == 'CANCEL':
+            continue
 
-    maca = None,
-) -> Dict[str, Any]:
-    """
-    Mandatory tool to call. Operations should be combined as much as possible. If you currently cannot complete the task, try to gather all info via user_questions, file_reads, file_searches, and shell_commands such that you can complete the entire task/subtask in the next call.
+        # Execute based on command type
+        if cmd.command == 'OUTPUT':
+            user_output = cmd.args.get('text', '')
+            temporary_results.append({'id': cmd.id, 'status': 'success'})
 
-    Args:
-        thoughts: Reason for yourself about what you need to do. This will not be saved in the context nor shown to the user. Be succinct (sacrifice grammar for briefness) and self-critical.
-        keep_extended_context: Set to true if you need to preserve the temporary context (full results from file_reads, file_searches, shell_commands, sub_processors) for the iteration. Do this only if you just found out that you are missing some information to accomplish a task that requires access to those results. If it's possible to densely summarize the info you'll still need in the future to `notes_for_context`, do that instead.
-        file_updates: Optional list of file modifications to apply. Executed FIRST (before data gathering operations).
-        user_questions: Optional list of questions to ask the user. Answers are stored in long-term context. If `preset_answers` is given, a 'other' option is always added automatically.
-        file_reads: Optional list of file (parts) to read into temporary context.
-        file_searches: Optional list of file searches to read into temporary context.
-        shell_commands: Optional list of shell commands to execute. Stdout and stderr go into temporary context. Don't even use shell commands to write files - use file_updates for that!
-        sub_processors: Optional list of LLM-calls (in a a fresh context) to perform. These will be single-shots. They can only update files and return a result. This can be very useful to:
-          - Ask a cheaper LLM to do some file edits.
-          - Split up independent work to different files into parallel LLM calls.
-          - Ask a more capable LLM for help on a hard problem.
-          - Ask a web-search-enabled LLM to look up info online.
-          The `model` field can be one of: small, medium, large, huge or search. The `assignment` should contain a full briefing - the sub-processor has no access to prior context. The `file_reads` field can be used to provide input data files. Specify `file_reads` to pass file contents into the sub-processor's context. The `file_write_allow_globs` field can be used to give the model write access to certain files. If left empty, no files can be updated. 
-          The result goes into our temporary context.
-        file_change_description: An optional brief (one sentence) description of the purpose of file changes made by file_updates, shell_commands and/or sub_processors. This will be used as the git commit message.
-        notes_for_context: Succinct (sacrifice grammar for briefness): A brief summary of...
-          - Your thoughts (if valuable)
-          - Temporary context that will be lost (all file_reads+file_searches+shell_commands+sub_processors unless keep_extended_context is set), insofar that you'll need it later in the conversation
-          - What the next completion needs to do with the input data it receives (unless obvious)
-          This will be saved in long-term context.
-        user_output: What to show the user. If you are *not* ordering further operations (user_questions, file_reads, file_searches, shell_commands, sub_processors) you *must* provide a meaningful answer or a summary of what was done here. Otherwise, only provide this if there really is something interesting to say at this point. Keep it short.
-        commit_message: If you believe the the code you created is fully complete and ready to be merged into `main` *and* you are not ordering any further commands (except perhaps the last `file_updates`), set this field to a git commit message (a short summary line followed by a blank line and an optional multi-line description). The message should encompass all changes made since the start of the task (or the last `commit_message`). It should not reflect meandering/intermediate steps, just the end result.
-    """
+        elif cmd.command == 'NOTES':
+            notes_for_context = cmd.args.get('text', '')
+            temporary_results.append({'id': cmd.id, 'status': 'success'})
 
-    # Build response structures
-    response = {}
-    done = True
+        elif cmd.command == 'KEEP_CONTEXT':
+            keep_context = True
+            temporary_results.append({'id': cmd.id, 'status': 'success'})
 
-    # 1. Handle file updates FIRST (LLM has already output the write comments)
-    if file_updates:
-        # Print file updates summary
-        for update in file_updates:
-            path = update['path']
-            if update.get('overwrite') is not None:
-                line_count = len(update['overwrite'].splitlines())
-                cprint(C_INFO, f"Writing {path} ({line_count} lines)")
-            elif update.get('update') is not None:
-                cprint(C_INFO, f"Updating {path} ({len(update['update'])} operations)")
-            elif update.get('rename') is not None:
-                if update['rename'] == "":
-                    cprint(C_INFO, f"Deleting {path}")
-                else:
-                    cprint(C_INFO, f"Renaming {path} -> {update['rename']}")
+        elif cmd.command == 'OVERWRITE':
+            result = apply_overwrite(cmd, maca.worktree_path)
+            temporary_results.append(result)
 
-        response['file_updates'] = apply_file_updates(file_updates, maca.worktree_path) or 'OK'
-        if response['file_updates'] != 'OK':
-            keep_extended_context = True
+        elif cmd.command == 'UPDATE':
+            result = apply_single_update(cmd, maca.worktree_path)
+            temporary_results.append(result)
+
+        elif cmd.command == 'RENAME':
+            result = apply_rename(cmd, maca.worktree_path)
+            temporary_results.append(result)
+
+        elif cmd.command == 'DELETE':
+            result = apply_delete(cmd, maca.worktree_path)
+            temporary_results.append(result)
+
+        elif cmd.command == 'READ':
+            result = execute_read(cmd, maca.worktree_path)
+            temporary_results.append(result)
+            done = False  # Data gathering - not done yet
+
+        elif cmd.command == 'SEARCH':
+            result = execute_search(cmd, maca.worktree_path)
+            temporary_results.append(result)
             done = False
 
-    # 2. Handle user questions (to get input before data gathering operations)
+        elif cmd.command == 'SHELL':
+            result = execute_shell(cmd, maca.worktree_path, maca.repo_root)
+            temporary_results.append(result)
+            done = False
+
+        elif cmd.command == 'PROCESS':
+            result = execute_process(cmd, maca)
+            temporary_results.append(result)
+            done = False
+
+        elif cmd.command == 'ASK':
+            result = execute_ask(cmd, maca)
+            temporary_results.append(result)
+            # Questions don't prevent completion
+
+        elif cmd.command == 'PROPOSE_MERGE':
+            commit_message = cmd.args.get('message', 'No message provided')
+            temporary_results.append({'id': cmd.id, 'status': 'success'})
+            # Will be handled below
+
+        else:
+            temporary_results.append({
+                'id': cmd.id,
+                'status': 'error',
+                'error': f'Unknown command: {cmd.command}'
+            })
+
+    # Show user output if provided
     if user_output:
         cprint(C_GOOD, user_output)
-    if user_questions:
-        # Q&A are stored as separate messages in long-term context
-        ask_questions(user_questions, maca)
 
-    # 3. Handle file reads
-    if file_reads:
-        # Print concise summary
-        file_list = ', '.join(fr['path'] for fr in file_reads)
-        cprint(C_INFO, f"Reading {len(file_reads)} file(s): {file_list}")
+    # Add notes to context if provided
+    if notes_for_context:
+        maca.add_message({'role': 'assistant', 'content': f"[Notes] {notes_for_context}"})
 
-        response['file_reads'] = read_files(file_reads, maca.worktree_path)
-        done = False
-
-    # 4. Handle file searches
-    if file_searches:
-        # Print search summary
-        for search in file_searches:
-            cprint(C_INFO, f"Searching for /{search['regex']}/")
-
-        response['file_searches'] = execute_searches(file_searches, maca.worktree_path)
-        done = False
-
-    # 5. Handle shell commands
-    if shell_commands:
-        # Print each command upfront
-        for cmd_spec in shell_commands:
-            cprint(C_INFO, f"Running: {cmd_spec['command']}")
-
-        response['shell_commands'] = execute_shell_commands(shell_commands, maca.worktree_path, maca.repo_root)
-        done = False
-
-    # 6. Handle sub-processors
-    if sub_processors:
-        # Load subprompt
-        script_dir = Path(__file__).parent
-        subprompt_path = script_dir / 'subprompt.md'
-        subprompt = subprompt_path.read_text()
-
-        processor_results = []
-        for i, processor in enumerate(sub_processors):
-            cprint(C_INFO, f'  [{i + 1}/{len(sub_processors)}] Executing processor')
-            result = run_subprocessor(processor, maca, subprompt)
-            processor_results.append(result)
-
-        response['sub_processors'] = processor_results
-        done = False
-
-    # Commit changes if files were updated
+    # Check if any file modifications occurred
     if maca.last_head_commit != git_ops.get_head_commit(maca.worktree_path):
-        git_ops.commit_changes(maca.worktree_path, f"MACA: {file_change_description or 'No description'}")
+        # Determine commit description
+        file_cmds = [c for c in parse_result.commands if c.command in ('OVERWRITE', 'UPDATE', 'RENAME', 'DELETE')]
+        if file_cmds:
+            paths = []
+            for c in file_cmds:
+                if 'path' in c.args:
+                    paths.append(c.args['path'])
+                if 'old_path' in c.args:
+                    paths.append(c.args['old_path'])
+            description = f"Modified {', '.join(paths[:3])}" + ('...' if len(paths) > 3 else '')
+        else:
+            description = "File changes"
+
+        git_ops.commit_changes(maca.worktree_path, f"MACA: {description}")
         maca.last_head_commit = git_ops.get_head_commit(maca.worktree_path)
 
-    # 9. Handle commit_message (merge to main if requested)
+    # Handle merge proposal
     if commit_message and done:
         # In non-interactive mode, auto-merge
         if not maca.non_interactive:
@@ -832,41 +774,59 @@ def respond(
                     ('no', 'Continue without merging'),
                 ]
             )
-            if not (response_choice == 'yes'):
-                return
+            if response_choice != 'yes':
+                # User declined - continue session
+                pass
+            else:
+                # Merge
+                cprint(C_INFO, 'Merging changes...')
+                conflict = git_ops.merge_to_main(maca.repo_root, maca.worktree_path, maca.branch_name, commit_message)
 
-        cprint(C_INFO, 'Merging changes...')
-        conflict = git_ops.merge_to_main(maca.repo_root, maca.worktree_path, maca.branch_name, commit_message)
+                if conflict:
+                    cprint(C_BAD, "⚠ Merge conflicts!")
+                    error_msg = f"Merge conflict while rebasing. Please resolve merge conflicts by reading the affected files and using UPDATE to resolve the conflicts. Then use SHELL to run `git add <filename>.. && git rebase --continue`, before trying again with another PROPOSE_MERGE. Here is the rebase output:\n\n{conflict}"
+                    maca.add_message({"role": "user", "content": error_msg})
+                    long_term_results = [{'id': r['id'], 'status': r['status']} for r in temporary_results]
+                    return (temporary_results, long_term_results, False, parse_result.thinking)
 
-        if conflict:
-            cprint(C_BAD, "⚠ Merge conflicts!")
-            error_response = {
-                "error": f"Merge conflict while rebasing. Please resolve merge conflicts by reading the affected files and using file_updates to resolve the conflicts. Then use a shell_command to run `git add <filename>.. && git rebase --continue`, before trying again with another commit_message. Here is the rebase output:\n\n{conflict}"
-            }
-            # Add error as user message so the assistant can fix it
-            maca.add_message({"role": "user", "content": json.dumps(error_response, indent=2)})
-            return (response, False)
+                maca.add_message({"role": "user", "content": "Squashed and merged into main! You're now working on a fresh feature branch."})
 
-        maca.add_message({"role": "user", "content": "Squashed and merged into main! You're now working on a fresh feature branch."})
+                # Cleanup
+                git_ops.cleanup_session(maca.repo_root, maca.worktree_path, maca.branch_name)
+                cprint(C_GOOD, '✓ Squashed and merged!')
 
-        # Cleanup
-        git_ops.cleanup_session(maca.repo_root, maca.worktree_path, maca.branch_name)
-        cprint(C_GOOD, '✓ Squashed and merged!')
+                # Create new worktree for next task
+                maca.worktree_path, maca.branch_name = git_ops.create_session_worktree(maca.repo_root, maca.session_id)
+        else:
+            # Non-interactive mode - auto-merge
+            cprint(C_INFO, 'Merging changes...')
+            conflict = git_ops.merge_to_main(maca.repo_root, maca.worktree_path, maca.branch_name, commit_message)
 
-        # In non-interactive mode, we'll return and the main loop will exit
-        if maca.non_interactive:
+            if conflict:
+                cprint(C_BAD, "⚠ Merge conflicts in non-interactive mode!")
+                exit(1)
+
+            cprint(C_GOOD, '✓ Squashed and merged!')
             exit(0)
 
-        # If in interactive mode, create git tree/branch for the next task
-        maca.worktree_path, maca.branch_name = git_ops.create_session_worktree(maca.repo_root, maca.session_id)
+    # Create long-term results (omit large data)
+    long_term_results = []
+    for result in temporary_results:
+        long_term = {'id': result['id'], 'status': result['status']}
 
-    # 10. Manage context cleanup
-    if not keep_extended_context:
+        # Copy metadata but omit large data fields
+        for key, value in result.items():
+            if key in ('id', 'status'):
+                continue
+            if key in ('data', 'output', 'matches', 'context', 'result'):
+                long_term[key] = 'OMITTED'
+            else:
+                long_term[key] = value
+
+        long_term_results.append(long_term)
+
+    # Manage context cleanup
+    if not keep_context:
         maca.clear_temporary_messages()
 
-    return (response, done)
-
-
-RESPOND_TOOL_SCHEMA = generate_tool_schema(respond)
-SUBPROCESSOR_RESPOND_TOOL_SCHEMA = generate_tool_schema(subprocessor_respond)
-SUBPROCESSOR_RESPOND_NO_UPDATES_TOOL_SCHEMA = generate_tool_schema(subprocessor_respond_no_updates)
+    return (temporary_results, long_term_results, done, parse_result.thinking)

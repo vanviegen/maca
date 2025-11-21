@@ -14,6 +14,7 @@ from prompt_toolkit.history import FileHistory
 
 import git_ops
 import tools
+from command_parser import format_command_results
 from utils import cprint, compute_diff, C_GOOD, C_BAD, C_NORMAL, C_IMPORTANT, C_INFO, C_LOG
 from llm import call_llm, get_cumulative_cost
 from logger import log
@@ -116,11 +117,18 @@ class MACA:
 
 
     def update_state(self):
-        """Update state tracking for AGENTS.md and code_map."""
+        """Update state tracking for AGENTS.md, code_map, and CHECKLIST.txt."""
         agents_md_path = self.repo_root / 'AGENTS.md'
+
+        # Ensure .scratch directory exists
+        scratch_dir = self.worktree_path / '.scratch'
+        scratch_dir.mkdir(exist_ok=True)
+
+        checklist_path = scratch_dir / 'CHECKLIST.txt'
         state = {
             "AGENTS.md": agents_md_path.read_text() if agents_md_path.exists() else "--None yet--",
-            "Code Map": code_map.generate_code_map(str(self.worktree_path))
+            "Code Map": code_map.generate_code_map(str(self.worktree_path)),
+            "CHECKLIST.txt": checklist_path.read_text() if checklist_path.exists() else "--None yet--"
         }
 
         if self.prev_state:
@@ -198,59 +206,43 @@ class MACA:
                         last_cache_control_content['cache_control'] = {'type': 'ephemeral'}
                     break
 
-            # Call LLM (retry logic is in call_llm)
+            # Call LLM (no tool schemas - just text output)
             result = call_llm(
                 model=self.model,
                 messages=self.messages,
-                tool_schemas=[tools.RESPOND_TOOL_SCHEMA],
+                tool_schemas=None,
             )
 
-            # Log the full message temporarily. The respond function will strip 'message' of details,
-            # so we can log the short version to long-term below.
+            # Get text content from message
             message = result['message']
-            self.add_message(deepcopy(message), 'temporary')
+            text_content = message.get('content', '')
 
-            # Process tool call from LLM response
-            tool_calls = message.get('tool_calls', [])
-            if len(tool_calls) != 1:
-                raise ContextError(f"Expected exactly 1 tool call, got {len(tool_calls)}")
-            tool_call = tool_calls[0]
-            
-            args = json.loads(tool_call['function']['arguments'])
-            log(tag='tool_call', **args)
-            (temporary_response, done) = tools.respond(**args, maca=self)
+            # Log thinking text
+            log(tag='llm_output', content=text_content[:500])
 
-            # Add assistant message (and trimmed version) to history
-            args.pop('thoughts', None)
-            if 'file_updates' in args:
-                for f in args['file_updates']:
-                    if 'overwrite' in f:
-                        f['overwrite'] = "OMITTED"
-                    if 'update' in f:
-                        f['update'] = "OMITTED"
-            args.pop('user_questions', None)  # Will be added as separate messages
-            if not done:
-                args.pop('commit_message', None)
-            # Add to both messages and long_term to maintain proper message alternation
-            self.add_message(message, 'normal')
+            # Execute commands from text
+            (temporary_results, long_term_results, done, thinking) = tools.execute_commands(text_content, self)
 
-            # Add tool result messages (temporary and long-term summary)
+            # Add assistant message with thinking to context
+            self.add_message({
+                'role': 'assistant',
+                'content': thinking
+            }, 'normal')
+
+            # Format and add command results
+            temp_results_text = format_command_results(temporary_results, long_term=False)
+            long_results_text = format_command_results(long_term_results, long_term=True)
+
+            # Add temporary results (with full data)
             self.add_message({
                 'role': 'user',
-                'content': [{
-                    'type': 'tool_result',
-                    'tool_use_id': tool_call['id'],
-                    'content': json.dumps(temporary_response),
-                }]
+                'content': temp_results_text
             }, 'temporary')
 
+            # Add long-term results (with OMITTED data)
             self.add_message({
                 'role': 'user',
-                'content': [{
-                    'type': 'tool_result',
-                    'tool_use_id': tool_call['id'],
-                    'content': "OMITTED",
-                }]
+                'content': long_results_text
             }, 'long-term-only')
 
 

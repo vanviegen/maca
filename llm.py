@@ -194,7 +194,7 @@ class LLMStreamReader:
 def call_llm(
     model: str,
     messages: List[Dict[str, Any]],
-    tool_schemas: List[Dict[str, Any]]
+    tool_schemas: Optional[List[Dict[str, Any]]] = None
 ) -> Dict[str, Any]:
     """
     Call the OpenRouter LLM API with retry logic and streaming.
@@ -202,7 +202,7 @@ def call_llm(
     Args:
         model: Model identifier (e.g., "anthropic/claude-sonnet-4.5")
         messages: List of message dicts with role and content
-        tool_schemas: List of tool schemas
+        tool_schemas: Optional list of tool schemas (for backwards compatibility)
 
     Returns:
         Dict with:
@@ -240,15 +240,18 @@ def call_llm(
     data = {
         'model': model,
         'messages': messages,
-        'tools': tool_schemas,
         'usage': {"include": True},
-        'tool_choice': 'required',
         'stream': True,
         'streamOptions': {'includeUsage': True}
         # 'reasoning': {
         #     'effort': 'medium'
         # }
     }
+
+    # Add tool-related fields only if tool_schemas is provided
+    if tool_schemas:
+        data['tools'] = tool_schemas
+        data['tool_choice'] = 'required'
 
     # Retry up to 3 times
     last_error = None
