@@ -44,6 +44,35 @@ When implementing new features, test them if possible using:
 
 If testing requires user interaction and cannot be automated, output a single sentence about manual testing requirements instead.
 
+### Integration Tests
+Run the full test suite:
+```bash
+./maca --test
+```
+
+This runs integration tests in `test.py` that verify core functionality with mock LLM responses.
+
+### Debugging Guidelines
+
+**CRITICAL: When encountering unexpected behavior or bugs:**
+
+1. **Always create a todo-list item** for investigation when you notice a bug - never let bugs go uninvestigated nor work around them
+2. **Prefer extending `test.py`** to demonstrate the problem clearly rather than running ad-hoc shell commands
+3. **Add logging to the code** (with `TODO: remove` comments) instead of fiddling with shell commands
+4. **Improve error logging** permanently rather than adding temporary workarounds
+
+**Example: Debugging a command parsing issue**
+```python
+# In command_parser.py
+def parse_commands(text: str) -> ParseResult:
+    # TODO: remove - Debug logging for investigation
+    print(f"DEBUG: Parsing line {i}: {repr(lines[i])}")
+
+    # ... rest of code
+```
+
+**Why:** The user needs to approve all shell commands, but test cases and code changes can run automatically. This makes debugging much faster and more reliable.
+
 ### Environment Setup
 MACA auto-creates a virtual environment at `~/.cache/maca-venv-1` with required dependencies (prompt-toolkit).
 

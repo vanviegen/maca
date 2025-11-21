@@ -804,10 +804,13 @@ def execute_commands(text: str, maca) -> tuple[List[Dict], List[Dict], bool, str
 
             if conflict:
                 cprint(C_BAD, "⚠ Merge conflicts in non-interactive mode!")
-                exit(1)
+                # Return error results instead of exiting
+                long_term_results = [{'id': r['id'], 'status': r['status']} for r in temporary_results]
+                return (temporary_results, long_term_results, False, parse_result.thinking)
 
             cprint(C_GOOD, '✓ Squashed and merged!')
-            exit(0)
+            # Mark as done and return - maca.run() will exit naturally in non-interactive mode
+            done = True
 
     # Create long-term results (omit large data)
     long_term_results = []

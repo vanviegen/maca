@@ -25,17 +25,26 @@ TEST_CASES: List[TestCase] = [
         'name': 'Simple File Creation',
         'task': 'Create a hello.txt file with "Hello, World!"',
         'responses': [
-            {
-                'thoughts': 'Creating a hello.txt file',
-                'file_updates': [{
-                    'path': 'hello.txt',
-                    'overwrite': 'Hello, World!\n',
-                    'summary': 'Create hello.txt with greeting'
-                }],
-                'file_change_description': 'Add hello.txt',
-                'user_output': 'Created hello.txt with greeting',
-                'commit_message': 'Add hello.txt\n\nCreated hello.txt with greeting message'
-            }
+            """Creating a hello.txt file
+
+~maca~ 1 OVERWRITE
+path: hello.txt
+content: ~maca~start~
+Hello, World!
+
+~maca~end~
+
+~maca~ 2 OUTPUT
+text: Created hello.txt with greeting
+
+~maca~ 3 PROPOSE_MERGE
+message: ~maca~start~
+Add hello.txt
+
+Created hello.txt with greeting message
+~maca~end~
+
+"""
         ],
         'expected_files': {
             'hello.txt': 'Hello, World!\n'
@@ -46,20 +55,30 @@ TEST_CASES: List[TestCase] = [
         'name': 'File Update',
         'task': 'Update README.md with a description',
         'responses': [
-            {
-                'thoughts': 'Updating README.md',
-                'file_updates': [{
-                    'path': 'README.md',
-                    'update': [{
-                        'search': '# Test Project\n',
-                        'replace': '# Test Project\n\nThis is a test.\n'
-                    }],
-                    'summary': 'Add description to README'
-                }],
-                'file_change_description': 'Update README.md',
-                'user_output': 'Updated README.md with description',
-                'commit_message': 'Update README.md\n\nAdded description to README'
-            }
+            """Updating README.md
+
+~maca~ 1 UPDATE
+path: README.md
+search: ~maca~start~
+# Test Project
+~maca~end~
+replace: ~maca~start~
+# Test Project
+
+This is a test.
+~maca~end~
+
+~maca~ 2 OUTPUT
+text: Updated README.md with description
+
+~maca~ 3 PROPOSE_MERGE
+message: ~maca~start~
+Update README.md
+
+Added description to README
+~maca~end~
+
+"""
         ],
         'expected_files': {
             'README.md': '# Test Project\n\nThis is a test.\n'
@@ -70,22 +89,37 @@ TEST_CASES: List[TestCase] = [
         'name': 'Multi-Step Task',
         'task': 'Create a todo.txt file for the project',
         'responses': [
-            {
-                'thoughts': 'Reading README to understand project',
-                'file_reads': [{'path': 'README.md'}],
-                'notes_for_context': 'README contains "# Test Project"'
-            },
-            {
-                'thoughts': 'Creating todo.txt based on project name',
-                'file_updates': [{
-                    'path': 'todo.txt',
-                    'overwrite': 'TODO for Test Project:\n- Write tests\n- Run tests\n',
-                    'summary': 'Create todo.txt'
-                }],
-                'file_change_description': 'Add todo.txt',
-                'user_output': 'Created todo.txt',
-                'commit_message': 'Add todo.txt\n\nCreated todo list for Test Project'
-            }
+            """Reading README to understand project
+
+~maca~ 1 READ
+path: README.md
+
+~maca~ 2 NOTES
+text: README contains "# Test Project"
+
+""",
+            """Creating todo.txt based on project name
+
+~maca~ 1 OVERWRITE
+path: todo.txt
+content: ~maca~start~
+TODO for Test Project:
+- Write tests
+- Run tests
+
+~maca~end~
+
+~maca~ 2 OUTPUT
+text: Created todo.txt
+
+~maca~ 3 PROPOSE_MERGE
+message: ~maca~start~
+Add todo.txt
+
+Created todo list for Test Project
+~maca~end~
+
+"""
         ],
         'expected_files': {
             'todo.txt': 'TODO for Test Project:\n- Write tests\n- Run tests\n'
@@ -121,14 +155,13 @@ def setup_test_repo():
     test_dir = tempfile.mkdtemp(prefix='maca_test_')
     repo_path = Path(test_dir)
 
-    # Initialize git repo
-    git_ops.init_git_repo(repo_path)
-
-    # Configure git for the test repo
+    # Initialize git and configure it (before any commits)
+    subprocess.run(['git', 'init'], cwd=repo_path, check=True, capture_output=True)
     subprocess.run(['git', 'config', 'user.email', 'test@example.com'], cwd=repo_path, check=True, capture_output=True)
     subprocess.run(['git', 'config', 'user.name', 'Test User'], cwd=repo_path, check=True, capture_output=True)
+    subprocess.run(['git', 'config', 'commit.gpgsign', 'false'], cwd=repo_path, check=True, capture_output=True)
 
-    # Create an initial file
+    # Create an initial file and commit
     (repo_path / 'README.md').write_text('# Test Project\n')
     subprocess.run(['git', 'add', 'README.md'], cwd=repo_path, check=True, capture_output=True)
     subprocess.run(['git', 'commit', '-m', 'Initial commit'], cwd=repo_path, check=True, capture_output=True)
@@ -146,36 +179,15 @@ def build_llm_responses(responses: List[Union[str, Dict]]) -> List[Dict]:
     llm_responses = []
 
     for i, response in enumerate(responses):
-        if isinstance(response, str):
-            # Text response - assistant message with no tool calls
-            llm_responses.append({
-                'message': {
-                    'role': 'assistant',
-                    'content': response,
-                    'tool_calls': None
-                },
-                'cost': 1000,
-                'usage': {'prompt_tokens': 100, 'completion_tokens': 50}
-            })
-        else:
-            # Tool call response - build respond tool call
-            tool_call = {
-                'id': f'call_{i+1}',
-                'type': 'function',
-                'function': {
-                    'name': 'respond',
-                    'arguments': json.dumps(response)
-                }
-            }
-            llm_responses.append({
-                'message': {
-                    'role': 'assistant',
-                    'content': '',
-                    'tool_calls': [tool_call]
-                },
-                'cost': 1000,
-                'usage': {'prompt_tokens': 100 + i*50, 'completion_tokens': 50 + i*10}
-            })
+        # All responses are now text (no more tool calls)
+        llm_responses.append({
+            'message': {
+                'role': 'assistant',
+                'content': response if isinstance(response, str) else json.dumps(response)
+            },
+            'cost': 1000,
+            'usage': {'prompt_tokens': 100 + i*50, 'completion_tokens': 50 + i*10}
+        })
 
     return llm_responses
 

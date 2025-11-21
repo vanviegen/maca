@@ -20,11 +20,8 @@ _debug_llm_responses = None
 _debug_llm_index = 0
 
 
-# Get API key from environment
+# Get API key from environment (will be checked when actually needed)
 api_key = os.environ.get('OPENROUTER_API_KEY')
-if not api_key:
-    cprint(C_BAD, 'Error: OPENROUTER_API_KEY environment variable not set')
-    sys.exit(1)
 
 
 class LLMStreamReader:
@@ -229,6 +226,11 @@ def call_llm(
             duration=0)
 
         return response
+
+    # Check API key when actually making a real API call
+    if not api_key:
+        cprint(C_BAD, 'Error: OPENROUTER_API_KEY environment variable not set')
+        sys.exit(1)
 
     headers = {
         'Content-Type': 'application/json',

@@ -120,10 +120,26 @@ def parse_commands(text: str) -> ParseResult:
                             content_lines.append(content_line)
                             i += 1
 
-                    arg_value = '\n'.join(content_lines)
+                    # Reconstruct content with newlines (split removed them)
+                    # Each line in content_lines came from splitting by \n, so we need to add \n back
+                    # But if last line is empty, the trailing \n was already there
+                    if content_lines:
+                        arg_value = '\n'.join(content_lines)
+                        if not content_lines[-1]:  # Last line empty = trailing newline was present
+                            # Already has trailing newline from the empty element
+                            pass
+                        else:
+                            # Add trailing newline
+                            arg_value += '\n'
+                    else:
+                        arg_value = ''
 
-                cmd_args[arg_name] = arg_value
-                i += 1
+                    cmd_args[arg_name] = arg_value
+                    # i already incremented by inner loop, don't increment again
+                else:
+                    # Single-line argument
+                    cmd_args[arg_name] = arg_value
+                    i += 1
 
             # Store command
             commands.append(Command(
